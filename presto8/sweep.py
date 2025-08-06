@@ -176,12 +176,12 @@ class Sweep(Base):
                 sim_db = 20 * np.log10(np.abs(port.z_data_sim))
                 f_min = port.f_data[np.argmin(sim_db)]  # type: ignore
                 print("----------------")
-                print(f"fr = {port.fitresults['fr']}")
+                print(f"fr = {port.fitresults['fr']} Hz")
                 print(f"Qi = {port.fitresults['Qi_dia_corr']}")
                 print(f"Qc = {port.fitresults['Qc_dia_corr']}")
                 print(f"Ql = {port.fitresults['Ql']}")
-                print(f"kappa = {port.fitresults['fr'] / port.fitresults['Qc_dia_corr']}")
-                print(f"f_min = {f_min}")
+                print(f"kappa = {port.fitresults['fr'] / port.fitresults['Qc_dia_corr']} Hz")
+                print(f"f_min = {f_min} Hz")
                 print("----------------")
 
                 return port
