@@ -2,7 +2,6 @@
 """
 Modifed from https://github.com/intermod-pro/presto-measure/blob/master/sweep.py
 """
-
 from typing import Literal, Optional, overload
 
 import h5py
@@ -191,44 +190,43 @@ class Sweep(Base):
 
         if not batch:
             import matplotlib.pyplot as plt
-            import matplotlib.widgets as mwidgets
 
+            # Create static plot
             fig1, ax1 = plt.subplots(2, 1, sharex=True, tight_layout=True)
             ax11, ax12 = ax1
-            ax11.plot(1e-9 * self.freq_arr, resp_dB, ".")
-            # ax11.plot(1e-9 * freq_arr, np.abs(resp_arr))
-            (line_fit_a,) = ax11.plot(
-                1e-9 * self.freq_arr, np.full_like(self.freq_arr, np.nan), ls="--"
-            )
+            
+            # Plot data
+            ax11.plot(1e-9 * self.freq_arr, resp_dB, ".", label="data")
             ax12.plot(1e-9 * self.freq_arr, np.angle(self.resp_arr), ".", label="data")
-            (line_fit_p,) = ax12.plot(
-                1e-9 * self.freq_arr, np.full_like(self.freq_arr, np.nan), ls="--", label="fit"
-            )
+            
+            # Set labels
             ax12.set_xlabel("Frequency [GHz]")
             ax11.set_ylabel("Power [A.U.]")
             ax12.set_ylabel("Phase [rad]")
             
-            def onselect(xmin, xmax):
-                port = do_fit(xmin * 1e9, xmax * 1e9)
+            # Perform automatic fit if resonator_tools is available
+            if _do_fit:
+                # Center fit on amplitude minimum
+                f_ctr = self.freq_arr[np.argmin(np.abs(self.resp_arr))]
+                # Fit at most half of the sweep span
+                f_min = max(f_ctr - self.freq_span / 4, self.freq_arr.min())
+                f_max = min(f_ctr + self.freq_span / 4, self.freq_arr.max())
+                
+                port = do_fit(f_min, f_max)
                 if port is not None:
                     sim_db = 20 * np.log10(np.abs(port.z_data_sim))
-                    line_fit_a.set_data(1e-9 * port.f_data, sim_db)  # type: ignore
-                    line_fit_p.set_data(1e-9 * port.f_data, np.angle(port.z_data_sim))  # type: ignore
-                    fig1.canvas.draw()
-
-            # SpanSelector messes up x limits in some versions of matplotlib
-            # save limits now and restore them later on
-            xlims = ax11.get_xlim()
-            rectprops = dict(facecolor="tab:gray", alpha=0.5)
-            span_a = mwidgets.SpanSelector(ax11, onselect, "horizontal", props=rectprops)  # pyright: ignore[reportPossiblyUnboundVariable]
-            span_p = mwidgets.SpanSelector(ax12, onselect, "horizontal", props=rectprops)  # pyright: ignore[reportPossiblyUnboundVariable]
-            # keep references to span selectors
-            fig1._span_a = span_a  # type: ignore
-            fig1._span_p = span_p  # type: ignore
-            # restore x limits
-            ax11.set_xlim(xlims)
-
-            fig1.show()
+                    sim_phase = np.angle(port.z_data_sim)
+                    
+                    # Plot fit results
+                    ax11.plot(1e-9 * port.f_data, sim_db, ls="--", label="fit")
+                    ax12.plot(1e-9 * port.f_data, sim_phase, ls="--", label="fit")
+                    
+                    # Add legend
+                    ax11.legend()
+                    ax12.legend()
+            
+            # Display the plot
+            plt.show()
 
         else:
             # (try to) do the first fit
