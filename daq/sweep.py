@@ -10,7 +10,7 @@ import numpy.typing as npt
 
 from presto import lockin
 from presto.utils import ProgressBar
-from _base import Base
+from daq._base import Base
 
 class Sweep(Base):
     def __init__(
