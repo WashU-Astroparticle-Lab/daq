@@ -1,0 +1,39 @@
+[tool]
+[tool.poetry]
+name = "daq"
+version = "0.0.0"
+description = "Stable wrappers for data acquisition system based on Intermodulation Product Presto-8, used at WashU Astroparticle Lab."
+readme = "README.md"
+authors = [
+  "Lanqing Yuan"
+]
+classifiers = [
+  "Development Status :: 1 - Planning",
+  "License :: OSI Approved :: BSD License",
+  "Natural Language :: English",
+  "Programming Language :: Python",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Physics",
+]
+repository = "https://github.com/WashU-Astroparticle-Lab/daq"
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.13"
+numpy = "*"
+resonator_tools = "*"
+
+[build-system]
+requires = ["poetry-core>=1.0.8", "setuptools>=61.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+preview = true
+
+[tool.docformatter]
+recursive = true
+in-place = true
+style = "sphinx"
+wrap-summaries = 100
+wrap-descriptions = 100
+blank = true
