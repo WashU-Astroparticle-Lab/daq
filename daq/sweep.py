@@ -201,7 +201,7 @@ class Sweep(Base):
             
             # Set labels
             ax12.set_xlabel("Frequency [GHz]")
-            ax11.set_ylabel("Power [A.U.]")
+            ax11.set_ylabel("Power [dBFS]")
             ax12.set_ylabel("Phase [rad]")
             
             # Perform automatic fit if resonator_tools is available
