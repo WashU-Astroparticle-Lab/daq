@@ -145,15 +145,15 @@ class Sweep(Base):
         return self
 
     @overload
-    def analyze(self): ...
+    def analyze(self, *, title: Optional[str] = None): ...
 
     @overload
-    def analyze(self, *, batch: Literal[False]): ...
+    def analyze(self, *, batch: Literal[False], title: Optional[str] = None): ...
 
     @overload
-    def analyze(self, *, batch: Literal[True]) -> float: ...
+    def analyze(self, *, batch: Literal[True], title: Optional[str] = None) -> float: ...
 
-    def analyze(self, *, batch: bool = False, do_fit: bool = True):
+    def analyze(self, *, batch: bool = False, do_fit: bool = True, title: Optional[str] = None):
         if self.freq_arr is None:
             raise RuntimeError
         if self.resp_arr is None:
@@ -203,6 +203,8 @@ class Sweep(Base):
             ax12.set_xlabel("Frequency [GHz]")
             ax11.set_ylabel("Power [dBFS]")
             ax12.set_ylabel("Phase [rad]")
+            if title is not None:
+                fig1.suptitle(title)
             
             # Perform automatic fit if resonator_tools is available
             if _do_fit:

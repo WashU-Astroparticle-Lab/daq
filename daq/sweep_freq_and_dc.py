@@ -195,7 +195,7 @@ class SweepFreqAndDC(Base):
 
         return self
 
-    def analyze(self, quantity: str):
+    def analyze(self, quantity: str, title: Optional[str] = None):
         assert self.freq_arr is not None
         assert self.resp_arr is not None
 
@@ -259,6 +259,8 @@ class SweepFreqAndDC(Base):
         )
         ax1.set_xlabel("Frequency [GHz]")
         ax1.set_ylabel("Bias [V]")
+        if title is not None:
+            ax1.set_title(title)
         cb = fig1.colorbar(im)
         cb.set_label(label)
         plt.show()
