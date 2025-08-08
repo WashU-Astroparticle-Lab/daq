@@ -222,6 +222,10 @@ class Sweep(Base):
                     # Plot fit results
                     ax11.plot(1e-9 * port.f_data, sim_db, ls="--", label="fit")
                     ax12.plot(1e-9 * port.f_data, sim_phase, ls="--", label="fit")
+
+                    # Mark the resonant frequency
+                    if port.fitresults['fr'] > self.freq_arr.min() and port.fitresults['fr'] < self.freq_arr.max():
+                        ax11.axvline(1e-9 * port.fitresults['fr'], color='red', linestyle='--', label='resonant frequency')
                     
                     # Add legend
                     ax11.legend()
