@@ -55,6 +55,7 @@ class SweepFreqAndDC(Base):
         presto_address: str,
         presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
+        save_filename: Optional[str] = None,
     ) -> str:
         with lockin.Lockin(
             address=presto_address,
@@ -150,7 +151,7 @@ class SweepFreqAndDC(Base):
             lck.apply_settings()
             # lck.hardware.ramp_dc_bias(0.0, self.bias_port,self.bias_ramp_rate)
 
-        return self.save()
+        return self.save(save_filename=save_filename)
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)
