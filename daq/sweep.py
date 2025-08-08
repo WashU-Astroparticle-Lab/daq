@@ -153,7 +153,7 @@ class Sweep(Base):
     @overload
     def analyze(self, *, batch: Literal[True]) -> float: ...
 
-    def analyze(self, *, batch: bool = False):
+    def analyze(self, *, batch: bool = False, do_fit: bool = True):
         if self.freq_arr is None:
             raise RuntimeError
         if self.resp_arr is None:
@@ -162,7 +162,7 @@ class Sweep(Base):
         try:
             from resonator_tools import circuit
 
-            _do_fit = True
+            _do_fit = do_fit
         except ImportError:
             _do_fit = False
 
