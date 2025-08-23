@@ -25,8 +25,6 @@ class TimeStream(Base):
         df: float,
         pixel_counts: int,
         amp: FloatAny,
-        phases_i: FloatAny,
-        phases_q: FloatAny,
         output_port: int,
         input_port: int,
         dither: bool = True,
@@ -37,8 +35,9 @@ class TimeStream(Base):
         self.df = df  # modified after tuning
         self.pixel_counts = pixel_counts
         self.amp = np.asarray(amp, dtype=np.float64)
-        self.phases_i = np.asarray(phases_i, dtype=np.float64)
-        self.phases_q = np.asarray(phases_q, dtype=np.float64)
+        # Auto-calculate phases for USB: I = 0, Q = -π/2
+        self.phases_i = np.zeros_like(self.if_freqs, dtype=np.float64)
+        self.phases_q = self.phases_i - np.pi / 2
         self.output_port = output_port
         self.input_port = input_port
         self.dither = dither
@@ -126,8 +125,6 @@ class TimeStream(Base):
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             if_freqs_in: npt.NDArray[np.float64] = h5f["if_freqs_in"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
-            phases_i: npt.NDArray[np.float64] = h5f["phases_i"][()]  # type: ignore
-            phases_q: npt.NDArray[np.float64] = h5f["phases_q"][()]  # type: ignore
 
             # Load data arrays if they exist
             freq_arr = h5f["freq_arr"][()] if "freq_arr" in h5f else None  # type: ignore
@@ -145,8 +142,6 @@ class TimeStream(Base):
             df=df,
             pixel_counts=pixel_counts,
             amp=amp,
-            phases_i=phases_i,
-            phases_q=phases_q,
             output_port=output_port,
             input_port=input_port,
             dither=dither,
@@ -165,41 +160,31 @@ class TimeStream(Base):
 
     def analyze(
         self, 
-        sideband: str = "usb", 
         num_samples: Optional[int] = None, 
         title: Optional[str] = None,
         show_iq: bool = True
     ):
         """
-        Plot the timestream data.
+        Plot the timestream data (USB only).
         
         Parameters:
         -----------
-        sideband : str, optional
-            Which sideband to plot: "usb" (upper) or "lsb" (lower). Default is "usb".
         num_samples : int, optional
             Number of samples to plot. If None, plots all samples.
         title : str, optional
             Title for the plot.
         show_iq : bool, optional
-            If True, show I and Q streams instead of phase and power. Default is False.
+            If True, show I and Q streams instead of phase and power. Default is True.
         """
-        if self.usb is None or self.lsb is None:
+        if self.usb is None:
             raise RuntimeError("No data available. Run the measurement first.")
 
         import matplotlib.pyplot as plt
 
-        # Select data based on sideband
-        if sideband.lower() == "usb":
-            data = self.usb
-            freqs = self.freqs_usb
-            sideband_label = "USB"
-        elif sideband.lower() == "lsb":
-            data = self.lsb
-            freqs = self.freqs_lsb
-            sideband_label = "LSB"
-        else:
-            raise ValueError("sideband must be 'usb' or 'lsb'")
+        # Force using USB
+        data = self.usb
+        freqs = self.freqs_usb
+        sideband_label = "USB"
 
         # Limit number of samples if specified
         if num_samples is not None:
@@ -251,9 +236,9 @@ class TimeStream(Base):
         # Set title
         plot_type = "I/Q Streams" if show_iq else "Power/Phase"
         if title is not None:
-            fig.suptitle(f"{title} - {sideband_label} ({plot_type})")
+            fig.suptitle(f"{title} - USB ({plot_type})")
         else:
-            fig.suptitle(f"TimeStream - {sideband_label} ({plot_type})")
+            fig.suptitle(f"TimeStream - USB ({plot_type})")
 
         plt.show()
 
