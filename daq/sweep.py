@@ -11,6 +11,7 @@ import numpy.typing as npt
 from presto import lockin
 from presto.utils import ProgressBar
 from daq._base import Base
+from daq.utils import get_presto_address
 
 class Sweep(Base):
     def __init__(
@@ -40,11 +41,13 @@ class Sweep(Base):
 
     def run(
         self,
-        presto_address: str,
+        presto_address: Optional[str] = None,
         presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
         save_filename: Optional[str] = None,
     ) -> str:
+        if presto_address is None:
+            presto_address = get_presto_address()
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,
