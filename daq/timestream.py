@@ -162,7 +162,8 @@ class TimeStream(Base):
         self, 
         sideband: str = "usb", 
         num_samples: Optional[int] = None, 
-        title: Optional[str] = None
+        title: Optional[str] = None,
+        show_iq: bool = True
     ):
         """
         Plot the timestream data.
@@ -175,6 +176,8 @@ class TimeStream(Base):
             Number of samples to plot. If None, plots all samples.
         title : str, optional
             Title for the plot.
+        show_iq : bool, optional
+            If True, show I and Q streams instead of phase and power. Default is False.
         """
         if self.usb is None or self.lsb is None:
             raise RuntimeError("No data available. Run the measurement first.")
@@ -210,28 +213,42 @@ class TimeStream(Base):
             axes = axes.reshape(1, -1)
 
         for i in range(n_freqs):
-            # Amplitude plot
-            amplitudes = np.abs(data[:, i])
-            power_db = 20.0 * np.log10(amplitudes)
-            axes[i, 0].plot(time_axis, power_db)
-            axes[i, 0].set_ylabel(f"Power [dBFS]\n{freqs[i]/1e9:.3f} GHz")
-            axes[i, 0].grid(True, alpha=0.3)
+            if show_iq:
+                # I stream plot
+                i_stream = np.real(data[:, i])
+                axes[i, 0].plot(time_axis, i_stream)
+                axes[i, 0].set_ylabel(f"I [a.u.]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 0].grid(True, alpha=0.3)
 
-            # Phase plot
-            phases = np.angle(data[:, i])
-            axes[i, 1].plot(time_axis, phases)
-            axes[i, 1].set_ylabel(f"Phase [rad]\n{freqs[i]/1e9:.3f} GHz")
-            axes[i, 1].grid(True, alpha=0.3)
+                # Q stream plot
+                q_stream = np.imag(data[:, i])
+                axes[i, 1].plot(time_axis, q_stream)
+                axes[i, 1].set_ylabel(f"Q [a.u.]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 1].grid(True, alpha=0.3)
+            else:
+                # Amplitude plot
+                amplitudes = np.abs(data[:, i])
+                power_db = 20.0 * np.log10(amplitudes)
+                axes[i, 0].plot(time_axis, power_db)
+                axes[i, 0].set_ylabel(f"Power [dBFS]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 0].grid(True, alpha=0.3)
+
+                # Phase plot
+                phases = np.angle(data[:, i])
+                axes[i, 1].plot(time_axis, phases)
+                axes[i, 1].set_ylabel(f"Phase [rad]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 1].grid(True, alpha=0.3)
 
         # Set x-labels for bottom plots
         axes[-1, 0].set_xlabel("Time [μs]")
         axes[-1, 1].set_xlabel("Time [μs]")
 
         # Set title
+        plot_type = "I/Q Streams" if show_iq else "Power/Phase"
         if title is not None:
-            fig.suptitle(f"{title} - {sideband_label}")
+            fig.suptitle(f"{title} - {sideband_label} ({plot_type})")
         else:
-            fig.suptitle(f"TimeStream - {sideband_label}")
+            fig.suptitle(f"TimeStream - {sideband_label} ({plot_type})")
 
         plt.show()
 
