@@ -21,7 +21,6 @@ class TimeStream(Base):
         self,
         lo_freq: float,
         if_freqs: FloatAny,
-        if_freqs_in: FloatAny,
         df: float,
         pixel_counts: int,
         amp: FloatAny,
@@ -31,7 +30,6 @@ class TimeStream(Base):
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
-        self.if_freqs_in = np.asarray(if_freqs_in, dtype=np.float64)
         self.df = df  # modified after tuning
         self.pixel_counts = pixel_counts
         self.amp = np.asarray(amp, dtype=np.float64)
@@ -88,8 +86,8 @@ class TimeStream(Base):
             og.set_phases(self.phases_i, self.phases_q)
 
             # Configure input group
-            ig = lck.add_input_group(self.input_port, len(self.if_freqs_in))
-            ig.set_frequencies(self.if_freqs_in)
+            ig = lck.add_input_group(self.input_port, len(self.if_freqs))
+            ig.set_frequencies(self.if_freqs)
 
             lck.apply_settings()
 
@@ -123,7 +121,6 @@ class TimeStream(Base):
             dither = bool(h5f.attrs["dither"])  # type: ignore
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
-            if_freqs_in: npt.NDArray[np.float64] = h5f["if_freqs_in"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
 
             # Load data arrays if they exist
@@ -138,7 +135,6 @@ class TimeStream(Base):
         self = cls(
             lo_freq=lo_freq,
             if_freqs=if_freqs,
-            if_freqs_in=if_freqs_in,
             df=df,
             pixel_counts=pixel_counts,
             amp=amp,
