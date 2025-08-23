@@ -14,7 +14,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray
 
 from daq._base import Base
-from daq.utils import get_presto_address
+from daq.utils import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -60,6 +60,8 @@ class SweepFreqAndDC(Base):
     ) -> str:
         if presto_address is None:
             presto_address = get_presto_address()
+        if presto_port is None:
+            presto_port = get_presto_port()
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,

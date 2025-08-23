@@ -10,7 +10,7 @@ import numpy.typing as npt
 
 from presto import lockin
 from presto.utils import untwist_downconversion
-from daq.utils import get_presto_address
+from daq.utils import get_presto_address, get_presto_port
 from daq._base import Base
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
@@ -61,6 +61,8 @@ class TimeStream(Base):
     ) -> str:
         if presto_address is None:
             presto_address = get_presto_address()
+        if presto_port is None:
+            presto_port = get_presto_port()
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,

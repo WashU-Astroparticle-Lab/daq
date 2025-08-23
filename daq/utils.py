@@ -1,6 +1,7 @@
 from datetime import date, datetime
 
 PRESTO_ADDRESS = "172.23.20.29"
+PRESTO_PORT = None  # Use system default port
 
 def get_date_str():
     """Get the current date as a string in the format YYYYMMDD
@@ -19,4 +20,10 @@ def get_date_str_with_time():
 def get_presto_address():
     """Get the address of the presto device.
     """
-    return PRESTO_ADDRESS   
+    return PRESTO_ADDRESS
+
+
+def get_presto_port():
+    """Get the port of the presto device.
+    """
+    return PRESTO_PORT   
