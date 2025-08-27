@@ -49,6 +49,11 @@ class TimeStream(Base):
         self.freqs_usb = None
         self.freqs_lsb = None
 
+        self.check_amp()
+
+    def check_amp(self):
+        assert self.amp.sum()<1.0, "Amplitude sum must be less than 1.0"
+
     def run(
         self,
         presto_address: Optional[str] = None,
