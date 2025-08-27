@@ -218,6 +218,8 @@ class Sweep(Base):
                 # Fit at most half of the sweep span
                 f_min = max(f_ctr - self.freq_span / 4, self.freq_arr.min())
                 f_max = min(f_ctr + self.freq_span / 4, self.freq_arr.max())
+
+                self.fit_results = port.fitresults
                 
                 port = do_fit(f_min, f_max)
                 if port is not None:
