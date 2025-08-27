@@ -120,7 +120,7 @@ class SweepFreqAndDC(Base):
             og = lck.add_output_group(self.output_port, 1)
             og.set_frequencies(0.0)
             og.set_amplitudes(self.amp)
-            og.set_phases(0.0, 0.0)
+            og.set_phases(0.0, -np.pi / 2)
 
             lck.set_dither(self.dither, self.output_port)
             ig = lck.add_input_group(self.input_port, 1)
