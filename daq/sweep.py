@@ -61,8 +61,6 @@ class Sweep(Base):
             address=presto_address,
             port=presto_port,
             ext_ref_clk=ext_ref_clk,
-            dac_mode=dac_mode,
-            dac_fsample=dac_fsample,
             **self.DC_PARAMS,
         ) as lck:
             lck.hardware.set_adc_attenuation(self.input_port, self.ADC_ATTENUATION)
