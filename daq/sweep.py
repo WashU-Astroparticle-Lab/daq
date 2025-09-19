@@ -54,6 +54,8 @@ class Sweep(Base):
 
         # Use the recommended DAC config for the center frequency
         dac_mode, dac_fsample = recommended_dac_config(self.freq_center)
+        self.DC_PARAMS["dac_mode"] = dac_mode
+        self.DC_PARAMS["dac_fsample"] = dac_fsample
 
         with lockin.Lockin(
             address=presto_address,
