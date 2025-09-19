@@ -12,6 +12,7 @@ from presto import lockin
 from presto.utils import ProgressBar
 from daq._base import Base
 from daq.utils import get_presto_address, get_presto_port
+from presto.utils import recommended_dac_config
 
 class Sweep(Base):
     def __init__(
@@ -50,10 +51,16 @@ class Sweep(Base):
             presto_address = get_presto_address()
         if presto_port is None:
             presto_port = get_presto_port()
+
+        # Use the recommended DAC config for the center frequency
+        dac_mode, dac_fsample = recommended_dac_config(self.freq_center)
+
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,
             ext_ref_clk=ext_ref_clk,
+            dac_mode=dac_mode,
+            dac_fsample=dac_fsample,
             **self.DC_PARAMS,
         ) as lck:
             lck.hardware.set_adc_attenuation(self.input_port, self.ADC_ATTENUATION)
