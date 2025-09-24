@@ -50,60 +50,64 @@ def S_2(fr,T,Delta):
 	return 1+np.sqrt(2*Delta/(np.pi*Boltz_k*T))*np.exp(-1*xi)*spec.i0(xi) # unitless
 
 def MB_fitter(T_fit, Qi_fit, f_fit, var_Qi, var_f, **kwargs):
+    sort_idx = np.argsort(T_fit)
+    T_fit = T_fit[sort_idx]
+    Qi_fit = Qi_fit[sort_idx]
+    f_fit = f_fit[sort_idx]
+    var_Qi = var_Qi[sort_idx]
+    var_f = var_f[sort_idx]
 
-	fit_result = []
+    def chisq(f0, Delta0, alpha, Qi0):
+        alpha_Q = alpha
+        alpha_f = alpha
 
-	def chisq(f0, Delta0, alpha, Qi0):
-		alpha_Q = alpha
-		alpha_f = alpha
-
-		return sum(
+        return sum(
             (f_T(T_fit, f0, Delta0, alpha_f) - f_fit)**2./var_f + 
             (Qi_T(T_fit, f0, Qi0, Delta0, alpha_Q) - Qi_fit)**2./var_Qi
         )/4.
 
-	f0_in = f_fit[0]
-	Delta0_in = 4.e-4
-	alpha_in = 0.05
-	Qi0_in = Qi_fit[0]
-    
-	minimizer = iminuit.Minuit(
-		chisq, 
-		f0=f0_in, 
-		Delta0=Delta0_in, 
-		alpha=alpha_in, 
-		Qi0=Qi0_in,
-	)
+    f0_in = f_fit[0]
+    Delta0_in = 4.e-4
+    alpha_in = 0.05
+    Qi0_in = Qi_fit[0]
 
-	# Fit parameters based on **kwargs
-	for key, value in kwargs.items():
-		minimizer.fixto(key, value)
+    minimizer = iminuit.Minuit(
+        chisq, 
+        f0=f0_in, 
+        Delta0=Delta0_in, 
+        alpha=alpha_in, 
+        Qi0=Qi0_in,
+    )
 
-	# Override parameters with kwargs if specified#
-	minimizer.limits["f0"] = (f_fit[0]/1.1,f_fit[0]*1.1)
-	minimizer.limits["Delta0"] = (1.e-4,1.e-3)
-	minimizer.limits["alpha"] = (0.,0.5)
-	minimizer.limits["Qi0"] = (1.e2,1.e7)
-    
-	f0_in = minimizer.values["f0"]
-	Delta0_in = minimizer.values["Delta0"]
-	alpha_in = minimizer.values["alpha"]
-	Qi0_in = minimizer.values["Qi0"]
-    
-	minimizer.migrad()
-	minimizer.hesse()
+    # Fit parameters based on **kwargs
+    for key, value in kwargs.items():
+        minimizer.fixto(key, value)
 
-	f0 = minimizer.values["f0"]
-	Delta0 = minimizer.values["Delta0"]
-	alpha = minimizer.values["alpha"]
-	Qi0 = minimizer.values["Qi0"]
-	chi_sq_dof = chisq(f0, Delta0, alpha, Qi0)
+    # Override parameters with kwargs if specified#
+    minimizer.limits["f0"] = (f_fit[0]/1.1,f_fit[0]*1.1)
+    minimizer.limits["Delta0"] = (1.e-4,5.e-4)
+    minimizer.limits["alpha"] = (0.,0.5)
+    minimizer.limits["Qi0"] = (Qi_fit[0]/2,Qi_fit[0]*2)
 
-	f0_err = minimizer.errors["f0"]
-	Delta0_err = minimizer.errors["Delta0"]
-	alpha_err = minimizer.errors["alpha"]
-	Qi0_err = minimizer.errors["Qi0"]
+    f0_in = minimizer.values["f0"]
+    Delta0_in = minimizer.values["Delta0"]
+    alpha_in = minimizer.values["alpha"]
+    Qi0_in = minimizer.values["Qi0"]
 
-	print(minimizer.hesse())
+    minimizer.migrad()
+    minimizer.hesse()
 
-	return f0/1.e9, Delta0*1000., alpha, Qi0, chi_sq_dof, f0_err/1.e9, Delta0_err*1000., alpha_err, Qi0_err
+    f0 = minimizer.values["f0"]
+    Delta0 = minimizer.values["Delta0"]
+    alpha = minimizer.values["alpha"]
+    Qi0 = minimizer.values["Qi0"]
+    chi_sq_dof = chisq(f0, Delta0, alpha, Qi0)
+
+    f0_err = minimizer.errors["f0"]
+    Delta0_err = minimizer.errors["Delta0"]
+    alpha_err = minimizer.errors["alpha"]
+    Qi0_err = minimizer.errors["Qi0"]
+
+    print(minimizer.hesse())
+
+    return f0/1.e9, Delta0*1000., alpha, Qi0, chi_sq_dof, f0_err/1.e9, Delta0_err*1000., alpha_err, Qi0_err
