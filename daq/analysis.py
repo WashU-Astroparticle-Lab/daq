@@ -63,7 +63,7 @@ def MB_fitter(T_fit, Qi_fit, f_fit, **kwargs):
 		return sum(
             (f_T(T_fit, f0, Delta0, alpha_f) - f_fit)**2./var_f + 
             (Qi_T(T_fit, f0, Qi0, Delta0, alpha_Q) - Qi_fit)**2./var_Qi
-        )
+        )/4.
 
 	f0_in = f_fit[0]
 	Delta0_in = 4.e-4
@@ -100,7 +100,7 @@ def MB_fitter(T_fit, Qi_fit, f_fit, **kwargs):
 	Delta0 = minimizer.values["Delta0"]
 	alpha = minimizer.values["alpha"]
 	Qi0 = minimizer.values["Qi0"]
-	chi_sq_dof = fit_chisq_test(T_fit, f_fit, Qi_fit, f0, Delta0, alpha, Qi0)
+	chi_sq_dof = chisq(f0, Delta0, alpha, Qi0)
 
 	f0_err = minimizer.errors["f0"]
 	Delta0_err = minimizer.errors["Delta0"]
