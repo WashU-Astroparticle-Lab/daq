@@ -58,12 +58,10 @@ def MB_fitter(T_fit, Qi_fit, f_fit, var_Qi, var_f, **kwargs):
     var_f = var_f[sort_idx]
 
     def chisq(f0, Delta0, alpha, Qi0):
-        alpha_Q = alpha
-        alpha_f = alpha
 
-        return sum(
-            (f_T(T_fit, f0, Delta0, alpha_f) - f_fit)**2./var_f + 
-            (Qi_T(T_fit, f0, Qi0, Delta0, alpha_Q) - Qi_fit)**2./var_Qi
+        return np.sum(
+            (f_T(T_fit, f0, Delta0, alpha) - f_fit)**2./var_f + 
+            (Qi_T(T_fit, f0, Qi0, Delta0, alpha) - Qi_fit)**2./var_Qi
         )/4.
 
     f0_in = f_fit[0]
@@ -87,7 +85,7 @@ def MB_fitter(T_fit, Qi_fit, f_fit, var_Qi, var_f, **kwargs):
     minimizer.limits["f0"] = (f_fit[0]/1.1,f_fit[0]*1.1)
     minimizer.limits["Delta0"] = (1.e-4,5.e-4)
     minimizer.limits["alpha"] = (0.,0.5)
-    minimizer.limits["Qi0"] = (Qi_fit[0]/2,Qi_fit[0]*2)
+    minimizer.limits["Qi0"] = (Qi_fit[0]/1.2,Qi_fit[0]*1.2)
 
     f0_in = minimizer.values["f0"]
     Delta0_in = minimizer.values["Delta0"]
