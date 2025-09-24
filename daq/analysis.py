@@ -49,16 +49,13 @@ def S_2(fr,T,Delta):
 	xi = 1./2.*(Planck_h*fr)/(Boltz_k*T)
 	return 1+np.sqrt(2*Delta/(np.pi*Boltz_k*T))*np.exp(-1*xi)*spec.i0(xi) # unitless
 
-def MB_fitter(T_fit, Qi_fit, f_fit, **kwargs):
+def MB_fitter(T_fit, Qi_fit, f_fit, var_Qi, var_f, **kwargs):
 
 	fit_result = []
 
 	def chisq(f0, Delta0, alpha, Qi0):
 		alpha_Q = alpha
 		alpha_f = alpha
-
-		var_Qi = np.var(Qi_fit)
-		var_f = np.var(f_fit)
 
 		return sum(
             (f_T(T_fit, f0, Delta0, alpha_f) - f_fit)**2./var_f + 
