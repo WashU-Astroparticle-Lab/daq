@@ -65,7 +65,7 @@ def MB_fitter(T_fit, Qi_fit, f_fit, var_Qi, var_f, **kwargs):
         )/4.
 
     f0_in = f_fit[0]
-    Delta0_in = 4.e-4
+    Delta0_in = 2.e-4
     alpha_in = 0.05
     Qi0_in = Qi_fit[0]
 
