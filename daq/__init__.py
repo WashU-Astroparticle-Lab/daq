@@ -1,5 +1,3 @@
-from .sweep import Sweep
-from .sweep_freq_and_dc import SweepFreqAndDC
-from .timestream import TimeStream
+from .measurements import Sweep, SweepFreqAndDC, SweepPower, TimeStream
 
-__all__ = ["Sweep", "SweepFreqAndDC", "TimeStream"]
+__all__ = ["Sweep", "SweepFreqAndDC", "SweepPower", "TimeStream"]

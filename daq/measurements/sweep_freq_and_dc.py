@@ -13,8 +13,8 @@ import numpy.typing as npt
 from presto import lockin
 from presto.utils import ProgressBar, asarray
 
-from daq._base import Base
-from daq.utils import get_presto_address, get_presto_port
+from .._base import Base
+from ..utils import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 

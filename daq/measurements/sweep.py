@@ -9,10 +9,10 @@ import numpy as np
 import numpy.typing as npt
 
 from presto import lockin
-from presto.utils import ProgressBar
-from daq._base import Base
-from daq.utils import get_presto_address, get_presto_port
-from presto.utils import recommended_dac_config
+from presto.utils import ProgressBar, recommended_dac_config
+
+from .._base import Base
+from ..utils import get_presto_address, get_presto_port
 
 class Sweep(Base):
     def __init__(
@@ -26,6 +26,9 @@ class Sweep(Base):
         input_port: int,
         dither: bool = True,
         num_skip: int = 0,
+        device: Optional[str] = None,
+        filter: Optional[str] = None,
+        notes: Optional[str] = None,
     ) -> None:
         self.freq_center = freq_center
         self.freq_span = freq_span
@@ -36,6 +39,9 @@ class Sweep(Base):
         self.input_port = input_port
         self.dither = dither
         self.num_skip = num_skip
+        self.device = device
+        self.filter = filter
+        self.notes = notes
 
         self.freq_arr = None  # replaced by run
         self.resp_arr = None  # replaced by run
