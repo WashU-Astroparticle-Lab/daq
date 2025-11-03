@@ -119,7 +119,7 @@ class Base:
                 )
         else:
             print(
-                "INFO: Measurement saved locally at {save_path}. "
+                f"INFO: Measurement saved locally at {save_path}. "
                 "Database logging skipped (database unavailable)."
             )
         

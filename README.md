@@ -5,7 +5,7 @@ Product Presto-8, used at WashU Astroparticle Lab.
 ## Features
 
 - **Measurement Classes**: Sweep, TimeStream, SweepPower, 
-  SweepFreqAndDC
+  SweepFreqAndDC, TwoTonePower
 - **MongoDB Integration**: Automatic logging of all measurements 
   to MongoDB Atlas (setup by Lanqing, which is beyond the scope of this package)
 - **Automatic Fitting**: Sweep measurements automatically perform 
@@ -91,6 +91,35 @@ filepath = ts.run()
 ts.analyze()
 ```
 
+### TwoTonePower Measurement
+
+```python
+from daq import TwoTonePower
+
+# Create a two-tone power measurement
+# 2D sweep of pump power and frequency with fixed probe
+tt = TwoTonePower(
+    readout_freq=6e9,          # Fixed probe frequency
+    control_freq_center=5e9,    # Pump center frequency
+    control_freq_span=100e6,    # Pump frequency span
+    df=1e3,                     # Frequency resolution
+    readout_amp=0.1,           # Probe amplitude
+    control_amp_arr=[0.01, 0.05, 0.1],  # Pump amplitudes
+    readout_port=1,            # Probe output port
+    control_port=2,            # Pump output port
+    input_port=1,              # Input port
+    num_averages=100,          # Number of averages
+    device="Device_C",         # Device name (required for DB)
+    notes="Two-tone spectroscopy"
+)
+
+# Run the measurement
+filepath = tt.run()
+
+# Analyze results
+tt.analyze(quantity="quadrature", linecut=True)
+```
+
 ## MongoDB Database Integration
 
 All measurements are automatically logged to MongoDB Atlas:
@@ -137,7 +166,8 @@ daq/
 │   ├── sweep.py
 │   ├── timestream.py
 │   ├── sweep_power.py
-│   └── sweep_freq_and_dc.py
+│   ├── sweep_freq_and_dc.py
+│   └── two_tone_power.py
 ├── db/                 # Database integration
 │   └── database.py
 ├── analysis/           # Analysis tools
