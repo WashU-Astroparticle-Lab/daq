@@ -94,7 +94,7 @@ ts.analyze()
 ## MongoDB Database Integration
 
 All measurements are automatically logged to MongoDB Atlas:
-- **Database**: "WashU Astroparticle Detector"
+- **Database**: "WashU_Astroparticle_Detector"
 - **Collection**: "measurement"
 
 ### Document Structure

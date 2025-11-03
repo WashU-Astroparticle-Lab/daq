@@ -12,7 +12,7 @@ MONGODB_URI = (
     "mongodb+srv://lanqing_yuan:WdXq8PrrHj78zjYy@freec.f96deaj."
     "mongodb.net/?appName=FreeC"
 )
-DB_NAME = "WashU Astroparticle Detector"
+DB_NAME = "WashU_Astroparticle_Detector"
 COLLECTION_NAME = "measurement"
 
 
