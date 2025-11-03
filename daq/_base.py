@@ -48,8 +48,20 @@ class Base:
                 "device parameter is required for database logging"
             )
         
-        # Get next number from database
-        number = get_next_number()
+        # Get next number from database (with fallback if unavailable)
+        try:
+            number = get_next_number()
+            db_available = True
+        except Exception as e:
+            # Database unavailable - use timestamp-based fallback
+            print(
+                f"WARN: Database unavailable ({e}). "
+                "Using timestamp-based numbering."
+            )
+            # Use timestamp as fallback number (format: YYYYMMDDHHMMSS)
+            timestamp = datetime.now()
+            number = timestamp.strftime("%Y%m%d%H%M%S")
+            db_available = False
         
         # Generate filename if not provided
         if save_filename is None:
@@ -87,22 +99,29 @@ class Base:
         
         print(f"Data saved to: {save_path}")
         
-        # Build MongoDB document
-        document = self._build_document(
-            number=number,
-            measurement_type=measurement_type,
-            file_path=save_path,
-            device=device,
-            filter_name=filter_name,
-            notes=notes,
-        )
-        
-        # Insert into MongoDB
-        try:
-            doc_id = insert_measurement(document)
-            print(f"Document inserted to MongoDB with ID: {doc_id}")
-        except Exception as e:
-            print(f"WARN: Failed to insert to MongoDB: {e}")
+        # Build MongoDB document and insert (only if DB was available)
+        if db_available:
+            try:
+                document = self._build_document(
+                    number=number,
+                    measurement_type=measurement_type,
+                    file_path=save_path,
+                    device=device,
+                    filter_name=filter_name,
+                    notes=notes,
+                )
+                doc_id = insert_measurement(document)
+                print(f"Document inserted to MongoDB with ID: {doc_id}")
+            except Exception as e:
+                print(
+                    f"WARN: Failed to insert to MongoDB: {e}. "
+                    "Data file saved locally."
+                )
+        else:
+            print(
+                "INFO: Measurement saved locally at {save_path}. "
+                "Database logging skipped (database unavailable)."
+            )
         
         return save_path
     
