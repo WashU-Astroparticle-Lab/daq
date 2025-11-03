@@ -10,8 +10,9 @@ import numpy.typing as npt
 
 from presto import lockin
 from presto.utils import untwist_downconversion
-from daq.utils import get_presto_address, get_presto_port
-from daq._base import Base
+
+from .._base import Base
+from ..utils import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -27,6 +28,9 @@ class TimeStream(Base):
         output_port: int,
         input_port: int,
         dither: bool = True,
+        device: Optional[str] = None,
+        filter: Optional[str] = None,
+        notes: Optional[str] = None,
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
@@ -39,6 +43,9 @@ class TimeStream(Base):
         self.output_port = output_port
         self.input_port = input_port
         self.dither = dither
+        self.device = device
+        self.filter = filter
+        self.notes = notes
 
         # Data arrays - set by run method
         self.freq_arr = None

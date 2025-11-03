@@ -9,10 +9,10 @@ import numpy as np
 import numpy.typing as npt
 
 from presto import lockin
-from presto.utils import ProgressBar
-from daq._base import Base
-from daq.utils import get_presto_address, get_presto_port
-from presto.utils import recommended_dac_config
+from presto.utils import ProgressBar, recommended_dac_config
+
+from .._base import Base
+from ..utils import get_presto_address, get_presto_port
 
 class Sweep(Base):
     def __init__(
@@ -26,6 +26,10 @@ class Sweep(Base):
         input_port: int,
         dither: bool = True,
         num_skip: int = 0,
+        device: Optional[str] = None,
+        filter: Optional[str] = None,
+        notes: Optional[str] = None,
+        auto_fit: bool = True,
     ) -> None:
         self.freq_center = freq_center
         self.freq_span = freq_span
@@ -36,6 +40,10 @@ class Sweep(Base):
         self.input_port = input_port
         self.dither = dither
         self.num_skip = num_skip
+        self.device = device
+        self.filter = filter
+        self.notes = notes
+        self.auto_fit = auto_fit
 
         self.freq_arr = None  # replaced by run
         self.resp_arr = None  # replaced by run
@@ -119,10 +127,54 @@ class Sweep(Base):
             og.set_amplitudes(0.0)
             lck.apply_settings()
 
+        # Perform automatic fit analysis before saving (if enabled)
+        if self.auto_fit:
+            self._perform_fit()
+
         return self.save(save_filename=save_filename)
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)
+
+    def _perform_fit(self) -> bool:
+        """
+        Perform resonator fitting silently and store results.
+        
+        Returns:
+            bool: True if fit was successful, False otherwise
+        """
+        if self.freq_arr is None or self.resp_arr is None:
+            return False
+
+        try:
+            from resonator_tools import circuit
+        except ImportError:
+            # resonator_tools not available, skip fitting
+            return False
+
+        try:
+            # Perform fit centered on amplitude minimum
+            f_ctr = self.freq_arr[np.argmin(np.abs(self.resp_arr))]
+            # Fit at most half of the sweep span
+            f_min = max(
+                f_ctr - self.freq_span / 4, self.freq_arr.min()
+            )
+            f_max = min(
+                f_ctr + self.freq_span / 4, self.freq_arr.max()
+            )
+
+            port = circuit.notch_port(self.freq_arr, self.resp_arr)
+            port.autofit(fcrop=(f_min, f_max))
+
+            # Store fit results for database
+            self.fit_results = port.fitresults
+
+            return True
+        except Exception as e:
+            # Fit failed, but don't prevent measurement from being saved
+            print(f"WARN: Fit analysis failed: {e}")
+            self.fit_results = None
+            return False
 
     @classmethod
     def load(cls, load_filename: str) -> "Sweep":
@@ -136,6 +188,13 @@ class Sweep(Base):
             input_port = int(h5f.attrs["input_port"])  # type: ignore
             dither = bool(h5f.attrs["dither"])  # type: ignore
             num_skip = int(h5f.attrs["num_skip"])  # type: ignore
+            # Load optional parameters if they exist
+            device = h5f.attrs.get("device", None)
+            filter_param = h5f.attrs.get("filter", None)
+            notes = h5f.attrs.get("notes", None)
+            auto_fit = bool(
+                h5f.attrs["auto_fit"]
+            ) if "auto_fit" in h5f.attrs else True
 
             freq_arr: npt.NDArray[np.float64] = h5f["freq_arr"][()]  # type: ignore
             resp_arr: npt.NDArray[np.complex128] = h5f["resp_arr"][()]  # type: ignore
@@ -150,6 +209,10 @@ class Sweep(Base):
             input_port=input_port,
             dither=dither,
             num_skip=num_skip,
+            device=device,
+            filter=filter_param,
+            notes=notes,
+            auto_fit=auto_fit,
         )
         self.freq_arr = freq_arr
         self.resp_arr = resp_arr
@@ -257,6 +320,8 @@ class Sweep(Base):
             f_max = min(f_ctr + self.freq_span / 4, self.freq_arr.max())
             port = do_fit(f_min, f_max)
             assert port is not None
+            # Store fit results for database
+            self.fit_results = port.fitresults
             sim_db = 20 * np.log10(np.abs(port.z_data_sim))
             f_min = port.f_data[np.argmin(sim_db)]  # type: ignore
             return float(f_min)

@@ -1,7 +1,11 @@
 from datetime import date, datetime
+import os
 
 PRESTO_ADDRESS = "172.23.20.29"
 PRESTO_PORT = None  # Use system default port
+DATA_FOLDER = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)), "data"
+)
 
 def get_date_str():
     """Get the current date as a string in the format YYYYMMDD
@@ -26,4 +30,10 @@ def get_presto_address():
 def get_presto_port():
     """Get the port of the presto device.
     """
-    return PRESTO_PORT   
+    return PRESTO_PORT
+
+
+def get_data_folder():
+    """Get the data folder path.
+    """
+    return DATA_FOLDER
