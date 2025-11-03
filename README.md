@@ -7,7 +7,9 @@ Product Presto-8, used at WashU Astroparticle Lab.
 - **Measurement Classes**: Sweep, TimeStream, SweepPower, 
   SweepFreqAndDC
 - **MongoDB Integration**: Automatic logging of all measurements 
-  to MongoDB Atlas
+  to MongoDB Atlas (setup by Lanqing, which is beyond the scope of this package)
+- **Automatic Fitting**: Sweep measurements automatically perform 
+  resonator fitting (optional, enabled by default)
 - **Data Management**: Organized data storage with cumulative 
   numbering system
 - **Analysis Tools**: Built-in visualization and fitting 
@@ -18,11 +20,6 @@ Product Presto-8, used at WashU Astroparticle Lab.
 ### Using pip:
 ```bash
 pip install -e .
-```
-
-### Using poetry:
-```bash
-poetry install
 ```
 
 ### Dependencies
@@ -51,16 +48,25 @@ sweep = Sweep(
     input_port=1,           # ADC input port
     device="Resonator_A",   # Device name (required for DB)
     filter="LPF_10GHz",     # Optional filter name
-    notes="Cooldown test"   # Optional notes
+    notes="Cooldown test",   # Optional notes
+    auto_fit=True           # Automatic fitting (default: True)
 )
 
-# Run the measurement (saves to DB automatically)
+# Run the measurement
+# - Automatically performs resonator fitting (if enabled)
+# - Saves fit results to database
+# - Saves data file to disk
 filepath = sweep.run()
 print(f"Data saved to: {filepath}")
 
-# Analyze the results
+# Visualize the results (optional)
 sweep.analyze()
 ```
+
+**Note**: By default, Sweep measurements automatically perform resonator 
+fitting after data acquisition and store fit results (frequency, quality 
+factors, etc.) in the MongoDB database. Set `auto_fit=False` to disable 
+automatic fitting.
 
 ### TimeStream Measurement
 
@@ -105,6 +111,18 @@ Each measurement creates a document with:
 - `amp`: Readout amplitude
 - All measurement-specific parameters (freq_center, lo_freq, etc.)
 
+**For Sweep measurements with automatic fitting enabled**, the document 
+also includes fit results:
+- `fit_fr`, `fit_fr_err`: Resonant frequency and error (Hz)
+- `fit_Qi`, `fit_Qi_err`: Internal quality factor and error
+- `fit_Qc`, `fit_Qc_err`: Coupling quality factor and error
+- `fit_Ql`, `fit_Ql_err`: Loaded quality factor and error
+- `fit_kappa`: Coupling rate = fr / Qc (Hz)
+
+These fit fields are only present if automatic fitting succeeds. If 
+fitting is disabled (`auto_fit=False`) or fails, the document is saved 
+without fit fields.
+
 ### File Naming Convention
 
 Data files are automatically named: `{number}-{device}-{type}.h5`
@@ -122,9 +140,10 @@ daq/
 │   └── sweep_freq_and_dc.py
 ├── db/                 # Database integration
 │   └── database.py
+├── analysis/           # Analysis tools
+│   └── mattis_bardeen.py
 ├── _base.py            # Base class for measurements
-├── utils.py            # Utility functions
-└── analysis.py         # Analysis tools
+└── utils.py            # Utility functions
 
 data/                   # Data storage directory
 ```

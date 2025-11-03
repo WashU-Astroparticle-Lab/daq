@@ -126,6 +126,46 @@ class Base:
             "notes": notes,
         }
         
+        # Extract fit results if available (for Sweep measurements)
+        fit_results = getattr(self, "fit_results", None)
+        if fit_results is not None and isinstance(fit_results, dict):
+            try:
+                # Extract resonant frequency
+                if "fr" in fit_results:
+                    document["fit_fr"] = float(fit_results["fr"])
+                if "fr_err" in fit_results:
+                    document["fit_fr_err"] = float(fit_results["fr_err"])
+                
+                # Extract internal quality factor
+                if "Qi_dia_corr" in fit_results:
+                    document["fit_Qi"] = float(fit_results["Qi_dia_corr"])
+                if "Qi_dia_corr_err" in fit_results:
+                    document["fit_Qi_err"] = float(
+                        fit_results["Qi_dia_corr_err"]
+                    )
+                
+                # Extract coupling quality factor
+                if "Qc_dia_corr" in fit_results:
+                    document["fit_Qc"] = float(fit_results["Qc_dia_corr"])
+                if "absQc_err" in fit_results:
+                    document["fit_Qc_err"] = float(fit_results["absQc_err"])
+                
+                # Extract loaded quality factor
+                if "Ql" in fit_results:
+                    document["fit_Ql"] = float(fit_results["Ql"])
+                if "Ql_err" in fit_results:
+                    document["fit_Ql_err"] = float(fit_results["Ql_err"])
+                
+                # Calculate coupling rate kappa = fr / Qc
+                if "fr" in fit_results and "Qc_dia_corr" in fit_results:
+                    if fit_results["Qc_dia_corr"] != 0:
+                        document["fit_kappa"] = float(
+                            fit_results["fr"] / fit_results["Qc_dia_corr"]
+                        )
+            except (KeyError, ValueError, TypeError) as e:
+                # If extraction fails, just skip fit results
+                print(f"WARN: Failed to extract fit results: {e}")
+        
         # Add all measurement parameters from __init__
         for attribute in self.__dict__:
             if attribute.startswith("_"):
@@ -133,6 +173,10 @@ class Base:
             
             # Skip metadata fields already added
             if attribute in ["device", "filter", "notes"]:
+                continue
+            
+            # Skip fit_results (handled separately above)
+            if attribute == "fit_results":
                 continue
             
             # Skip data arrays (large datasets)
