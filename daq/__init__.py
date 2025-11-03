@@ -1,3 +1,15 @@
-from .measurements import Sweep, SweepFreqAndDC, SweepPower, TimeStream
+from .measurements import (
+    Sweep,
+    SweepFreqAndDC,
+    SweepPower,
+    TimeStream,
+    TwoTonePower,
+)
 
-__all__ = ["Sweep", "SweepFreqAndDC", "SweepPower", "TimeStream"]
+__all__ = [
+    "Sweep",
+    "SweepFreqAndDC",
+    "SweepPower",
+    "TimeStream",
+    "TwoTonePower",
+]
