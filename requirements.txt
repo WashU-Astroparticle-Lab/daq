@@ -2,4 +2,5 @@ numpy
 h5py
 matplotlib
 pymongo
+git+https://github.com/FaroutYLq/resonator_tools.git
 

@@ -20,7 +20,7 @@ repository = "https://github.com/WashU-Astroparticle-Lab/daq"
 [tool.poetry.dependencies]
 python = ">=3.11"
 numpy = "*"
-resonator_tools = "*"
+resonator_tools = {git = "https://github.com/FaroutYLq/resonator_tools.git"}
 presto = "*"
 pymongo = "*"
 
