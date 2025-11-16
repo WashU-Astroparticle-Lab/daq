@@ -173,10 +173,10 @@ def select_runs(
     if not results:
         return pd.DataFrame()
     
-    # Convert ObjectId to string for all documents
+    # Remove _id field from all documents
     for doc in results:
         if "_id" in doc:
-            doc["_id"] = str(doc["_id"])
+            del doc["_id"]
     
     # Convert to DataFrame
     df = pd.DataFrame(results)
