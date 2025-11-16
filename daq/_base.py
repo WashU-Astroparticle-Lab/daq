@@ -86,6 +86,10 @@ class Base:
                 try:
                     if attribute.startswith("_"):
                         continue
+                    if attribute == "fit_results":
+                        # fit_results is a nested dict used for DB logging only
+                        # and may contain non-HDF5 compatible objects
+                        continue
                     if attribute in ["jpa_params", "clear"]:
                         h5f.attrs[attribute] = str(self.__dict__[attribute])
                     elif np.isscalar(self.__dict__[attribute]):

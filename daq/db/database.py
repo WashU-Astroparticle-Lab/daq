@@ -3,7 +3,9 @@
 MongoDB Atlas database integration for DAQ system.
 """
 from datetime import datetime
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Union
+
+import pandas as pd
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 
@@ -86,4 +88,129 @@ def insert_measurement(document: Dict[str, Any]) -> str:
     
     result = collection.insert_one(document)
     return str(result.inserted_id)
+
+
+def select_runs(
+    device: Optional[str] = None,
+    filter_name: Optional[str] = None,
+    notes: Optional[str] = None,
+    measurement_type: Optional[str] = None,
+    start_time: Optional[Union[datetime, str]] = None,
+    end_time: Optional[Union[datetime, str]] = None,
+    string_match: str = "exact",
+    **kwargs
+) -> pd.DataFrame:
+    """
+    Query the database for measurement runs matching specified criteria.
+    
+    Args:
+        device: Device name to filter by
+        filter_name: Filter name to filter by
+        notes: Notes text to filter by
+        measurement_type: Measurement type (e.g., "sweep", "timestream")
+        start_time: Start time for time range (datetime or ISO string)
+        end_time: End time for time range (datetime or ISO string)
+        string_match: Matching mode for string fields ("exact" or "regex")
+        **kwargs: Additional field filters (e.g., output_port=1, amp=0.1)
+    
+    Returns:
+        pd.DataFrame: DataFrame containing all matching documents with all
+            fields. Includes "number" as identifier and "file" as location.
+    """
+    collection = _get_collection()
+    query: Dict[str, Any] = {}
+    
+    # Helper function to add string field to query
+    def add_string_filter(
+        field: str, value: Optional[str], query_dict: Dict[str, Any]
+    ):
+        if value is not None:
+            if string_match == "regex":
+                query_dict[field] = {"$regex": value, "$options": "i"}
+            else:  # exact match
+                query_dict[field] = value
+    
+    # Add string field filters
+    add_string_filter("device", device, query)
+    add_string_filter("filter", filter_name, query)
+    add_string_filter("notes", notes, query)
+    add_string_filter("type", measurement_type, query)
+    
+    # Handle time range filtering
+    if start_time is not None or end_time is not None:
+        time_query: Dict[str, Any] = {}
+        
+        if start_time is not None:
+            if isinstance(start_time, str):
+                start_dt = datetime.fromisoformat(start_time.replace("Z", "+00:00"))
+            else:
+                start_dt = start_time
+            time_query["$gte"] = start_dt.isoformat()
+        
+        if end_time is not None:
+            if isinstance(end_time, str):
+                end_dt = datetime.fromisoformat(end_time.replace("Z", "+00:00"))
+            else:
+                end_dt = end_time
+            time_query["$lte"] = end_dt.isoformat()
+        
+        query["utc_time"] = time_query
+    
+    # Handle additional kwargs filters
+    for key, value in kwargs.items():
+        if value is not None:
+            # For string values, apply matching mode
+            if isinstance(value, str):
+                add_string_filter(key, value, query)
+            else:
+                query[key] = value
+    
+    # Execute query
+    cursor = collection.find(query)
+    results = list(cursor)
+    
+    # Handle empty results
+    if not results:
+        return pd.DataFrame()
+    
+    # Convert ObjectId to string for all documents
+    for doc in results:
+        if "_id" in doc:
+            doc["_id"] = str(doc["_id"])
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results)
+    
+    return df
+
+
+def list_devices() -> pd.DataFrame:
+    """
+    List all unique device names recorded in the database with their counts.
+    
+    Returns:
+        pd.DataFrame: DataFrame with columns ['device', 'count'] containing
+            all unique device names and the number of measurements for each.
+            Sorted by count in descending order.
+    """
+    collection = _get_collection()
+    
+    # Use aggregation pipeline to count measurements per device
+    pipeline = [
+        {"$match": {"device": {"$exists": True, "$ne": None}}},
+        {"$group": {"_id": "$device", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$project": {"_id": 0, "device": "$_id", "count": 1}}
+    ]
+    
+    results = list(collection.aggregate(pipeline))
+    
+    # Handle empty results
+    if not results:
+        return pd.DataFrame(columns=["device", "count"])
+    
+    # Convert to DataFrame
+    df = pd.DataFrame(results)
+    
+    return df
 
