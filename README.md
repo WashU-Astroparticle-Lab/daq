@@ -26,6 +26,7 @@ pip install -e .
 - numpy
 - h5py
 - matplotlib
+- pandas (for database querying)
 - pymongo (for database integration)
 - presto
 - resonator_tools
@@ -157,6 +158,215 @@ without fit fields.
 Data files are automatically named: `{number}-{device}-{type}.h5`
 
 Example: `00000042-Resonator_A-sweep.h5`
+
+### Querying the Database
+
+Use the `select_runs` function to query measurement runs from the database:
+
+```python
+from daq.db import select_runs
+import pandas as pd
+```
+
+#### Basic Queries
+
+**Query by device:**
+```python
+# Find all measurements for a specific device
+df = select_runs(device="Resonator_A")
+print(df[['number', 'file', 'utc_time', 'type']])
+```
+
+**Query by measurement type:**
+```python
+# Find all sweep measurements
+df = select_runs(measurement_type="sweep")
+```
+
+**Query with multiple filters:**
+```python
+# Find sweeps for a specific device
+df = select_runs(
+    device="Resonator_A",
+    measurement_type="sweep"
+)
+```
+
+#### Time Range Queries
+
+**Using ISO format strings:**
+```python
+# Find measurements in a date range
+df = select_runs(
+    start_time="2024-01-01T00:00:00",
+    end_time="2024-12-31T23:59:59"
+)
+```
+
+**Using datetime objects:**
+```python
+from datetime import datetime
+
+# Find measurements from the last week
+start = datetime(2024, 1, 1)
+end = datetime(2024, 1, 8)
+df = select_runs(start_time=start, end_time=end)
+```
+
+**Combine time range with other filters:**
+```python
+# Find recent sweeps for a specific device
+df = select_runs(
+    device="Resonator_A",
+    measurement_type="sweep",
+    start_time="2024-01-01T00:00:00",
+    end_time="2024-12-31T23:59:59"
+)
+```
+
+#### String Matching Modes
+
+**Exact matching (default):**
+```python
+# Exact match for device name
+df = select_runs(device="Resonator_A", string_match="exact")
+```
+
+**Partial/regex matching:**
+```python
+# Find all devices starting with "Resonator"
+df = select_runs(
+    device="Resonator",
+    string_match="regex"
+)
+
+# Find notes containing "cooldown" (case-insensitive)
+df = select_runs(
+    notes="cooldown",
+    string_match="regex"
+)
+```
+
+#### Advanced Filtering
+
+**Filter by additional measurement parameters:**
+```python
+# Find sweeps with specific amplitude
+df = select_runs(
+    measurement_type="sweep",
+    amp=0.1
+)
+
+# Find measurements with specific port configuration
+df = select_runs(
+    output_port=1,
+    input_port=1
+)
+
+# Combine multiple parameter filters
+df = select_runs(
+    device="Resonator_A",
+    measurement_type="sweep",
+    freq_center=5e9,
+    amp=0.1
+)
+```
+
+**Filter by fit results (for Sweep measurements):**
+```python
+# Find measurements with specific resonant frequency
+# Note: Fit fields may not exist for all measurements
+df = select_runs(measurement_type="sweep")
+df_with_fit = df[df['fit_fr'].notna()]
+df_filtered = df_with_fit[
+    (df_with_fit['fit_fr'] > 4.9e9) & 
+    (df_with_fit['fit_fr'] < 5.1e9)
+]
+```
+
+#### Working with Results
+
+The function returns a pandas DataFrame with all document fields:
+
+```python
+# Get all results
+df = select_runs(device="Resonator_A")
+
+# Display basic info
+print(f"Found {len(df)} measurements")
+print(df.columns.tolist())
+
+# Access specific fields
+for idx, row in df.iterrows():
+    print(f"Run {row['number']}: {row['file']}")
+    print(f"  Device: {row['device']}")
+    print(f"  Type: {row['type']}")
+    print(f"  Time: {row['utc_time']}")
+
+# Export to CSV
+df.to_csv('measurements.csv', index=False)
+
+# Filter DataFrame further
+recent_sweeps = df[
+    (df['type'] == 'sweep') & 
+    (df['utc_time'] > '2024-01-01')
+]
+```
+
+**Empty results:**
+```python
+# Returns empty DataFrame if no matches found
+df = select_runs(device="NonExistentDevice")
+print(df.empty)  # True
+print(len(df))   # 0
+```
+
+### Listing Devices
+
+Use the `list_devices` function to get all unique device names recorded in 
+the database:
+
+```python
+from daq.db import list_devices
+
+# Get all devices with their measurement counts
+devices_df = list_devices()
+print(devices_df)
+```
+
+**Example output:**
+```
+         device  count
+0  Resonator_A     42
+1  Resonator_B     31
+2   Detector_C     18
+```
+
+The results are sorted by count in descending order (most measurements first).
+
+**Working with device list:**
+```python
+# Get device names as a list
+devices_df = list_devices()
+device_names = devices_df['device'].tolist()
+print(f"Found {len(device_names)} devices: {device_names}")
+
+# Get device with most measurements
+top_device = devices_df.iloc[0]['device']
+print(f"Most measured device: {top_device}")
+
+# Filter devices with at least 10 measurements
+active_devices = devices_df[devices_df['count'] >= 10]
+print(active_devices)
+```
+
+**Empty database:**
+```python
+# Returns empty DataFrame with correct columns if no devices found
+devices_df = list_devices()
+print(devices_df.empty)  # True
+print(devices_df.columns.tolist())  # ['device', 'count']
+```
 
 ## Project Structure
 
