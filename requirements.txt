@@ -3,5 +3,5 @@ h5py
 matplotlib
 pymongo
 pandas
-git+https://github.com/FaroutYLq/resonator_tools.git
+resonator_tools
 
