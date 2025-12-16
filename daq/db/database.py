@@ -10,17 +10,14 @@ from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 
 # MongoDB Atlas connection URI
-MONGODB_URI = (
-    "mongodb+srv://lanqing_yuan:WdXq8PrrHj78zjYy@freec.f96deaj."
-    "mongodb.net/?appName=FreeC"
-)
+MONGODB_URI = "mongodb://localhost:27017"
 DB_NAME = "WashU_Astroparticle_Detector"
 COLLECTION_NAME = "measurement"
 
 
 def _get_collection():
     """Get the MongoDB collection for measurements."""
-    client = MongoClient(MONGODB_URI, server_api=ServerApi('1'))
+    client = MongoClient(MONGODB_URI)
     db = client[DB_NAME]
     collection = db[COLLECTION_NAME]
     return collection
