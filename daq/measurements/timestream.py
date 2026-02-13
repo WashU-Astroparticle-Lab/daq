@@ -2,7 +2,7 @@
 """
 TimeStream measurement class for acquiring time-domain data with multiple frequencies.
 """
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import h5py
 import numpy as np
@@ -28,6 +28,7 @@ class TimeStream(Base):
         output_port: int,
         input_port: int,
         dither: bool = True,
+        symmetric_lockin: bool = False,
         device: Optional[str] = None,
         filter: Optional[str] = None,
         notes: Optional[str] = None,
@@ -43,6 +44,7 @@ class TimeStream(Base):
         self.output_port = output_port
         self.input_port = input_port
         self.dither = dither
+        self.symmetric_lockin = symmetric_lockin
         self.device = device
         self.filter = filter
         self.notes = notes
@@ -61,6 +63,111 @@ class TimeStream(Base):
     def check_amp(self):
         assert self.amp.sum()<1.0, "Amplitude sum must be less than 1.0"
 
+    def _run_lockin(
+        self,
+        presto_address: str,
+        presto_port: int,
+        ext_ref_clk: bool,
+        save_filename: Optional[str],
+    ) -> None:
+        with lockin.Lockin(
+            address=presto_address,
+            port=presto_port,
+            ext_ref_clk=ext_ref_clk,
+            **self.DC_PARAMS,
+        ) as lck:
+            lck.hardware.set_adc_attenuation(
+                self.input_port, self.ADC_ATTENUATION
+            )
+            lck.hardware.set_dac_current(self.output_port, self.DAC_CURRENT)
+            lck.hardware.set_inv_sinc(self.output_port, 0)
+            lck.hardware.configure_mixer(
+                self.lo_freq,
+                out_ports=self.output_port,
+                in_ports=self.input_port,
+            )
+            lck.set_dither(self.dither, self.output_port)
+
+            _, self.df = lck.tune(0.0, self.df)
+            lck.set_df(self.df)
+
+            og = lck.add_output_group(
+                self.output_port, len(self.if_freqs)
+            )
+            og.set_frequencies(self.if_freqs)
+            og.set_amplitudes(self.amp)
+            og.set_phases(self.phases_i, self.phases_q)
+
+            ig = lck.add_input_group(
+                self.input_port, len(self.if_freqs)
+            )
+            ig.set_frequencies(self.if_freqs)
+
+            lck.apply_settings()
+
+            pixel_dict = lck.get_pixels(self.pixel_counts)
+            self.freq_arr, self.pixel_i, self.pixel_q = pixel_dict[
+                self.input_port
+            ]
+            self.lsb, self.usb = untwist_downconversion(
+                self.pixel_i, self.pixel_q
+            )
+
+            self.freqs_usb = self.lo_freq + self.if_freqs
+            self.freqs_lsb = self.lo_freq - self.if_freqs
+
+            og.set_amplitudes(0.0)
+            lck.apply_settings()
+
+    def _run_symmetric(
+        self,
+        presto_address: str,
+        presto_port: int,
+        ext_ref_clk: bool,
+        save_filename: Optional[str],
+    ) -> None:
+        with lockin.SymmetricLockin(
+            address=presto_address,
+            port=presto_port,
+            ext_ref_clk=ext_ref_clk,
+            **self.DC_PARAMS,
+        ) as lck:
+            lck.hardware.set_adc_attenuation(
+                self.input_port, self.ADC_ATTENUATION
+            )
+            lck.hardware.set_dac_current(self.output_port, self.DAC_CURRENT)
+            lck.hardware.set_inv_sinc(self.output_port, 0)
+            lck.hardware.configure_mixer(
+                self.lo_freq,
+                out_ports=self.output_port,
+                in_ports=self.input_port,
+            )
+            lck.set_dither(self.dither, self.output_port)
+
+            _, self.df = lck.tune(0.0, self.df)
+            lck.set_df(self.df)
+
+            sg = lck.add_symmetric_group(
+                self.input_port, self.output_port, len(self.if_freqs)
+            )
+            sg.set_frequencies(self.if_freqs)
+            sg.set_amplitudes(self.amp)
+            sg.set_phases(self.phases_i)
+
+            lck.apply_settings()
+
+            pixel_dict = lck.get_pixels(self.pixel_counts)
+            self.freq_arr, pixels = pixel_dict[self.input_port]
+            self.pixel_i = np.real(pixels)
+            self.pixel_q = np.imag(pixels)
+            self.usb = pixels
+            self.lsb = None
+            self.freqs_usb = self.lo_freq + self.if_freqs
+            self.freqs_lsb = self.lo_freq - self.if_freqs
+
+            sg.set_amplitudes(0.0)
+            lck.apply_settings()
+
     def run(
         self,
         presto_address: Optional[str] = None,
@@ -72,55 +179,41 @@ class TimeStream(Base):
             presto_address = get_presto_address()
         if presto_port is None:
             presto_port = get_presto_port()
-        with lockin.Lockin(
-            address=presto_address,
-            port=presto_port,
-            ext_ref_clk=ext_ref_clk,
-            **self.DC_PARAMS,
-        ) as lck:
-            lck.hardware.set_adc_attenuation(self.input_port, self.ADC_ATTENUATION)
-            lck.hardware.set_dac_current(self.output_port, self.DAC_CURRENT)
-            lck.hardware.set_inv_sinc(self.output_port, 0)
-            lck.hardware.configure_mixer(
-                self.lo_freq, 
-                out_ports=self.output_port, 
-                in_ports=self.input_port
+
+        if self.symmetric_lockin:
+            self._run_symmetric(
+                presto_address, presto_port, ext_ref_clk, save_filename
             )
-            lck.set_dither(self.dither, self.output_port)
-
-            _, self.df = lck.tune(0.0, self.df)
-            lck.set_df(self.df)
-
-            # Configure output group
-            og = lck.add_output_group(self.output_port, len(self.if_freqs))
-            og.set_frequencies(self.if_freqs)
-            og.set_amplitudes(self.amp)
-            og.set_phases(self.phases_i, self.phases_q)
-
-            # Configure input group
-            ig = lck.add_input_group(self.input_port, len(self.if_freqs))
-            ig.set_frequencies(self.if_freqs)
-
-            lck.apply_settings()
-
-            # Acquire data
-            pixel_dict = lck.get_pixels(self.pixel_counts)
-            
-            self.freq_arr, self.pixel_i, self.pixel_q = pixel_dict[self.input_port]
-            self.lsb, self.usb = untwist_downconversion(self.pixel_i, self.pixel_q)
-
-            # Calculate frequency arrays
-            self.freqs_usb = self.lo_freq + self.if_freqs
-            self.freqs_lsb = self.lo_freq - self.if_freqs
-
-            # Mute outputs at the end
-            og.set_amplitudes(0.0)
-            lck.apply_settings()
-
+        else:
+            self._run_lockin(
+                presto_address, presto_port, ext_ref_clk, save_filename
+            )
         return self.save(save_filename=save_filename)
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)
+
+    def _build_document(
+        self,
+        number: str,
+        measurement_type: str,
+        file_path: str,
+        device: str,
+        filter_name: Optional[str],
+        notes: Optional[str],
+    ) -> Dict[str, Any]:
+        document = super()._build_document(
+            number=number,
+            measurement_type=measurement_type,
+            file_path=file_path,
+            device=device,
+            filter_name=filter_name,
+            notes=notes,
+        )
+        document["lockin_type"] = (
+            "SymmetricLockin" if self.symmetric_lockin else "Lockin"
+        )
+        return document
 
     @classmethod
     def load(cls, load_filename: str) -> "TimeStream":
@@ -131,6 +224,9 @@ class TimeStream(Base):
             output_port = int(h5f.attrs["output_port"])  # type: ignore
             input_port = int(h5f.attrs["input_port"])  # type: ignore
             dither = bool(h5f.attrs["dither"])  # type: ignore
+            symmetric_lockin = bool(
+                h5f.attrs["symmetric_lockin"]
+            ) if "symmetric_lockin" in h5f.attrs else False
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
@@ -153,6 +249,7 @@ class TimeStream(Base):
             output_port=output_port,
             input_port=input_port,
             dither=dither,
+            symmetric_lockin=symmetric_lockin,
         )
 
         # Restore data arrays
