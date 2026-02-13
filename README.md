@@ -92,6 +92,31 @@ filepath = ts.run()
 ts.analyze()
 ```
 
+**Symmetric lock-in (optional):** For setups where the same frequencies are
+used on input and output, you can use Presto’s `SymmetricLockin` backend by
+setting `symmetric_lockin=True`. The database stores the lockin type so you
+can filter later (e.g. `select_runs(lockin_type="SymmetricLockin")`).
+
+```python
+from daq import TimeStream
+
+# TimeStream with SymmetricLockin (same frequencies on input and output)
+ts_sym = TimeStream(
+    lo_freq=5e9,
+    if_freqs=[10e6, 20e6],
+    df=1e3,
+    pixel_counts=10000,
+    amp=[0.05, 0.05],
+    output_port=1,
+    input_port=1,
+    device="Detector_B",
+    symmetric_lockin=True,   # Use SymmetricLockin backend
+    notes="Noise measurement (symmetric)"
+)
+filepath = ts_sym.run()
+ts_sym.analyze()
+```
+
 ### TwoTonePower Measurement
 
 ```python
@@ -139,6 +164,7 @@ Each measurement creates a document with:
 - `file`: Full path to HDF5 data file
 - `output_port`, `input_port`: Port numbers
 - `amp`: Readout amplitude
+- `lockin_type`: For TimeStream, `"Lockin"` or `"SymmetricLockin"`
 - All measurement-specific parameters (freq_center, lo_freq, etc.)
 
 **For Sweep measurements with automatic fitting enabled**, the document 
@@ -269,6 +295,12 @@ df = select_runs(
     measurement_type="sweep",
     freq_center=5e9,
     amp=0.1
+)
+
+# Find TimeStream runs that used SymmetricLockin
+df = select_runs(
+    measurement_type="timestream",
+    lockin_type="SymmetricLockin"
 )
 ```
 
