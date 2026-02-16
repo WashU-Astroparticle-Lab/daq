@@ -31,6 +31,7 @@ class TimeStream(Base):
         device: Optional[str] = None,
         filter: Optional[str] = None,
         notes: Optional[str] = None,
+        external_trigger: Optional[bool] = False # WH change
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
@@ -46,6 +47,7 @@ class TimeStream(Base):
         self.device = device
         self.filter = filter
         self.notes = notes
+        self.external_trigger = external_trigger # WH Change
 
         # Data arrays - set by run method
         self.freq_arr = None
@@ -101,6 +103,9 @@ class TimeStream(Base):
             ig = lck.add_input_group(self.input_port, len(self.if_freqs))
             ig.set_frequencies(self.if_freqs)
 
+            if self.external_trigger:
+                lck.set_trigger_out([1], width=0.03) # Trigger signal as soon as "lck.apply_settings" is called
+            
             lck.apply_settings()
 
             # Acquire data
@@ -114,6 +119,8 @@ class TimeStream(Base):
             self.freqs_lsb = self.lo_freq - self.if_freqs
 
             # Mute outputs at the end
+            if self.external_trigger:
+                lck.set_trigger_out([0]) # Turns off trigger signal
             og.set_amplitudes(0.0)
             lck.apply_settings()
 
