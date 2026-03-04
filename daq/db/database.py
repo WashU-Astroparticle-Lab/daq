@@ -1,25 +1,23 @@
 # -*- coding: utf-8 -*-
-"""
-MongoDB Atlas database integration for DAQ system.
-"""
+"""MongoDB database integration for DAQ system."""
 from datetime import datetime
 from typing import Any, Dict, Optional, Union
 
 import pandas as pd
 from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
 
-# MongoDB Atlas connection URI
-MONGODB_URI = "mongodb://localhost:27017"
-DB_NAME = "WashU_Astroparticle_Detector"
-COLLECTION_NAME = "measurement"
+from ..config import (
+    get_mongodb_collection_name,
+    get_mongodb_db_name,
+    get_mongodb_uri,
+)
 
 
 def _get_collection():
     """Get the MongoDB collection for measurements."""
-    client = MongoClient(MONGODB_URI)
-    db = client[DB_NAME]
-    collection = db[COLLECTION_NAME]
+    client = MongoClient(get_mongodb_uri())
+    db = client[get_mongodb_db_name()]
+    collection = db[get_mongodb_collection_name()]
     return collection
 
 
@@ -210,4 +208,3 @@ def list_devices() -> pd.DataFrame:
     df = pd.DataFrame(results)
     
     return df
-

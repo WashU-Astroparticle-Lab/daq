@@ -16,7 +16,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray, rotate_opt
 
 from .._base import Base
-from ..utils import get_presto_address, get_presto_port
+from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -404,4 +404,3 @@ class TwoTonePower(Base):
             fig1.canvas.blit(fig1.bbox)
 
         return fig1
-

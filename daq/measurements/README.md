@@ -295,9 +295,11 @@ All measurements save data in HDF5 format with:
 
 ## Database Integration
 
-All measurements automatically log to MongoDB Atlas:
-- **Database**: "WashU_Astroparticle_Detector"
-- **Collection**: "measurement"
+All measurements log to MongoDB when the configured server is available.
+Default configuration:
+- **URI**: `mongodb://localhost:27017`
+- **Database**: `WashU_Astroparticle_Detector`
+- **Collection**: `measurement`
 - **Document Fields**: All measurement parameters + metadata
 - **Fit Results**: Sweep measurements include resonator fit parameters
 
@@ -341,4 +343,3 @@ loaded.analyze()
 - Measurement type is automatically determined from class name
 - Large data arrays are excluded from database (stored only in HDF5 files)
 - All measurements inherit error handling and robustness from `Base` class
-
