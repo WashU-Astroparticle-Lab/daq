@@ -14,7 +14,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray
 
 from .._base import Base
-from ..utils import get_presto_address, get_presto_port
+from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -47,11 +47,16 @@ class SweepPower(Base):
 
     def run(
         self,
-        presto_address: Optional[str] = get_presto_address(),
-        presto_port: Optional[int] = get_presto_port(),
+        presto_address: Optional[str] = None,
+        presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
         save_filename: Optional[str] = None
     ) -> str:
+        if presto_address is None:
+            presto_address = get_presto_address()
+        if presto_port is None:
+            presto_port = get_presto_port()
+
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,

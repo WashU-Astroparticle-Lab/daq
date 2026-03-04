@@ -1,39 +1,63 @@
-from datetime import date, datetime
-import os
+# -*- coding: utf-8 -*-
+"""Backward-compatible utility API.
 
-PRESTO_ADDRESS = "172.23.20.29"
-PRESTO_PORT = None  # Use system default port
-DATA_FOLDER = os.path.join(
-    os.path.dirname(os.path.dirname(__file__)), "data"
+This module is retained for compatibility. New code should import configuration
+from :mod:`daq.config` and date helpers from :mod:`daq.time_utils`.
+"""
+
+from __future__ import annotations
+
+import warnings
+from typing import Optional
+
+from .config import (
+    get_data_folder as _get_data_folder,
+    get_presto_address as _get_presto_address,
+    get_presto_port as _get_presto_port,
+    get_settings,
 )
+from .time_utils import get_date_str, get_date_str_with_time
 
-def get_date_str():
-    """Get the current date as a string in the format YYYYMMDD
-    """
-    today = date.today()
-    date_str = f"{today.year}{today.month:02d}{today.day:02d}"
-    return date_str
-
-def get_date_str_with_time():
-    """Get the current date and time as a string in the format YYYYMMDD_HHMMSS
-    """
-    today = datetime.now()
-    date_str = f"{today.year}{today.month:02d}{today.day:02d}_{today.hour:02d}{today.minute:02d}{today.second:02d}"
-    return date_str
-
-def get_presto_address():
-    """Get the address of the presto device.
-    """
-    return PRESTO_ADDRESS
+_settings = get_settings()
+PRESTO_ADDRESS = _settings.presto_address
+PRESTO_PORT = _settings.presto_port
+DATA_FOLDER = str(_settings.data_folder)
 
 
-def get_presto_port():
-    """Get the port of the presto device.
-    """
-    return PRESTO_PORT
+def _warn_deprecated(name: str, replacement: str) -> None:
+    """Emit deprecation warning for compatibility wrappers."""
+    warnings.warn(
+        f"daq.utils.{name} is deprecated; use {replacement} instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
 
 
-def get_data_folder():
-    """Get the data folder path.
-    """
-    return DATA_FOLDER
+def get_presto_address() -> str:
+    """Return configured Presto address (compat wrapper)."""
+    _warn_deprecated("get_presto_address", "daq.config.get_presto_address")
+    return _get_presto_address()
+
+
+def get_presto_port() -> Optional[int]:
+    """Return configured Presto port (compat wrapper)."""
+    _warn_deprecated("get_presto_port", "daq.config.get_presto_port")
+    return _get_presto_port()
+
+
+def get_data_folder() -> str:
+    """Return configured data folder path (compat wrapper)."""
+    _warn_deprecated("get_data_folder", "daq.config.get_data_folder")
+    return _get_data_folder()
+
+
+__all__ = [
+    "PRESTO_ADDRESS",
+    "PRESTO_PORT",
+    "DATA_FOLDER",
+    "get_date_str",
+    "get_date_str_with_time",
+    "get_presto_address",
+    "get_presto_port",
+    "get_data_folder",
+]

@@ -123,9 +123,11 @@ tt.analyze(quantity="quadrature", linecut=True)
 
 ## MongoDB Database Integration
 
-All measurements are automatically logged to MongoDB Atlas:
-- **Database**: "WashU_Astroparticle_Detector"
-- **Collection**: "measurement"
+Measurements are logged to MongoDB when the configured server is available.
+Default configuration:
+- **URI**: `mongodb://localhost:27017`
+- **Database**: `WashU_Astroparticle_Detector`
+- **Collection**: `measurement`
 
 ### Document Structure
 
@@ -382,17 +384,29 @@ daq/
 │   └── database.py
 ├── analysis/           # Analysis tools
 │   └── mattis_bardeen.py
+├── config.py           # Runtime configuration (env + defaults)
+├── time_utils.py       # Date/time helpers
 ├── _base.py            # Base class for measurements
-└── utils.py            # Utility functions
+└── utils.py            # Backward-compatible utility facade
 
 data/                   # Data storage directory
 ```
 
 ## Configuration
 
-Edit `daq/utils.py` to configure:
-- `PRESTO_ADDRESS`: Presto device IP address
-- `PRESTO_PORT`: Presto device port
-- `DATA_FOLDER`: Data storage location
+Set environment variables to configure runtime behavior:
+- `DAQ_PRESTO_ADDRESS`: Presto device IP address (default: `172.23.20.29`)
+- `DAQ_PRESTO_PORT`: Presto device port (default: unset, Presto default port)
+- `DAQ_DATA_FOLDER`: Data storage location (default: `<repo>/data`)
+- `DAQ_MONGODB_URI`: MongoDB URI (default: `mongodb://localhost:27017`)
+- `DAQ_MONGODB_DB_NAME`: MongoDB database name
+- `DAQ_MONGODB_COLLECTION_NAME`: MongoDB collection name
 
-Database credentials are configured in `daq/db/database.py`.
+`daq/utils.py` is retained for backward compatibility, but new code should use
+`daq.config` for configuration and `daq.time_utils` for datetime helpers.
+
+## Style Conventions
+
+- Use Sphinx-style docstrings for public classes/functions.
+- Use complete type annotations for public APIs.
+- Prefer `Optional[T]` consistently when `None` is allowed.

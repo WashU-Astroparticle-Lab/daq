@@ -12,7 +12,7 @@ from presto import lockin
 from presto.utils import ProgressBar, recommended_dac_config
 
 from .._base import Base
-from ..utils import get_presto_address, get_presto_port
+from ..config import get_presto_address, get_presto_port
 
 class Sweep(Base):
     def __init__(

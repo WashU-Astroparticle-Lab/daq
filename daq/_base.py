@@ -10,8 +10,8 @@ import numpy as np
 from presto.hardware import AdcMode, DacMode
 from presto.utils import get_sourcecode
 
+from .config import get_data_folder
 from .db import get_next_number, insert_measurement, generate_filename
-from .utils import get_data_folder
 
 
 class Base:

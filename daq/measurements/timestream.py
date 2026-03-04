@@ -12,7 +12,7 @@ from presto import lockin
 from presto.utils import untwist_downconversion
 
 from .._base import Base
-from ..utils import get_presto_address, get_presto_port
+from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -31,7 +31,7 @@ class TimeStream(Base):
         device: Optional[str] = None,
         filter: Optional[str] = None,
         notes: Optional[str] = None,
-        external_trigger: Optional[bool] = False # WH change
+        external_trigger: bool = False,
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
@@ -47,7 +47,7 @@ class TimeStream(Base):
         self.device = device
         self.filter = filter
         self.notes = notes
-        self.external_trigger = external_trigger # WH Change
+        self.external_trigger = external_trigger
 
         # Data arrays - set by run method
         self.freq_arr = None
@@ -60,8 +60,8 @@ class TimeStream(Base):
 
         self.check_amp()
 
-    def check_amp(self):
-        assert self.amp.sum()<1.0, "Amplitude sum must be less than 1.0"
+    def check_amp(self) -> None:
+        assert self.amp.sum() < 1.0, "Amplitude sum must be less than 1.0"
 
     def run(
         self,
