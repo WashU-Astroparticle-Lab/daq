@@ -19,8 +19,8 @@ class Base:
     Base class for measurements
     """
 
-    DAC_CURRENT: int = 32_000
-    """μA -- Change to increase or decrease DAC analog output range"""
+    DAC_CURRENT: int = 40_500
+    """μA -- Hardcoded to hardware maximum DAC analog output range"""
     ADC_ATTENUATION: float = 0.0  # dB
     """dB -- Change to increase or decrease ADC analog input range"""
     DC_PARAMS: dict = {
