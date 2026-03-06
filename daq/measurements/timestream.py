@@ -92,12 +92,6 @@ class TimeStream(Base):
 
             _, self.df = lck.tune(0.0, self.df)
             lck.set_df(self.df)
-
-            # Do not phase if any IF frequency is non-zero, 
-            # otherwise the frequencies will be tuned away from the desired frequencies.
-            # The mechanism of ths forced tuning when allowing resetting phase is not clear.
-            # The cost of disabling phase resetting is that the phase will drift at scale of µHz.
-            # Reference: https://mynotebook.labarchives.com/share/Qubit%2520&%2520KID/MjM3Ljl8MTE1MjQ2MC8xODMvVHJlZU5vZGUvMzgxNTI3MjY1MXw2MDMuOQ==
             if np.any(~np.isclose(self.if_freqs, 0.0)):
                 lck.set_phase_reset(False)
 
