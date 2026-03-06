@@ -92,7 +92,8 @@ class TimeStream(Base):
 
             _, self.df = lck.tune(0.0, self.df)
             lck.set_df(self.df)
-            lck.set_phase_reset(False)
+            if np.any(~np.isclose(self.if_freqs, 0.0)):
+                lck.set_phase_reset(False)
 
             # Configure output group
             og = lck.add_output_group(self.output_port, len(self.if_freqs))
