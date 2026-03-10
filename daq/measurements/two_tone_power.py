@@ -16,7 +16,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray, rotate_opt
 
 from .._base import Base
-from ..calibrations import amp_to_power_dbm
+from ..calibrations import amp_to_power_dbm_hz
 from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
@@ -254,7 +254,7 @@ class TwoTonePower(Base):
 
         if quantity == "dB":
             data = 20.0 * np.log10(np.abs(self.resp_arr))
-            unit = "dBFS"
+            unit = "dB"
             title = "Response amplitude"
         elif quantity == "phase":
             data = np.angle(self.resp_arr)
@@ -280,7 +280,7 @@ class TwoTonePower(Base):
                 data *= 1e3
             unit += "FS"
 
-        power_dbm = amp_to_power_dbm(self.control_freq_center * 1e-9, self.control_amp_arr)
+        power_dbm = amp_to_power_dbm_hz(self.control_freq_center, self.control_amp_arr)
 
         # choose limits for colorbar
         cutoff = 1.0  # %
@@ -293,7 +293,7 @@ class TwoTonePower(Base):
         dx = 1e-9 * (self.control_freq_arr[1] - self.control_freq_arr[0])
         y_min = power_dbm[0]
         y_max = power_dbm[-1]
-        dy = power_dbm[1] - power_dbm[0]
+        dy = power_dbm[1] - power_dbm[0] if len(power_dbm) > 1 else 1.0
 
         if linecut:
             fig1 = plt.figure(tight_layout=True, figsize=(6.4, 7.2))

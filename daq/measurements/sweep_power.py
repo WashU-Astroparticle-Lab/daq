@@ -14,7 +14,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray
 
 from .._base import Base
-from ..calibrations import amp_to_power_dbm
+from ..calibrations import amp_to_power_dbm_hz
 from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
@@ -189,7 +189,7 @@ class SweepPower(Base):
             resp_scaled = self.resp_arr
 
         resp_dB = 20.0 * np.log10(np.abs(resp_scaled))
-        power_dbm = amp_to_power_dbm(self.freq_center * 1e-9, self.amp_arr)
+        power_dbm = amp_to_power_dbm_hz(self.freq_center, self.amp_arr)
 
         # choose limits for colorbar
         cutoff = 1.0  # %
@@ -202,7 +202,7 @@ class SweepPower(Base):
         dx = 1e-9 * (self.freq_arr[1] - self.freq_arr[0])
         y_min = power_dbm[0]
         y_max = power_dbm[-1]
-        dy = power_dbm[1] - power_dbm[0]
+        dy = power_dbm[1] - power_dbm[0] if len(power_dbm) > 1 else 1.0
 
         if portrait:
             fig1 = plt.figure(tight_layout=True, figsize=(6.4, 9.6))
