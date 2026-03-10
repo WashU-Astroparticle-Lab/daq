@@ -10,6 +10,7 @@ import numpy as np
 from presto.hardware import AdcMode, DacMode
 from presto.utils import get_sourcecode
 
+from .calibrations import amp_to_power_dbm
 from .config import get_data_folder
 from .db import get_next_number, insert_measurement, generate_filename
 
@@ -225,4 +226,62 @@ class Base:
                 except Exception:
                     pass
         
+        # Add calibrated power in dBm for all amp-related fields
+        self._add_power_dbm_fields(document)
+
         return document
+
+    def _add_power_dbm_fields(self, document: Dict[str, Any]) -> None:
+        """Compute calibrated power in dBm and add to the document.
+
+        Handles the amp/frequency pairings for each measurement type:
+
+        - ``amp`` (scalar) at ``freq_center`` → ``power_dbm``
+        - ``amp_arr`` at ``freq_center`` → ``power_dbm_arr``
+        - ``readout_amp`` at ``readout_freq`` → ``readout_power_dbm``
+        - ``control_amp_arr`` at ``control_freq_center`` → ``control_power_dbm_arr``
+        - ``amp`` (array) at ``lo_freq + if_freqs`` → ``power_dbm`` (per-tone)
+        """
+        try:
+            # Sweep, SweepFreqAndDC: scalar amp at freq_center
+            if hasattr(self, "amp") and hasattr(self, "freq_center"):
+                amp_val = getattr(self, "amp")
+                freq_hz = getattr(self, "freq_center")
+                if np.isscalar(amp_val):
+                    document["power_dbm"] = float(
+                        amp_to_power_dbm(freq_hz * 1e-9, amp_val)
+                    )
+
+            # TimeStream: per-tone amp array at lo_freq + if_freqs
+            if hasattr(self, "amp") and hasattr(self, "lo_freq") and hasattr(self, "if_freqs"):
+                amp_val = np.asarray(getattr(self, "amp"))
+                lo_freq = getattr(self, "lo_freq")
+                if_freqs = np.asarray(getattr(self, "if_freqs"))
+                if amp_val.ndim >= 1:
+                    tone_freqs_ghz = (lo_freq + if_freqs) * 1e-9
+                    power_list = [
+                        float(amp_to_power_dbm(f, a))
+                        for f, a in zip(tone_freqs_ghz, amp_val)
+                    ]
+                    document["power_dbm"] = power_list
+
+            # SweepPower: amp_arr at freq_center
+            if hasattr(self, "amp_arr") and hasattr(self, "freq_center"):
+                freq_ghz = getattr(self, "freq_center") * 1e-9
+                arr = np.asarray(getattr(self, "amp_arr"))
+                document["power_dbm_arr"] = amp_to_power_dbm(freq_ghz, arr).tolist()
+
+            # TwoTonePower: readout_amp at readout_freq, control_amp_arr at control_freq_center
+            if hasattr(self, "readout_amp") and hasattr(self, "readout_freq"):
+                document["readout_power_dbm"] = float(
+                    amp_to_power_dbm(
+                        getattr(self, "readout_freq") * 1e-9,
+                        getattr(self, "readout_amp"),
+                    )
+                )
+            if hasattr(self, "control_amp_arr") and hasattr(self, "control_freq_center"):
+                freq_ghz = getattr(self, "control_freq_center") * 1e-9
+                arr = np.asarray(getattr(self, "control_amp_arr"))
+                document["control_power_dbm_arr"] = amp_to_power_dbm(freq_ghz, arr).tolist()
+        except Exception as e:
+            print(f"WARN: Failed to compute calibrated power: {e}")

@@ -192,7 +192,14 @@ Each measurement creates a document with:
 - `amp`: Readout amplitude
 - All measurement-specific parameters (freq_center, lo_freq, etc.)
 
-**For Sweep measurements with automatic fitting enabled**, the document 
+**Calibrated power fields** are automatically added to every document:
+- `power_dbm`: Calibrated output power in dBm (scalar for Sweep/SweepFreqAndDC,
+  per-tone list for TimeStream)
+- `power_dbm_arr`: Calibrated drive power array in dBm (SweepPower)
+- `readout_power_dbm`: Calibrated probe power in dBm (TwoTonePower)
+- `control_power_dbm_arr`: Calibrated pump power array in dBm (TwoTonePower)
+
+**For Sweep measurements with automatic fitting enabled**, the document
 also includes fit results:
 - `fit_fr`, `fit_fr_err`: Resonant frequency and error (Hz)
 - `fit_Qi`, `fit_Qi_err`: Internal quality factor and error
