@@ -121,6 +121,55 @@ filepath = tt.run()
 tt.analyze(quantity="quadrature", linecut=True)
 ```
 
+## Power Calibration
+
+The DAQ package includes a power calibration module that translates between
+DAC full-scale amplitude (`amp`) and actual output power in dBm. The
+calibration is based on an interpolator stored in
+`daq/calibrations/power_cal_interpolator.pkl`.
+
+### Amp to Power (dBm)
+
+```python
+from daq import amp_to_power_dbm
+
+# Get the output power at 7.45 GHz for amp = 0.1
+power = amp_to_power_dbm(7.45, 0.1)
+print(f"Power = {power:.1f} dBm")
+```
+
+### Power (dBm) to Amp
+
+If you know the desired output power in dBm, you can convert it back to the
+DAC amplitude to pass to measurement classes:
+
+```python
+from daq import power_dbm_to_amp
+
+# Find the amp needed for -20 dBm at 5.0 GHz
+amp = power_dbm_to_amp(5.0, -20.0)
+print(f"amp = {amp:.4f}")
+
+# Use in a measurement
+from daq import Sweep
+
+sweep = Sweep(
+    freq_center=5e9,
+    freq_span=100e6,
+    df=1e3,
+    num_averages=100,
+    amp=power_dbm_to_amp(5.0, -20.0),
+    output_port=1,
+    input_port=1,
+    device="Resonator_A",
+)
+```
+
+### Plots
+
+`SweepPower` and `TwoTonePower` analyses automatically display calibrated
+power in dBm on their y-axes instead of the raw DAC amplitude.
+
 ## MongoDB Database Integration
 
 Measurements are logged to MongoDB when the configured server is available.

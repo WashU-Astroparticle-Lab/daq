@@ -120,7 +120,7 @@ ts.analyze()
 - `freq_span`: Frequency span (Hz)
 - `df`: Frequency resolution (Hz)
 - `num_averages`: Number of averages per point
-- `amp_arr`: Array of drive amplitudes
+- `amp_arr`: Array of drive amplitudes (fraction of full scale; use `power_dbm_to_amp` to convert from dBm)
 - `output_port`: DAC output port
 - `input_port`: ADC input port
 - `device`: Device name (required for DB)
@@ -219,7 +219,7 @@ frequency, fixed probe.
 - `control_freq_span`: Pump frequency span (Hz)
 - `df`: Frequency resolution (Hz)
 - `readout_amp`: Probe amplitude
-- `control_amp_arr`: Array of pump amplitudes
+- `control_amp_arr`: Array of pump amplitudes (fraction of full scale; use `power_dbm_to_amp` to convert from dBm)
 - `readout_port`: Probe output port
 - `control_port`: Pump output port
 - `input_port`: ADC input port
