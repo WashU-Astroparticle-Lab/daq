@@ -121,6 +121,55 @@ filepath = tt.run()
 tt.analyze(quantity="quadrature", linecut=True)
 ```
 
+## Power Calibration
+
+The DAQ package includes a power calibration module that translates between
+DAC full-scale amplitude (`amp`) and actual output power in dBm. The
+calibration is based on an interpolator stored in
+`daq/calibrations/power_cal_interpolator.pkl`.
+
+### Amp to Power (dBm)
+
+```python
+from daq import amp_to_power_dbm
+
+# Get the output power at 7.45 GHz for amp = 0.1
+power = amp_to_power_dbm(7.45, 0.1)
+print(f"Power = {power:.1f} dBm")
+```
+
+### Power (dBm) to Amp
+
+If you know the desired output power in dBm, you can convert it back to the
+DAC amplitude to pass to measurement classes:
+
+```python
+from daq import power_dbm_to_amp
+
+# Find the amp needed for -20 dBm at 5.0 GHz
+amp = power_dbm_to_amp(5.0, -20.0)
+print(f"amp = {amp:.4f}")
+
+# Use in a measurement
+from daq import Sweep
+
+sweep = Sweep(
+    freq_center=5e9,
+    freq_span=100e6,
+    df=1e3,
+    num_averages=100,
+    amp=power_dbm_to_amp(5.0, -20.0),
+    output_port=1,
+    input_port=1,
+    device="Resonator_A",
+)
+```
+
+### Plots
+
+`SweepPower` and `TwoTonePower` analyses automatically display calibrated
+power in dBm on their y-axes instead of the raw DAC amplitude.
+
 ## MongoDB Database Integration
 
 Measurements are logged to MongoDB when the configured server is available.
@@ -143,7 +192,14 @@ Each measurement creates a document with:
 - `amp`: Readout amplitude
 - All measurement-specific parameters (freq_center, lo_freq, etc.)
 
-**For Sweep measurements with automatic fitting enabled**, the document 
+**Calibrated power fields** are automatically added to every document:
+- `power_dbm`: Calibrated output power in dBm (scalar for Sweep/SweepFreqAndDC,
+  per-tone list for TimeStream)
+- `power_dbm_arr`: Calibrated drive power array in dBm (SweepPower)
+- `readout_power_dbm`: Calibrated probe power in dBm (TwoTonePower)
+- `control_power_dbm_arr`: Calibrated pump power array in dBm (TwoTonePower)
+
+**For Sweep measurements with automatic fitting enabled**, the document
 also includes fit results:
 - `fit_fr`, `fit_fr_err`: Resonant frequency and error (Hz)
 - `fit_Qi`, `fit_Qi_err`: Internal quality factor and error

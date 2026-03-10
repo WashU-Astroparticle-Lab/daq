@@ -16,6 +16,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray, rotate_opt
 
 from .._base import Base
+from ..calibrations import amp_to_power_dbm_hz
 from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
@@ -253,7 +254,7 @@ class TwoTonePower(Base):
 
         if quantity == "dB":
             data = 20.0 * np.log10(np.abs(self.resp_arr))
-            unit = "dBFS"
+            unit = "dB"
             title = "Response amplitude"
         elif quantity == "phase":
             data = np.angle(self.resp_arr)
@@ -279,7 +280,7 @@ class TwoTonePower(Base):
                 data *= 1e3
             unit += "FS"
 
-        amp_dBFS = 20 * np.log10(self.control_amp_arr / 1.0)
+        power_dbm = amp_to_power_dbm_hz(self.control_freq_center, self.control_amp_arr)
 
         # choose limits for colorbar
         cutoff = 1.0  # %
@@ -290,9 +291,9 @@ class TwoTonePower(Base):
         x_min = 1e-9 * self.control_freq_arr[0]
         x_max = 1e-9 * self.control_freq_arr[-1]
         dx = 1e-9 * (self.control_freq_arr[1] - self.control_freq_arr[0])
-        y_min = amp_dBFS[0]
-        y_max = amp_dBFS[-1]
-        dy = amp_dBFS[1] - amp_dBFS[0]
+        y_min = power_dbm[0]
+        y_max = power_dbm[-1]
+        dy = power_dbm[1] - power_dbm[0] if len(power_dbm) > 1 else 1.0
 
         if linecut:
             fig1 = plt.figure(tight_layout=True, figsize=(6.4, 7.2))
@@ -317,11 +318,11 @@ class TwoTonePower(Base):
         )
         if linecut:
             line_sel = ax1.axhline(
-                amp_dBFS[self._AMP_IDX], ls="--", c="k", lw=3, animated=blit
+                power_dbm[self._AMP_IDX], ls="--", c="k", lw=3, animated=blit
             )
         ax1.set_title(f"Probe frequency: {self.readout_freq / 1e9:.2f} GHz")
         ax1.set_xlabel("Pump frequency [GHz]")
-        ax1.set_ylabel("Pump amplitude [dBFS]")
+        ax1.set_ylabel("Pump power [dBm]")
         cb = fig1.colorbar(im)
         cb.set_label(f"{title:s} [{unit:s}]")
 
@@ -351,7 +352,7 @@ class TwoTonePower(Base):
             def onbuttonpress(event):
                 if event.inaxes == ax1:
                     self._AMP_IDX = np.argmin(
-                        np.abs(amp_dBFS - event.ydata)
+                        np.abs(power_dbm - event.ydata)
                     )
                     update()
 
@@ -359,8 +360,8 @@ class TwoTonePower(Base):
                 if event.inaxes == ax1:
                     if event.key == "up":
                         self._AMP_IDX += 1
-                        if self._AMP_IDX >= len(amp_dBFS):
-                            self._AMP_IDX = len(amp_dBFS) - 1
+                        if self._AMP_IDX >= len(power_dbm):
+                            self._AMP_IDX = len(power_dbm) - 1
                         update()
                     elif event.key == "down":
                         self._AMP_IDX -= 1
@@ -370,12 +371,11 @@ class TwoTonePower(Base):
 
             def update():
                 line_sel.set_ydata(
-                    [amp_dBFS[self._AMP_IDX], amp_dBFS[self._AMP_IDX]]
+                    [power_dbm[self._AMP_IDX], power_dbm[self._AMP_IDX]]
                 )  # pyright: ignore [reportPossiblyUnboundVariable]
                 print(
                     f"drive amp {self._AMP_IDX:d}: "
-                    f"{self.control_amp_arr[self._AMP_IDX]:.2e} FS = "
-                    f"{amp_dBFS[self._AMP_IDX]:.1f} dBFS"
+                    f"Power = {power_dbm[self._AMP_IDX]:.1f} dBm"
                 )
                 line_a.set_ydata(data[self._AMP_IDX])
                 if blit:

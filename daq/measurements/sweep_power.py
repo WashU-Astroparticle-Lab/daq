@@ -14,6 +14,7 @@ from presto import lockin
 from presto.utils import ProgressBar, asarray
 
 from .._base import Base
+from ..calibrations import amp_to_power_dbm_hz
 from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
@@ -188,7 +189,7 @@ class SweepPower(Base):
             resp_scaled = self.resp_arr
 
         resp_dB = 20.0 * np.log10(np.abs(resp_scaled))
-        amp_dBFS = 20 * np.log10(self.amp_arr / 1.0)
+        power_dbm = amp_to_power_dbm_hz(self.freq_center, self.amp_arr)
 
         # choose limits for colorbar
         cutoff = 1.0  # %
@@ -199,9 +200,9 @@ class SweepPower(Base):
         x_min = 1e-9 * self.freq_arr[0]
         x_max = 1e-9 * self.freq_arr[-1]
         dx = 1e-9 * (self.freq_arr[1] - self.freq_arr[0])
-        y_min = amp_dBFS[0]
-        y_max = amp_dBFS[-1]
-        dy = amp_dBFS[1] - amp_dBFS[0]
+        y_min = power_dbm[0]
+        y_max = power_dbm[-1]
+        dy = power_dbm[1] - power_dbm[0] if len(power_dbm) > 1 else 1.0
 
         if portrait:
             fig1 = plt.figure(tight_layout=True, figsize=(6.4, 9.6))
@@ -218,10 +219,10 @@ class SweepPower(Base):
             vmin=lowlim,  # type: ignore
             vmax=highlim,  # type: ignore
         )
-        line_sel = ax1.axhline(amp_dBFS[self._AMP_IDX], ls="--", c="k", lw=3, animated=blit)
+        line_sel = ax1.axhline(power_dbm[self._AMP_IDX], ls="--", c="k", lw=3, animated=blit)
         # ax1.set_title(f"amp = {amp_arr[AMP_IDX]:.2e}")
         ax1.set_xlabel("Frequency [GHz]")
-        ax1.set_ylabel("Drive amplitude [dBFS]")
+        ax1.set_ylabel("Drive power [dBm]")
         cb = fig1.colorbar(im)
         if portrait:
             cb.set_label("Response amplitude [dB]")
@@ -282,15 +283,15 @@ class SweepPower(Base):
 
         def onbuttonpress(event):
             if event.inaxes == ax1:
-                self._AMP_IDX = np.argmin(np.abs(amp_dBFS - event.ydata))
+                self._AMP_IDX = np.argmin(np.abs(power_dbm - event.ydata))
                 update()
 
         def onkeypress(event):
             if event.inaxes == ax1:
                 if event.key == "up":
                     self._AMP_IDX += 1
-                    if self._AMP_IDX >= len(amp_dBFS):
-                        self._AMP_IDX = len(amp_dBFS) - 1
+                    if self._AMP_IDX >= len(power_dbm):
+                        self._AMP_IDX = len(power_dbm) - 1
                     update()
                 elif event.key == "down":
                     self._AMP_IDX -= 1
@@ -300,10 +301,10 @@ class SweepPower(Base):
 
         def update():
             assert self.resp_arr is not None
-            line_sel.set_ydata([amp_dBFS[self._AMP_IDX], amp_dBFS[self._AMP_IDX]])
+            line_sel.set_ydata([power_dbm[self._AMP_IDX], power_dbm[self._AMP_IDX]])
             # ax1.set_title(f"amp = {amp_arr[AMP_IDX]:.2e}")
             print(
-                f"drive amp {self._AMP_IDX:d}: {self.amp_arr[self._AMP_IDX]:.2e} FS = {amp_dBFS[self._AMP_IDX]:.1f} dBFS"
+                f"drive amp {self._AMP_IDX:d}: Power = {power_dbm[self._AMP_IDX]:.1f} dBm"
             )
             line_a.set_ydata(resp_dB[self._AMP_IDX])
             line_p.set_ydata(np.angle(self.resp_arr[self._AMP_IDX]))
