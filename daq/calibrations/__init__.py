@@ -24,6 +24,37 @@ _LEGACY_PICKLE_PATH = Path(__file__).parent / "power_cal_interpolator.pkl"
 FloatArray = Union[float, npt.NDArray[np.floating]]
 
 
+def _is_monotonic_along_amp_axis(Z: npt.NDArray[np.float64]) -> bool:
+    """Return whether power changes monotonically with amplitude."""
+    dZ = np.diff(Z, axis=1)
+    return bool(np.all(dZ >= 0.0) or np.all(dZ <= 0.0))
+
+
+def _orient_calibration_grid(
+    f_grid: npt.NDArray[np.float64],
+    a_grid: npt.NDArray[np.float64],
+    Z: npt.NDArray[np.float64],
+) -> npt.NDArray[np.float64]:
+    """Match the calibration matrix to ``(frequency, amplitude)`` axes.
+
+    Some packaged assets were saved with the grid transposed. Power should
+    vary monotonically with amplitude at fixed frequency, so use that
+    physical constraint to choose the correct orientation.
+    """
+    expected_shape = (len(f_grid), len(a_grid))
+
+    if Z.shape == expected_shape and _is_monotonic_along_amp_axis(Z):
+        return Z
+
+    if Z.T.shape == expected_shape and _is_monotonic_along_amp_axis(Z.T):
+        return Z.T
+
+    raise ValueError(
+        "Calibration grid shape/orientation is inconsistent with the "
+        "frequency and amplitude axes."
+    )
+
+
 @lru_cache(maxsize=1)
 def _load_calibration():
     """Load calibration grids and build a scipy interpolator.
@@ -59,6 +90,8 @@ def _load_calibration():
         f_grid = np.asarray(g["f_grid"], dtype=np.float64)
         a_grid = np.asarray(g["a_grid"], dtype=np.float64)
         Z = np.asarray(g["Z"], dtype=np.float64)
+
+    Z = _orient_calibration_grid(f_grid, a_grid, Z)
 
     interp = RegularGridInterpolator(
         (f_grid, a_grid), Z, method="linear", bounds_error=True
