@@ -125,8 +125,8 @@ tt.analyze(quantity="quadrature", linecut=True)
 
 The DAQ package includes a power calibration module that translates between
 DAC full-scale amplitude (`amp`) and actual output power in dBm. The
-calibration is based on an interpolator stored in
-`daq/calibrations/power_cal_interpolator.pkl`.
+calibration is based on packaged calibration grid data stored in
+`daq/calibrations/power_calibration.npz`.
 
 ### Amp to Power (dBm)
 

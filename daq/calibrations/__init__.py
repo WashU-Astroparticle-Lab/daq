@@ -3,47 +3,62 @@
 Power calibration utilities.
 
 Translates between DAC full-scale amplitude (``amp``) and calibrated output
-power in dBm using calibration data stored in a pickle file.
+power in dBm using packaged calibration grid data.
 
-The pickle contains a cloudpickle'd function whose ``__globals__`` hold the
-calibration grids (``f_grid``, ``a_grid``, ``Z``).  We extract these arrays
-and build a :class:`scipy.interpolate.RegularGridInterpolator` so the
-calibration works across Python versions.
+The preferred calibration asset is a NumPy ``.npz`` archive containing the
+calibration grids (``f_grid``, ``a_grid``, ``Z``). A legacy cloudpickle-based
+asset is still supported as a fallback for compatibility, but the interpolator
+is always rebuilt from raw arrays at runtime.
 """
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Tuple, Union
+from typing import Union
 
 import numpy as np
 import numpy.typing as npt
 
-_PICKLE_PATH = Path(__file__).parent / "power_cal_interpolator.pkl"
+_DATA_PATH = Path(__file__).parent / "power_calibration.npz"
+_LEGACY_PICKLE_PATH = Path(__file__).parent / "power_cal_interpolator.pkl"
 
 FloatArray = Union[float, npt.NDArray[np.floating]]
 
 
 @lru_cache(maxsize=1)
 def _load_calibration():
-    """Load calibration grids from the pickle and build a scipy interpolator.
+    """Load calibration grids and build a scipy interpolator.
 
-    The pickle stores a cloudpickle'd function with ``f_grid`` (GHz),
-    ``a_grid`` (full-scale amplitude), and ``Z`` (power in dBm) in its
-    ``__globals__``.  We extract those and construct a
-    :class:`~scipy.interpolate.RegularGridInterpolator`.
+    The preferred data source is a packaged ``.npz`` archive with ``f_grid``
+    (GHz), ``a_grid`` (full-scale amplitude), and ``Z`` (power in dBm). For
+    backward compatibility, a legacy cloudpickle-based calibration asset is
+    used only if the stable archive is unavailable.
 
     :returns: ``(interpolator, f_grid, a_grid)``
     """
-    import cloudpickle
     from scipy.interpolate import RegularGridInterpolator
 
-    with _PICKLE_PATH.open("rb") as f:
-        fn = cloudpickle.load(f)
+    if _DATA_PATH.exists():
+        with np.load(_DATA_PATH) as data:
+            f_grid = np.asarray(data["f_grid"], dtype=np.float64)
+            a_grid = np.asarray(data["a_grid"], dtype=np.float64)
+            Z = np.asarray(data["Z"], dtype=np.float64)
+    else:
+        try:
+            import cloudpickle
 
-    g = fn.__globals__
-    f_grid = g["f_grid"]  # shape (N_f,), GHz
-    a_grid = g["a_grid"]  # shape (N_a,), full-scale
-    Z = g["Z"]  # shape (N_f, N_a), dBm
+            with _LEGACY_PICKLE_PATH.open("rb") as f:
+                fn = cloudpickle.load(f)
+        except Exception as exc:
+            raise RuntimeError(
+                "Calibration data could not be loaded. "
+                f"Expected '{_DATA_PATH.name}' or a compatible legacy "
+                f"'{_LEGACY_PICKLE_PATH.name}'."
+            ) from exc
+
+        g = fn.__globals__
+        f_grid = np.asarray(g["f_grid"], dtype=np.float64)
+        a_grid = np.asarray(g["a_grid"], dtype=np.float64)
+        Z = np.asarray(g["Z"], dtype=np.float64)
 
     interp = RegularGridInterpolator(
         (f_grid, a_grid), Z, method="linear", bounds_error=True
@@ -109,4 +124,6 @@ def power_dbm_to_amp(freq_ghz: float, power_dbm: float) -> float:
             f"[{min(p_lo, p_hi):.1f}, {max(p_lo, p_hi):.1f}] dBm at {freq_ghz:.4f} GHz."
         )
 
-    return float(brentq(lambda a: amp_to_power_dbm(freq_ghz, a) - power_dbm, amp_lo, amp_hi))
+    return float(
+        brentq(lambda a: amp_to_power_dbm(freq_ghz, a) - power_dbm, amp_lo, amp_hi)
+    )

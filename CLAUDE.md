@@ -73,7 +73,7 @@ Files are saved as `{number}-{device}-{type}.h5` (e.g., `00000042-Resonator_A-sw
 
 ### Calibrations (`daq/calibrations/`)
 
-Power calibration module. Translates between DAC full-scale amplitude (`amp`) and output power in dBm via a pickled interpolator (`power_cal_interpolator.pkl`). Key functions:
+Power calibration module. Translates between DAC full-scale amplitude (`amp`) and output power in dBm via packaged calibration grid data (`power_calibration.npz`). Key functions:
 - `amp_to_power_dbm(freq_ghz, amp)` — Forward conversion (used by `SweepPower` and `TwoTonePower` plots).
 - `power_dbm_to_amp(freq_ghz, power_dbm)` — Inverse conversion via `scipy.optimize.brentq`.
 
