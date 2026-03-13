@@ -13,6 +13,9 @@ Always activate the conda environment before running any commands:
 conda activate presto
 ```
 
+## References
+The `presto` package is documented here: https://www.intermod.pro/manuals/presto/index.html, and this should be the major reference to be read before searching externally.
+
 ## Commands
 
 **Install:**
