@@ -13,7 +13,7 @@ import numpy as np
 import numpy.typing as npt
 
 from presto import lockin
-from presto.utils import ProgressBar, asarray, rotate_opt
+from presto.utils import ProgressBar, asarray, recommended_dac_config, rotate_opt
 
 from .._base import Base
 from ..calibrations import amp_to_power_dbm_hz
@@ -71,6 +71,11 @@ class TwoTonePower(Base):
             presto_address = get_presto_address()
         if presto_port is None:
             presto_port = get_presto_port()
+
+        # Use the recommended DAC config for the control frequency
+        dac_mode, dac_fsample = recommended_dac_config(self.control_freq_center)
+        self.DC_PARAMS["dac_mode"] = dac_mode
+        self.DC_PARAMS["dac_fsample"] = dac_fsample
 
         with lockin.Lockin(
             address=presto_address,
