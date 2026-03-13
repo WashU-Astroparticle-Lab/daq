@@ -11,7 +11,7 @@ import numpy as np
 import numpy.typing as npt
 
 from presto import lockin
-from presto.utils import ProgressBar, asarray
+from presto.utils import ProgressBar, asarray, recommended_dac_config
 
 from .._base import Base
 from ..calibrations import amp_to_power_dbm_hz
@@ -58,11 +58,17 @@ class SweepPower(Base):
         if presto_port is None:
             presto_port = get_presto_port()
 
+        # Use the recommended DAC config for the center frequency
+        dac_mode, dac_fsample = recommended_dac_config(self.freq_center)
+        dc_params = dict(self.DC_PARAMS)
+        dc_params["dac_mode"] = dac_mode
+        dc_params["dac_fsample"] = dac_fsample
+
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,
             ext_ref_clk=ext_ref_clk,
-            **self.DC_PARAMS,
+            **dc_params,
         ) as lck:
             lck.hardware.set_adc_attenuation(self.input_port, self.ADC_ATTENUATION)
             lck.hardware.set_dac_current(self.output_port, self.DAC_CURRENT)

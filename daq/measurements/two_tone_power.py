@@ -74,14 +74,15 @@ class TwoTonePower(Base):
 
         # Use the recommended DAC config for the control frequency
         dac_mode, dac_fsample = recommended_dac_config(self.control_freq_center)
-        self.DC_PARAMS["dac_mode"] = dac_mode
-        self.DC_PARAMS["dac_fsample"] = dac_fsample
+        dc_params = dict(self.DC_PARAMS)
+        dc_params["dac_mode"] = dac_mode
+        dc_params["dac_fsample"] = dac_fsample
 
         with lockin.Lockin(
             address=presto_address,
             port=presto_port,
             ext_ref_clk=ext_ref_clk,
-            **self.DC_PARAMS,
+            **dc_params,
         ) as lck:
             lck.hardware.set_adc_attenuation(
                 self.input_port, self.ADC_ATTENUATION
