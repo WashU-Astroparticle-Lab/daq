@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """Analysis tools for DAQ measurements."""
-from .noise import compute_psd
+from .noise import compute_psd, from_elec_to_reson, remove_correlated_noise
 from .mattis_bardeen import (
     signed_log10,
     n_qp,
@@ -15,6 +15,8 @@ from .mattis_bardeen import (
 
 __all__ = [
     "compute_psd",
+    "from_elec_to_reson",
+    "remove_correlated_noise",
     "signed_log10",
     "n_qp",
     "f_T",

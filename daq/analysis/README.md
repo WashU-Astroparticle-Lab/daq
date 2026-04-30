@@ -5,6 +5,8 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 ## Contents
 
 - [Noise PSD](#noise-psd)
+- [Electronic to Resonator Basis](#electronic-to-resonator-basis)
+- [Correlated Noise Removal](#correlated-noise-removal)
 - [Mattis-Bardeen Fitting](#mattis-bardeen-fitting)
 - [Helper Functions](#helper-functions)
 
@@ -76,6 +78,122 @@ data_2d = np.vstack([i_data, q_data])  # shape: (2, N)
 
 f, psd = compute_psd(data_2d, fs)
 # psd.shape == (2, len(f))
+```
+
+---
+
+## Electronic to Resonator Basis
+
+`from_elec_to_reson` transforms raw I/Q time-stream data from the electronic measurement basis into the resonator coordinate system using calibration parameters from a fitted `Sweep`. It returns the complex resonator-basis coordinate along with the dissipation (radial) and frequency (arc-length) responses.
+
+### Basic usage
+
+```python
+from daq.measurements import Sweep, TimeStream
+from daq.analysis import from_elec_to_reson
+
+# Load a fitted sweep and a time-stream measurement at the same resonance
+sw = Sweep.load("00000042-Resonator_A-sweep.h5")
+ts = TimeStream.load("00000043-Resonator_A-timestream.h5")
+
+# Transform the USB time-stream for the first tone
+tsz, rad, arc = from_elec_to_reson(ts.usb[:, 0], sw)
+# tsz: complex resonator-basis coordinate
+# rad: dissipation (radial) response
+# arc: frequency (arc-length) response
+```
+
+### Computing PSD in the resonator basis
+
+Combine with `compute_psd` to obtain the noise spectrum in dissipation and frequency channels:
+
+```python
+from daq.analysis import compute_psd
+
+fs = ts.df  # sampling rate (Hz)
+
+f, psd_rad = compute_psd(rad, fs)
+f, psd_arc = compute_psd(arc, fs)
+```
+
+---
+
+## Correlated Noise Removal
+
+`remove_correlated_noise` subtracts correlated electronics noise (gain drift, LO phase noise) from an on-resonance tone using a simultaneously acquired off-resonance reference. It implements the cleaning procedure of Eqn 7.44–7.45 in Wen (2025), working in the gain / arc-length basis.
+
+### Basic usage
+
+```python
+from daq.measurements import TimeStream
+from daq.analysis import remove_correlated_noise
+
+ts = TimeStream.load("00000050-Resonator_A-timestream.h5")
+
+# on_res: tone index 0 (on resonance), off_res: tone index 1 (off resonance)
+on_res = ts.usb[:, 0]
+off_res = ts.usb[:, 1]
+
+cleaned, x_r, x_rho = remove_correlated_noise(on_res, off_res, fs=ts.df)
+print(f"Cleaning coefficients: x_r={x_r:.4f}, x_rho={x_rho:.4f}")
+```
+
+### Time-windowed cleaning coefficients
+
+Restrict the time window used to compute cleaning coefficients (subtraction still applies to the full array):
+
+```python
+# Use only the first 10 seconds to compute coefficients
+cleaned, x_r, x_rho = remove_correlated_noise(
+    on_res, off_res, fs=ts.df, max_t_s=10.0
+)
+
+# Use a window from 5 s to 15 s
+cleaned, x_r, x_rho = remove_correlated_noise(
+    on_res, off_res, fs=ts.df, min_t_s=5.0, max_t_s=15.0
+)
+```
+
+### Getting cleaned r/rho and computing PSDs
+
+Set `return_r_rho=True` to also get the mean-subtracted gain and arc-length components, which can be passed directly to `compute_psd`:
+
+```python
+from daq.analysis import compute_psd
+
+cleaned, x_r, x_rho, cleaned_r, cleaned_rho = remove_correlated_noise(
+    on_res, off_res, fs=ts.df, return_r_rho=True
+)
+
+f, psd_r = compute_psd(cleaned_r, ts.df)
+f, psd_rho = compute_psd(cleaned_rho, ts.df)
+```
+
+### Before/after PSD comparison
+
+```python
+import numpy as np
+import matplotlib.pyplot as plt
+from daq.analysis import compute_psd, remove_correlated_noise
+
+cleaned, x_r, x_rho, cleaned_r, cleaned_rho = remove_correlated_noise(
+    on_res, off_res, fs=ts.df, return_r_rho=True
+)
+
+# Original gain fluctuations
+r_original = np.abs(on_res) - np.mean(np.abs(on_res))
+f, psd_before = compute_psd(r_original, ts.df)
+f, psd_after = compute_psd(cleaned_r, ts.df)
+
+plt.figure()
+plt.loglog(f[1:], psd_before[1:], label="Before cleaning")
+plt.loglog(f[1:], psd_after[1:], label="After cleaning")
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("PSD [arb$^2$/Hz]")
+plt.title("Gain noise: before vs. after correlated noise removal")
+plt.legend()
+plt.grid(True, which="both", alpha=0.3)
+plt.show()
 ```
 
 ---
