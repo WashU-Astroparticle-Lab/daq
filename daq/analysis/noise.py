@@ -141,6 +141,8 @@ def remove_correlated_noise(
         raise ValueError("on_res and off_res must be 1-D arrays")
     if on_res.shape[0] != off_res.shape[0]:
         raise ValueError("on_res and off_res must have the same length")
+    if on_res.shape[0] == 0:
+        raise ValueError("on_res and off_res must be non-empty")
 
     N = on_res.shape[0]
 
@@ -149,11 +151,12 @@ def remove_correlated_noise(
     r_off = np.abs(off_res)
     mean_r_on = np.mean(r_on)
     mean_r_off = np.mean(r_off)
-    rho_on = np.angle(on_res) * mean_r_on
+    theta_on = np.angle(on_res)
+    rho_on = theta_on * mean_r_on
     rho_off = np.angle(off_res) * mean_r_off
 
     # --- Mean-subtract ---
-    mean_theta_on = np.mean(np.angle(on_res))
+    mean_theta_on = np.mean(theta_on)
     r_on_c = r_on - mean_r_on
     r_off_c = r_off - mean_r_off
     mean_rho_on = np.mean(rho_on)
@@ -171,10 +174,15 @@ def remove_correlated_noise(
             mask &= t <= max_t_s
 
     # --- Cleaning coefficients (Eqn 7.45) ---
+    if mask.sum() < 2:
+        raise ValueError(
+            "Time window selects fewer than 2 samples; cannot compute cleaning coefficients"
+        )
+
     def _cleaning_coeff(d: npt.NDArray[np.floating], s: npt.NDArray[np.floating]) -> float:
         C = np.cov(d[mask], s[mask])
         var_s = C[1, 1]
-        if var_s == 0.0:
+        if var_s == 0.0 or not np.isfinite(var_s):
             return 0.0
         return float(C[0, 1] / var_s)
 
