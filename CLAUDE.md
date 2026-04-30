@@ -86,14 +86,14 @@ Power calibration module. Translates between DAC full-scale amplitude (`amp`) an
 - **`MB_fitter`** (`mattis_bardeen.py`) — Mattis-Bardeen superconductor theory fit for temperature-dependent resonant frequency and internal quality factor using `iminuit`.
 - Helper functions: `n_qp`, `f_T`, `Qi_T`, `kappa_1`, `kappa_2`, `S_1`, `S_2`, `signed_log10`.
 
-Usage examples are in `docs/analysis_guide.md`.
+Usage examples are in `daq/analysis/README.md`.
 
 ## Documentation
 
 When adding or modifying measurement classes or analysis modules, update the corresponding documentation:
 
 - **Measurement classes** — Document new classes in the Architecture > Measurement Classes section of this file.
-- **Analysis tools** — Add usage examples to `docs/analysis_guide.md` and update the Architecture > Analysis section of this file.
+- **Analysis tools** — Add usage examples to `daq/analysis/README.md` and update the Architecture > Analysis section of this file.
 
 ## Style Conventions
 
