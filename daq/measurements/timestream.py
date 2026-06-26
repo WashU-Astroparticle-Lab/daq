@@ -15,6 +15,7 @@ from .._base import Base
 from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
+BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
 
 
 class TimeStream(Base):
@@ -27,6 +28,7 @@ class TimeStream(Base):
         amp: FloatAny,
         output_port: int,
         input_port: int,
+        is_usb: Optional[BoolAny] = None,
         dither: bool = True,
         device: Optional[str] = None,
         filter: Optional[str] = None,
@@ -38,9 +40,21 @@ class TimeStream(Base):
         self.df = df  # modified after tuning
         self.pixel_counts = pixel_counts
         self.amp = np.asarray(amp, dtype=np.float64)
-        # Auto-calculate phases for USB: I = 0, Q = -π/2
+        # Per-tone sideband selection: True -> USB (LO + IF), False -> LSB (LO - IF).
+        # Defaults to all-USB to preserve previous behaviour. A single bool is
+        # broadcast to every tone.
+        if is_usb is None:
+            self.is_usb = np.ones_like(self.if_freqs, dtype=bool)
+        else:
+            is_usb_arr = np.atleast_1d(np.asarray(is_usb, dtype=bool))
+            if is_usb_arr.size == 1:
+                self.is_usb = np.full(self.if_freqs.shape, bool(is_usb_arr.item()))
+            else:
+                self.is_usb = is_usb_arr
+        # Auto-calculate single-sideband phases: I = 0, and Q lags I by 90° for
+        # USB (-π/2), leads I by 90° for LSB (+π/2). Users never set phases by hand.
         self.phases_i = np.zeros_like(self.if_freqs, dtype=np.float64)
-        self.phases_q = self.phases_i - np.pi / 2
+        self.phases_q = self.phases_i + np.where(self.is_usb, -np.pi / 2, np.pi / 2)
         self.output_port = output_port
         self.input_port = input_port
         self.dither = dither
@@ -57,11 +71,23 @@ class TimeStream(Base):
         self.usb = None
         self.freqs_usb = None
         self.freqs_lsb = None
+        # Per-tone selected sideband (set by run method):
+        #   signal[:, i]      -> IQ timestream of tone i at its chosen sideband
+        #   signal_freqs[i]   -> physical frequency (Hz) of tone i
+        self.signal = None
+        self.signal_freqs = None
 
         self.check_amp()
+        self.check_sideband()
 
     def check_amp(self) -> None:
         assert self.amp.sum() < 1.0, "Amplitude sum must be less than 1.0"
+
+    def check_sideband(self) -> None:
+        assert self.is_usb.shape == self.if_freqs.shape, (
+            "is_usb must have the same length as if_freqs "
+            f"({self.is_usb.shape} != {self.if_freqs.shape})"
+        )
 
     def run(
         self,
@@ -120,6 +146,11 @@ class TimeStream(Base):
             self.freqs_usb = self.lo_freq + self.if_freqs
             self.freqs_lsb = self.lo_freq - self.if_freqs
 
+            # Select the driven sideband for each tone so users get the right
+            # data directly, without remembering USB/LSB conventions.
+            self.signal = np.where(self.is_usb[np.newaxis, :], self.usb, self.lsb)
+            self.signal_freqs = np.where(self.is_usb, self.freqs_usb, self.freqs_lsb)
+
             # Mute outputs at the end
             if self.external_trigger:
                 lck.set_trigger_out([0]) # Turns off trigger signal
@@ -143,6 +174,8 @@ class TimeStream(Base):
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
+            # is_usb may be absent in files saved before sideband selection existed
+            is_usb = h5f["is_usb"][()] if "is_usb" in h5f else None  # type: ignore
 
             # Load data arrays if they exist
             freq_arr = h5f["freq_arr"][()] if "freq_arr" in h5f else None  # type: ignore
@@ -152,6 +185,8 @@ class TimeStream(Base):
             usb = h5f["usb"][()] if "usb" in h5f else None  # type: ignore
             freqs_usb = h5f["freqs_usb"][()] if "freqs_usb" in h5f else None  # type: ignore
             freqs_lsb = h5f["freqs_lsb"][()] if "freqs_lsb" in h5f else None  # type: ignore
+            signal = h5f["signal"][()] if "signal" in h5f else None  # type: ignore
+            signal_freqs = h5f["signal_freqs"][()] if "signal_freqs" in h5f else None  # type: ignore
 
         self = cls(
             lo_freq=lo_freq,
@@ -161,6 +196,7 @@ class TimeStream(Base):
             amp=amp,
             output_port=output_port,
             input_port=input_port,
+            is_usb=is_usb,
             dither=dither,
         )
 
@@ -172,18 +208,27 @@ class TimeStream(Base):
         self.usb = usb
         self.freqs_usb = freqs_usb
         self.freqs_lsb = freqs_lsb
+        self.signal = signal
+        self.signal_freqs = signal_freqs
+
+        # Reconstruct the per-tone selected sideband for files saved before
+        # `signal`/`signal_freqs` existed (defaults to all-USB on those files).
+        if self.signal is None and self.usb is not None and self.lsb is not None:
+            self.signal = np.where(self.is_usb[np.newaxis, :], self.usb, self.lsb)
+        if self.signal_freqs is None and freqs_usb is not None and freqs_lsb is not None:
+            self.signal_freqs = np.where(self.is_usb, freqs_usb, freqs_lsb)
 
         return self
 
     def analyze(
-        self, 
-        num_samples: Optional[int] = None, 
+        self,
+        num_samples: Optional[int] = None,
         title: Optional[str] = None,
         show_iq: bool = True
     ):
         """
-        Plot the timestream data (USB only).
-        
+        Plot the timestream data, using each tone's selected sideband.
+
         Parameters:
         -----------
         num_samples : int, optional
@@ -193,15 +238,14 @@ class TimeStream(Base):
         show_iq : bool, optional
             If True, show I and Q streams instead of phase and power. Default is True.
         """
-        if self.usb is None:
+        if self.signal is None:
             raise RuntimeError("No data available. Run the measurement first.")
 
         import matplotlib.pyplot as plt
 
-        # Force using USB
-        data = self.usb
-        freqs = self.freqs_usb
-        sideband_label = "USB"
+        # Use the per-tone selected sideband
+        data = self.signal
+        freqs = self.signal_freqs
 
         # Limit number of samples if specified
         if num_samples is not None:
@@ -220,30 +264,32 @@ class TimeStream(Base):
             axes = axes.reshape(1, -1)
 
         for i in range(n_freqs):
+            sb = "USB" if self.is_usb[i] else "LSB"
+            freq_label = f"{freqs[i]/1e9:.3f} GHz ({sb})"
             if show_iq:
                 # I stream plot
                 i_stream = np.real(data[:, i])
                 axes[i, 0].plot(time_axis, i_stream)
-                axes[i, 0].set_ylabel(f"I [a.u.]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 0].set_ylabel(f"I [a.u.]\n{freq_label}")
                 axes[i, 0].grid(True, alpha=0.3)
 
                 # Q stream plot
                 q_stream = np.imag(data[:, i])
                 axes[i, 1].plot(time_axis, q_stream)
-                axes[i, 1].set_ylabel(f"Q [a.u.]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 1].set_ylabel(f"Q [a.u.]\n{freq_label}")
                 axes[i, 1].grid(True, alpha=0.3)
             else:
                 # Amplitude plot
                 amplitudes = np.abs(data[:, i])
                 power_db = 20.0 * np.log10(amplitudes)
                 axes[i, 0].plot(time_axis, power_db)
-                axes[i, 0].set_ylabel(f"Power [dBFS]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 0].set_ylabel(f"Power [dBFS]\n{freq_label}")
                 axes[i, 0].grid(True, alpha=0.3)
 
                 # Phase plot
                 phases = np.angle(data[:, i])
                 axes[i, 1].plot(time_axis, phases)
-                axes[i, 1].set_ylabel(f"Phase [rad]\n{freqs[i]/1e9:.3f} GHz")
+                axes[i, 1].set_ylabel(f"Phase [rad]\n{freq_label}")
                 axes[i, 1].grid(True, alpha=0.3)
 
         # Set x-labels for bottom plots
@@ -253,9 +299,9 @@ class TimeStream(Base):
         # Set title
         plot_type = "I/Q Streams" if show_iq else "Power/Phase"
         if title is not None:
-            fig.suptitle(f"{title} - USB ({plot_type})")
+            fig.suptitle(f"{title} ({plot_type})")
         else:
-            fig.suptitle(f"TimeStream - USB ({plot_type})")
+            fig.suptitle(f"TimeStream ({plot_type})")
 
         plt.show()
 
