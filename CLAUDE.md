@@ -53,7 +53,7 @@ Settings are cached after first access via `get_settings()`. Call `reload_settin
 All measurement classes inherit from `Base` (`daq/_base.py`). Each runs a hardware acquisition via the `presto` library, optionally fits the data, saves results to HDF5, and logs metadata to MongoDB.
 
 - **`Sweep`** — Single-tone frequency sweep. Auto-fits resonator parameters (fr, Qi, Qc, Ql, kappa) using `resonator_tools`.
-- **`TimeStream`** — Time-domain multi-tone acquisition. Supports multiple IF frequencies with USB/LSB sideband separation. Phase reset is gated: disabled for non-zero IF.
+- **`TimeStream`** — Time-domain multi-tone acquisition. Supports multiple IF frequencies with per-tone USB/LSB sideband selection via the `is_usb` bool array (`True` → `LO + IF`, `False` → `LO - IF`; default all-USB). Single-sideband output phases are derived automatically. Each `|IF| < 500 MHz`, so centering the LO between tones lets two tones up to 1 GHz apart be read at once. After `run()`, `signal`/`signal_freqs` give the per-tone selected-sideband data and physical frequencies. Phase reset is gated: disabled for non-zero IF.
 - **`SweepPower`** — 2D sweep over frequency × drive power.
 - **`SweepFreqAndDC`** — 2D sweep over frequency × DC bias (JPA modulation curves).
 - **`TwoTonePower`** — Two-tone spectroscopy: pump power/frequency vs. fixed probe frequency.

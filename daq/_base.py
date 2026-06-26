@@ -206,7 +206,8 @@ class Base:
             # Skip data arrays (large datasets)
             if attribute in [
                 "freq_arr", "resp_arr", "pixel_i", "pixel_q",
-                "lsb", "usb", "freqs_usb", "freqs_lsb"
+                "lsb", "usb", "freqs_usb", "freqs_lsb",
+                "signal", "signal_freqs"
             ]:
                 continue
             
@@ -252,13 +253,19 @@ class Base:
                         amp_to_power_dbm(freq_hz * 1e-9, amp_val)
                     )
 
-            # TimeStream: per-tone amp array at lo_freq + if_freqs
+            # TimeStream: per-tone amp array at the selected sideband frequency
+            # (lo_freq + if_freqs for USB, lo_freq - if_freqs for LSB)
             if hasattr(self, "amp") and hasattr(self, "lo_freq") and hasattr(self, "if_freqs"):
                 amp_val = np.asarray(getattr(self, "amp"))
                 lo_freq = getattr(self, "lo_freq")
                 if_freqs = np.asarray(getattr(self, "if_freqs"))
                 if amp_val.ndim >= 1:
-                    tone_freqs_ghz = (lo_freq + if_freqs) * 1e-9
+                    is_usb = getattr(self, "is_usb", None)
+                    if is_usb is None:
+                        sign = 1.0
+                    else:
+                        sign = np.where(np.asarray(is_usb, dtype=bool), 1.0, -1.0)
+                    tone_freqs_ghz = (lo_freq + sign * if_freqs) * 1e-9
                     power_list = [
                         float(amp_to_power_dbm(f, a))
                         for f, a in zip(tone_freqs_ghz, amp_val)

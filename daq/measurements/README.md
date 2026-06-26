@@ -69,21 +69,57 @@ results.
 - Multi-tone measurement (multiple IF frequencies)
 - Time-domain data acquisition
 - I/Q data streams
-- USB/LSB sideband separation
+- Per-tone USB/LSB sideband selection via the `is_usb` flag
 
 **Key Parameters**:
 - `lo_freq`: LO frequency (Hz)
-- `if_freqs`: Array of IF frequencies (Hz)
+- `if_freqs`: Array of IF frequencies (Hz), each with `|IF| < 500 MHz`
 - `df`: Sample rate (Hz)
 - `pixel_counts`: Number of samples
 - `amp`: Array of amplitudes for each tone
 - `output_port`: DAC output port
 - `input_port`: ADC input port
+- `is_usb`: Optional per-tone bool array — `True` (default) puts the tone on the
+  upper sideband (`LO + IF`), `False` on the lower sideband (`LO - IF`). A single
+  bool applies to every tone. The single-sideband output phases are derived
+  automatically, so you never set them by hand.
 - `device`: Device name (required for DB)
 - `filter`: Filter name (optional)
 - `notes`: Measurement notes (optional)
 
-**Usage Example**:
+**Sideband selection** — the hardware limits each IF magnitude to `< 500 MHz`, so
+USB-only readout can only reach `LO … LO + 500 MHz`. To cover tones on both sides
+of the LO (up to 1 GHz apart), center the LO between them and mark each tone USB or
+LSB. For example, two tones 600 MHz apart at `f_lo = LO - 300 MHz` and
+`f_hi = LO + 300 MHz`:
+
+```python
+ts = TimeStream(
+    lo_freq=6.0e9,
+    if_freqs=[300e6, 300e6],   # magnitudes only; sign is set by is_usb
+    is_usb=[False, True],      # tone 0 -> LO - 300 MHz, tone 1 -> LO + 300 MHz
+    df=1e3,
+    pixel_counts=10000,
+    amp=[0.05, 0.05],
+    output_port=1,
+    input_port=1,
+    device="Detector_B",
+    notes="Two tones 600 MHz apart",
+)
+filepath = ts.run()
+ts.analyze()
+```
+
+**Outputs**: after `run()`, use the ready-made per-tone fields rather than the raw
+sidebands:
+- `ts.signal` — complex I/Q array of shape `(n_samples, n_tones)`; column `i` is the
+  tone's selected sideband.
+- `ts.signal_freqs` — physical frequency (Hz) of each tone (`LO ± IF`).
+- `ts.is_usb` — which sideband each tone used.
+
+(The raw `ts.usb` / `ts.lsb` and `ts.freqs_usb` / `ts.freqs_lsb` are still available.)
+
+**Usage Example** (single-tone, all-USB default):
 ```python
 from daq import TimeStream
 
@@ -102,7 +138,7 @@ filepath = ts.run()
 ts.analyze()
 ```
 
-**Analysis**: Plots I/Q streams for each frequency tone.
+**Analysis**: Plots I/Q streams for each tone, labelled with its sideband (USB/LSB).
 
 ---
 

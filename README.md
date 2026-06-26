@@ -90,6 +90,25 @@ ts = TimeStream(
 # Run and analyze
 filepath = ts.run()
 ts.analyze()
+
+# Per-tone selected-sideband data:
+#   ts.signal        -> complex I/Q, shape (n_samples, n_tones)
+#   ts.signal_freqs  -> physical frequency (Hz) of each tone
+
+# Reading two tones 600 MHz apart: center the LO and use both sidebands
+# (each IF magnitude must stay < 500 MHz).
+ts = TimeStream(
+    lo_freq=5.0e9,
+    if_freqs=[300e6, 300e6],   # magnitudes only
+    is_usb=[False, True],      # LO - 300 MHz and LO + 300 MHz
+    df=1e3,
+    pixel_counts=10000,
+    amp=[0.05, 0.05],
+    output_port=1,
+    input_port=1,
+    device="Detector_B",
+)
+filepath = ts.run()
 ```
 
 ### TwoTonePower Measurement
