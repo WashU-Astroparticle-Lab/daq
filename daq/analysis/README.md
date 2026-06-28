@@ -32,6 +32,20 @@ f, psd = compute_psd(signal, fs)
 
 `f` is the frequency array in Hz and `psd` has units of (signal units)^2 / Hz.
 
+### Welch's method
+
+By default `compute_psd` uses the bare periodogram. Pass `welch=True` to use Welch's method (`scipy.signal.welch`), which averages the periodograms of overlapping windowed segments to reduce variance at the cost of frequency resolution:
+
+```python
+# Default Welch parameters (Hann window, nperseg=256, 50% overlap)
+f, psd = compute_psd(signal, fs, welch=True)
+
+# Customize the segmentation
+f, psd = compute_psd(signal, fs, welch=True, nperseg=4096, noverlap=2048)
+```
+
+The `nperseg`, `noverlap`, `window`, and `detrend` parameters are only used when `welch=True`.
+
 ### Plotting the PSD
 
 ```python

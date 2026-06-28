@@ -13,11 +13,20 @@ if TYPE_CHECKING:
 
 
 def compute_psd(
-    data: npt.ArrayLike, fs: float
+    data: npt.ArrayLike,
+    fs: float,
+    welch: bool = False,
+    nperseg: Optional[int] = None,
+    noverlap: Optional[int] = None,
+    window: str = "hann",
+    detrend: str | bool = "constant",
 ) -> tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
-    """Compute the Power Spectral Density using the Periodogram method (Direct FFT).
+    """Compute the Power Spectral Density of a real-valued time series.
 
-    No windowing or detrending is applied (bare periodogram).
+    By default the bare periodogram (direct FFT, no windowing or detrending) is
+    used.  Setting ``welch=True`` switches to Welch's method
+    (:func:`scipy.signal.welch`), which averages the periodograms of overlapping
+    windowed segments to reduce variance at the cost of frequency resolution.
 
     For 1-D input the result is a single PSD.  For 2-D input each row is
     treated as an independent time series and the result has shape
@@ -26,6 +35,16 @@ def compute_psd(
     :param data: Real-valued time series data. 1-D or 2-D array where each row
         is a separate time series. Complex input is not supported.
     :param fs: The sampling frequency in Hz.
+    :param welch: When ``True``, use Welch's method instead of the bare
+        periodogram. Defaults to ``False``.
+    :param nperseg: Length of each Welch segment. Only used when ``welch`` is
+        ``True``; defaults to scipy's choice (256 or the series length).
+    :param noverlap: Number of points to overlap between Welch segments. Only
+        used when ``welch`` is ``True``; defaults to ``nperseg // 2``.
+    :param window: Window passed to :func:`scipy.signal.welch`. Only used when
+        ``welch`` is ``True``. Defaults to ``"hann"``.
+    :param detrend: Detrending applied to each Welch segment. Only used when
+        ``welch`` is ``True``. Defaults to ``"constant"``.
     :returns: ``(f, psd)`` — sample frequencies in Hz and power spectral density in
         (units of *data*)²/Hz.
     :raises TypeError: If *data* is complex.
@@ -38,6 +57,20 @@ def compute_psd(
         raise ValueError("data must be a non-empty 1-D or 2-D array")
     if data.ndim > 2:
         raise ValueError(f"data must be 1-D or 2-D, got {data.ndim}-D")
+
+    if welch:
+        from scipy.signal import welch as _welch
+
+        f, psd = _welch(
+            data,
+            fs=fs,
+            window=window,
+            nperseg=nperseg,
+            noverlap=noverlap,
+            detrend=detrend,
+            axis=-1,
+        )
+        return f, psd
 
     N = data.shape[-1]
 
