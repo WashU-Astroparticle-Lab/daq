@@ -44,7 +44,9 @@ def compute_psd(
     :param window: Window passed to :func:`scipy.signal.welch`. Only used when
         ``welch`` is ``True``. Defaults to ``"hann"``.
     :param detrend: Detrending applied to each Welch segment. Only used when
-        ``welch`` is ``True``. Defaults to ``"constant"``.
+        ``welch`` is ``True``. Defaults to ``"constant"`` (mean removal); note
+        this differs from the periodogram path, which applies no detrending.
+        Pass ``False`` to match the periodogram's behavior.
     :returns: ``(f, psd)`` — sample frequencies in Hz and power spectral density in
         (units of *data*)²/Hz.
     :raises TypeError: If *data* is complex.

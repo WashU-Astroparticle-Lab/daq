@@ -44,7 +44,7 @@ f, psd = compute_psd(signal, fs, welch=True)
 f, psd = compute_psd(signal, fs, welch=True, nperseg=4096, noverlap=2048)
 ```
 
-The `nperseg`, `noverlap`, `window`, and `detrend` parameters are only used when `welch=True`.
+The `nperseg`, `noverlap`, `window`, and `detrend` parameters are only used when `welch=True`. Note that the Welch path defaults to `detrend="constant"` (mean removal), unlike the periodogram path which applies no detrending; pass `detrend=False` to match it.
 
 ### Plotting the PSD
 
