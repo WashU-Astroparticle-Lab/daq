@@ -258,6 +258,7 @@ def averaged_psd_timestream(
     noverlap: Optional[int] = None,
     window: str = "hann",
     detrend: str | bool = "constant",
+    discard_start_s: Optional[float] = None,
     dither: bool = True,
     device: Optional[str] = None,
     filter: Optional[str] = None,
@@ -310,6 +311,14 @@ def averaged_psd_timestream(
     :param noverlap: Forwarded to :func:`compute_psd` (Welch only).
     :param window: Forwarded to :func:`compute_psd` (Welch only).
     :param detrend: Forwarded to :func:`compute_psd` (Welch only).
+    :param discard_start_s: If given, discard this many seconds from the start of every
+        acquisition before analysis (e.g. ``2e-4`` to drop the first 0.2 ms, which is
+        often startup junk). The number of samples dropped is
+        ``round(discard_start_s * fs)`` using the actual hardware sample rate. The cut is
+        applied to both the PSD input and the time-axis arrays of the returned
+        :class:`TimeStream` objects (``signal``, ``usb``, ``lsb``, ``pixel_i``,
+        ``pixel_q``), so the in-memory objects match the analysed window. The HDF5 file
+        saved by each ``run()`` retains the full, untrimmed acquisition.
     :param dither: Forwarded to :class:`TimeStream`.
     :param device: Forwarded to :class:`TimeStream` (used in the saved metadata).
     :param filter: Forwarded to :class:`TimeStream`.
@@ -323,8 +332,8 @@ def averaged_psd_timestream(
         *psd_a* / *psd_b* are the averaged PSDs with shape ``(n_tones, n_freqs)``
         (dissipation / frequency when *sweeps* is given, else I / Q), and *streams* is
         the list of executed :class:`TimeStream` objects (each already saved).
-    :raises ValueError: If *num_averages* < 1, or *sweeps* length does not match the
-        number of tones.
+    :raises ValueError: If *num_averages* < 1, *sweeps* length does not match the number
+        of tones, or *discard_start_s* is negative or would leave fewer than 2 samples.
     """
     from ..measurements.timestream import TimeStream
 
@@ -336,6 +345,17 @@ def averaged_psd_timestream(
 
     if sweeps is not None and len(sweeps) != n_tones:
         raise ValueError(f"sweeps must provide one Sweep per tone ({len(sweeps)} != {n_tones})")
+
+    if discard_start_s is not None:
+        if discard_start_s < 0:
+            raise ValueError(f"discard_start_s must be non-negative, got {discard_start_s}")
+        # Early sanity check against the requested rate (the tuned rate is nearly
+        # identical) so we fail before running the hardware num_averages times.
+        if int(round(discard_start_s * df)) >= pixel_counts - 1:
+            raise ValueError(
+                f"discard_start_s={discard_start_s} s discards ~all of the "
+                f"{pixel_counts} samples at df={df} Hz; leaves fewer than 2 samples"
+            )
 
     iterator = range(num_averages)
     if progress:
@@ -376,6 +396,22 @@ def averaged_psd_timestream(
 
         # Actual hardware sample rate (df is refined by tune during run()).
         fs = ts.df
+
+        # Drop the leading junk window from every time-axis array so both the PSDs
+        # and the returned TimeStream objects reflect the same analysed window. The
+        # saved HDF5 file already holds the full, untrimmed acquisition.
+        if discard_start_s is not None:
+            n_discard = int(round(discard_start_s * fs))
+            if n_discard >= ts.signal.shape[0] - 1:
+                raise ValueError(
+                    f"discard_start_s={discard_start_s} s drops {n_discard} of "
+                    f"{ts.signal.shape[0]} samples at fs={fs} Hz; leaves fewer than 2 samples"
+                )
+            if n_discard > 0:
+                for attr in ("signal", "usb", "lsb", "pixel_i", "pixel_q"):
+                    arr = getattr(ts, attr, None)
+                    if arr is not None:
+                        setattr(ts, attr, arr[n_discard:])
 
         if sweeps is not None:
             rad_rows = []
