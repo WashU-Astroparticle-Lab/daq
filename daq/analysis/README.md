@@ -5,6 +5,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 ## Contents
 
 - [Noise PSD](#noise-psd)
+- [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [Correlated Noise Removal](#correlated-noise-removal)
 - [Mattis-Bardeen Fitting](#mattis-bardeen-fitting)
@@ -93,6 +94,82 @@ data_2d = np.vstack([i_data, q_data])  # shape: (2, N)
 f, psd = compute_psd(data_2d, fs)
 # psd.shape == (2, len(f))
 ```
+
+---
+
+## Averaged PSD from repeated TimeStreams
+
+`averaged_psd_timestream` wraps `TimeStream` for the common "take data, then show averaged PSD" workflow. It builds a multi-tone `TimeStream` with the configuration you provide, runs it `num_averages` times (e.g. 100), computes a per-tone PSD for every acquisition, and returns the PSDs averaged across acquisitions. Averaging is done as a running mean, so the raw time streams are not all held in memory at once. Each `run()` still writes its own HDF5 file and MongoDB document, just like running the measurement by hand.
+
+The function returns `(f, psd_a, psd_b, streams)`:
+
+- `f` — PSD frequency axis (Hz).
+- `psd_a`, `psd_b` — averaged PSDs, each of shape `(n_tones, n_freqs)`.
+- `streams` — the list of executed `TimeStream` objects (each already saved).
+
+### Resonator basis (dissipation / frequency)
+
+Pass one fitted `Sweep` per tone (aligned with `if_freqs`). Each tone is projected with `from_elec_to_reson`, so `psd_a` is the dissipation (radial) PSD and `psd_b` is the frequency (arc-length) PSD:
+
+```python
+import numpy as np
+from daq.measurements import Sweep
+from daq.analysis import averaged_psd_timestream
+
+# One fitted Sweep per tone, in the same order as if_freqs
+frs = np.array([sw.fit_results["fr"] for sw in sweeps])
+lo = frs[0] - 5e5  # center the LO just below the tones
+
+f, psd_diss, psd_freq, streams = averaged_psd_timestream(
+    num_averages=100,
+    lo_freq=lo,
+    if_freqs=frs - lo,          # multiple IF tones are fine
+    df=10e3,                    # sample rate (Hz)
+    pixel_counts=int(10e3 * 20),
+    amp=0.01,
+    output_port=1,
+    input_port=1,
+    sweeps=sweeps,              # -> resonator-basis PSDs
+    device="B260416-NG-D1",
+    notes="No bias; for PSDs",
+)
+# psd_diss.shape == psd_freq.shape == (len(frs), len(f))
+```
+
+Plot the averaged dissipation and frequency PSDs per tone:
+
+```python
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+for ch in range(psd_diss.shape[0]):
+    axes[0].loglog(f[1:], psd_diss[ch, 1:], label=f"Ch {ch}")
+    axes[1].loglog(f[1:], psd_freq[ch, 1:], label=f"Ch {ch}")
+axes[0].set(xlabel="Frequency [Hz]", ylabel="Dissipation PSD [1/Hz]")
+axes[1].set(xlabel="Frequency [Hz]", ylabel="Frequency PSD [1/Hz]")
+axes[0].legend()
+plt.tight_layout()
+plt.show()
+```
+
+### Raw I/Q (no sweeps)
+
+If you omit `sweeps`, no projection is applied and the two returned PSDs are the averaged PSDs of the raw I (real) and Q (imaginary) quadratures:
+
+```python
+f, psd_i, psd_q, streams = averaged_psd_timestream(
+    num_averages=100,
+    lo_freq=3e9,
+    if_freqs=[0.0, 1e5, 2e5],
+    df=1e3,
+    pixel_counts=int(1e3 * 20),
+    amp=0.01,
+    output_port=1,
+    input_port=1,
+)
+```
+
+Welch's method and its parameters (`welch`, `nperseg`, `noverlap`, `window`, `detrend`) are forwarded to `compute_psd`, and `is_usb` is forwarded to `TimeStream` for per-tone sideband selection.
 
 ---
 
