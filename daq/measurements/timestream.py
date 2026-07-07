@@ -3,6 +3,7 @@
 TimeStream measurement class for acquiring time-domain data with multiple frequencies.
 """
 
+import warnings
 from typing import List, Optional, Union
 
 import h5py
@@ -202,6 +203,25 @@ class TimeStream(Base):
             freqs_lsb = h5f["freqs_lsb"][()] if "freqs_lsb" in h5f else None  # type: ignore
             signal = h5f["signal"][()] if "signal" in h5f else None  # type: ignore
             signal_freqs = h5f["signal_freqs"][()] if "signal_freqs" in h5f else None  # type: ignore
+
+        # Legacy files (saved before scalar-amp broadcasting) stored a single scalar
+        # amp for a multi-tone measurement. presto's set_amplitudes drove only the
+        # first tone and left the rest unpowered, so those other tones contain only
+        # the noise floor. Reconstruct amp as [amp, 0, ..., 0] to reflect what was
+        # actually driven (this also keeps the full-scale sum check happy, since the
+        # lone scalar already passed it when the file was written) and warn the user.
+        amp_arr = np.atleast_1d(np.asarray(amp, dtype=np.float64))
+        n_tones = np.atleast_1d(if_freqs).shape[0]
+        if amp_arr.size == 1 and n_tones > 1:
+            warnings.warn(
+                f"{load_filename} was saved with a single scalar amp for {n_tones} "
+                "tones (legacy pre-broadcast format). presto drove only the first tone "
+                "and left the others unpowered, so only tone 0 carries meaningful "
+                "signal; the remaining tones are just the noise floor. Reconstructing "
+                "amp as [amp, 0, ...] to reflect what was actually driven.",
+                stacklevel=2,
+            )
+            amp = np.concatenate([amp_arr, np.zeros(n_tones - 1, dtype=np.float64)])
 
         self = cls(
             lo_freq=lo_freq,
