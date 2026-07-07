@@ -2,6 +2,8 @@
 """
 TimeStream measurement class for acquiring time-domain data with multiple frequencies.
 """
+
+import warnings
 from typing import List, Optional, Union
 
 import h5py
@@ -39,7 +41,17 @@ class TimeStream(Base):
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
         self.df = df  # modified after tuning
         self.pixel_counts = pixel_counts
-        self.amp = np.asarray(amp, dtype=np.float64)
+        # Per-tone amplitudes. A single scalar is broadcast to every tone (equal
+        # drive), matching the is_usb convention. This guards against a presto
+        # footgun: OutputGroup.set_amplitudes drives ONLY tone 0 and silently
+        # zeroes the rest when given fewer amplitudes than tones, so feeding one
+        # amp for a multi-IF measurement would leave every tone but the first
+        # unprobed.
+        amp_arr = np.atleast_1d(np.asarray(amp, dtype=np.float64))
+        if amp_arr.size == 1:
+            self.amp = np.full(self.if_freqs.shape, amp_arr.item())
+        else:
+            self.amp = amp_arr
         # Per-tone sideband selection: True -> USB (LO + IF), False -> LSB (LO - IF).
         # Defaults to all-USB to preserve previous behaviour. A single bool is
         # broadcast to every tone.
@@ -81,6 +93,10 @@ class TimeStream(Base):
         self.check_sideband()
 
     def check_amp(self) -> None:
+        assert self.amp.shape == self.if_freqs.shape, (
+            "amp must be a scalar or have the same length as if_freqs "
+            f"({self.amp.shape} != {self.if_freqs.shape})"
+        )
         assert self.amp.sum() < 1.0, "Amplitude sum must be less than 1.0"
 
     def check_sideband(self) -> None:
@@ -110,9 +126,7 @@ class TimeStream(Base):
             lck.hardware.set_dac_current(self.output_port, self.DAC_CURRENT)
             lck.hardware.set_inv_sinc(self.output_port, 0)
             lck.hardware.configure_mixer(
-                self.lo_freq, 
-                out_ports=self.output_port, 
-                in_ports=self.input_port
+                self.lo_freq, out_ports=self.output_port, in_ports=self.input_port
             )
             lck.set_dither(self.dither, self.output_port)
 
@@ -132,13 +146,15 @@ class TimeStream(Base):
             ig.set_frequencies(self.if_freqs)
 
             if self.external_trigger:
-                lck.set_trigger_out([1], width=0.03) # Trigger signal as soon as "lck.apply_settings" is called
-            
+                lck.set_trigger_out(
+                    [1], width=0.03
+                )  # Trigger signal as soon as "lck.apply_settings" is called
+
             lck.apply_settings()
 
             # Acquire data
             pixel_dict = lck.get_pixels(self.pixel_counts)
-            
+
             self.freq_arr, self.pixel_i, self.pixel_q = pixel_dict[self.input_port]
             self.lsb, self.usb = untwist_downconversion(self.pixel_i, self.pixel_q)
 
@@ -153,7 +169,7 @@ class TimeStream(Base):
 
             # Mute outputs at the end
             if self.external_trigger:
-                lck.set_trigger_out([0]) # Turns off trigger signal
+                lck.set_trigger_out([0])  # Turns off trigger signal
             og.set_amplitudes(0.0)
             lck.apply_settings()
 
@@ -188,6 +204,25 @@ class TimeStream(Base):
             signal = h5f["signal"][()] if "signal" in h5f else None  # type: ignore
             signal_freqs = h5f["signal_freqs"][()] if "signal_freqs" in h5f else None  # type: ignore
 
+        # Legacy files (saved before scalar-amp broadcasting) stored a single scalar
+        # amp for a multi-tone measurement. presto's set_amplitudes drove only the
+        # first tone and left the rest unpowered, so those other tones contain only
+        # the noise floor. Reconstruct amp as [amp, 0, ..., 0] to reflect what was
+        # actually driven (this also keeps the full-scale sum check happy, since the
+        # lone scalar already passed it when the file was written) and warn the user.
+        amp_arr = np.atleast_1d(np.asarray(amp, dtype=np.float64))
+        n_tones = np.atleast_1d(if_freqs).shape[0]
+        if amp_arr.size == 1 and n_tones > 1:
+            warnings.warn(
+                f"{load_filename} was saved with a single scalar amp for {n_tones} "
+                "tones (legacy pre-broadcast format). presto drove only the first tone "
+                "and left the others unpowered, so only tone 0 carries meaningful "
+                "signal; the remaining tones are just the noise floor. Reconstructing "
+                "amp as [amp, 0, ...] to reflect what was actually driven.",
+                stacklevel=2,
+            )
+            amp = np.concatenate([amp_arr, np.zeros(n_tones - 1, dtype=np.float64)])
+
         self = cls(
             lo_freq=lo_freq,
             if_freqs=if_freqs,
@@ -221,10 +256,7 @@ class TimeStream(Base):
         return self
 
     def analyze(
-        self,
-        num_samples: Optional[int] = None,
-        title: Optional[str] = None,
-        show_iq: bool = True
+        self, num_samples: Optional[int] = None, title: Optional[str] = None, show_iq: bool = True
     ):
         """
         Plot the timestream data, using each tone's selected sideband.
@@ -256,9 +288,10 @@ class TimeStream(Base):
 
         # Create figure with subplots for each frequency
         n_freqs = data.shape[1]
-        fig, axes = plt.subplots(n_freqs, 2, figsize=(12, 2 * n_freqs), 
-                                tight_layout=True, sharex=True)
-        
+        fig, axes = plt.subplots(
+            n_freqs, 2, figsize=(12, 2 * n_freqs), tight_layout=True, sharex=True
+        )
+
         # Handle single frequency case
         if n_freqs == 1:
             axes = axes.reshape(1, -1)
