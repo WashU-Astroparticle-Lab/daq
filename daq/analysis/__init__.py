@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """Analysis tools for DAQ measurements."""
-from .noise import compute_psd, from_elec_to_reson, remove_correlated_noise
+
+from .noise import (
+    averaged_psd_timestream,
+    compute_psd,
+    from_elec_to_reson,
+    remove_correlated_noise,
+)
 from .mattis_bardeen import (
     signed_log10,
     n_qp,
@@ -14,6 +20,7 @@ from .mattis_bardeen import (
 )
 
 __all__ = [
+    "averaged_psd_timestream",
     "compute_psd",
     "from_elec_to_reson",
     "remove_correlated_noise",
@@ -27,4 +34,3 @@ __all__ = [
     "S_2",
     "MB_fitter",
 ]
-
