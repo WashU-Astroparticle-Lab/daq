@@ -149,7 +149,7 @@ ts.analyze()
 **Key Features**:
 - 2D parameter sweep (frequency × power)
 - Power-dependent resonator characterization
-- Interactive visualization with linecuts
+- Per-power resonator fits with `fr` and `Qi` vs. drive power
 
 **Key Parameters**:
 - `freq_center`: Center frequency (Hz)
@@ -162,6 +162,7 @@ ts.analyze()
 - `device`: Device name (required for DB)
 - `filter`: Filter name (optional)
 - `notes`: Measurement notes (optional)
+- `attenuation_db`: Line attenuation in dB (optional). When set, plots reference the drive power to the device input (drive power − attenuation)
 
 **Usage Example**:
 ```python
@@ -182,8 +183,9 @@ filepath = sp.run()
 sp.analyze(norm=True, portrait=True)
 ```
 
-**Analysis**: 2D heatmap with interactive linecuts and optional resonator 
-fitting.
+**Analysis**: 2D response heatmap (with the fitted `fr` overlaid as a scatter),
+plus best-fit `fr` and `Qi` (diag. corrected) vs. drive power with error bars.
+Drive powers whose fit fails are omitted automatically.
 
 ---
 
@@ -350,7 +352,7 @@ Each measurement class provides an `analyze()` method for visualization:
 
 - **Sweep**: Static plots with optional resonator fitting
 - **TimeStream**: I/Q stream plots for each frequency
-- **SweepPower**: 2D heatmap with interactive linecuts
+- **SweepPower**: 2D heatmap with fitted `fr`/`Qi` vs. drive power
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
 
