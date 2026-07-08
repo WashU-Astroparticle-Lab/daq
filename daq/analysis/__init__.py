@@ -20,6 +20,7 @@ from .mattis_bardeen import (
     S_2,
     MB_fitter,
 )
+from .plotting import plot_iq_comparison
 
 __all__ = [
     "averaged_psd_cleaned",
@@ -28,6 +29,7 @@ __all__ = [
     "compute_psd",
     "from_elec_to_reson",
     "remove_correlated_noise",
+    "plot_iq_comparison",
     "signed_log10",
     "n_qp",
     "f_T",

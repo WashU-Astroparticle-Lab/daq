@@ -7,6 +7,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Noise PSD](#noise-psd)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
+- [I/Q Comparison Plot](#iq-comparison-plot)
 - [Correlated Noise Removal](#correlated-noise-removal)
   - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
 - [Mattis-Bardeen Fitting](#mattis-bardeen-fitting)
@@ -227,6 +228,71 @@ fs = ts.df  # sampling rate (Hz)
 
 f, psd_rad = compute_psd(rad, fs)
 f, psd_arc = compute_psd(arc, fs)
+```
+
+---
+
+## I/Q Comparison Plot
+
+`plot_iq_comparison` overlays a time-stream I/Q cloud on the smooth fitted resonator sweep circle in the complex plane. It re-fits the sweep internally (via `resonator_tools`) so the smooth trace and the calibration parameters (`environmental_term`, `phi0`, `fr`) come from one self-consistent fit, then projects the time stream, the sweep trace, and optional QC-trace calibration points into a common display basis. Markers highlight the resonance `fr` and `fr ± freq_shift`, and the sweep trace is coloured by frequency detuning.
+
+### Basic usage
+
+```python
+from daq.measurements import Sweep, TimeStream
+from daq.analysis import plot_iq_comparison
+
+sw = Sweep.load("00000042-Resonator_A-sweep.h5")
+ts = TimeStream.load("00000043-Resonator_A-timestream.h5")
+
+# Overlay the first-tone time stream on the sweep, in the resonator basis
+ax = plot_iq_comparison(
+    ts.signal[:, 0],
+    sw,
+    basis="resonator",
+    device="Resonator_A",
+    power_dbm=-95,
+)
+```
+
+### Choosing a basis and a density style
+
+The `basis` argument selects the display coordinates:
+
+- `"electronic"` — raw I/Q (default),
+- `"fractional"` — environment divided out,
+- `"resonator"` — recentred on the resonance circle.
+
+The `density` argument controls how the (typically large) time-stream cloud is rendered:
+
+- `"scatter"` — light scatter points (default),
+- `"kde"` — scatter plus 1σ / 2σ Gaussian-KDE contours (accurate but slowest),
+- `"contour"` — scatter plus fast 1σ / 2σ contours from a 2-D histogram (levels bound the innermost 68.3% / 95.4% of the counts); the fast way to get contour lines on a large cloud,
+- `"hexbin"` — hexagonal density bins (fastest for big clouds),
+- `"hist2d"` — 2-D histogram.
+
+For big clouds (millions of points) `"contour"` gives KDE-like σ-contours roughly 5× faster than `"kde"`, since it bins with `numpy.histogram2d` instead of evaluating a kernel per point.
+
+```python
+# Fast density view for a very large time stream, with a QC calibration trace
+ax = plot_iq_comparison(
+    ts.signal[:, 0],
+    sw,
+    qc=qc_trace,              # optional complex calibration points (red circles)
+    basis="fractional",
+    density="hexbin",
+    freq_shift=200e3,         # fr ± 200 kHz marker diamonds
+    savefig="iq_comparison.png",
+)
+```
+
+Pass an existing `ax` to compose subplots, `xlim`/`ylim` to zoom, or `title` to override the auto-generated label. The function returns the matplotlib axis.
+
+The scatter defaults (`scatter_size=0.05`, `scatter_alpha=0.005`) are tuned for million-point clouds and render nearly invisibly on small time streams. For a modest cloud, raise them:
+
+```python
+# A few thousand points: make the scatter visible
+ax = plot_iq_comparison(ts.signal[:, 0], sw, scatter_size=2, scatter_alpha=0.2)
 ```
 
 ---
