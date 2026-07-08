@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import warnings
 from typing import TYPE_CHECKING, List, Optional, Sequence, Union
 
 import numpy as np
@@ -497,15 +498,45 @@ def clean_correlated_streams(
         physical frequencies (Hz) of the signal tones (shape ``(n_pairs,)``). When
         *return_coeffs* is ``True``, returns ``(cleaned, freqs, x_r, x_rho)`` with
         *x_r* / *x_rho* of shape ``(n_streams, n_pairs)``.
-    :raises ValueError: If *streams* is empty, only one of *signal_indices* /
-        *reference_indices* is given, the two index lists differ in length, or the
-        default pairing is requested with an odd number of tones.
+    :raises ValueError: If *streams* is empty; any stream's ``signal`` is unset, not
+        2-D, or differs in shape from the first; the first stream's ``signal_freqs`` is
+        unset; only one of *signal_indices* / *reference_indices* is given; the two index
+        lists differ in length; an index is out of range; or the default pairing is
+        requested with an odd number of tones.
+
+    A :class:`UserWarning` is emitted if any signal tone is paired with itself as its own
+    reference (which collapses that cleaned tone to ~zero).
     """
     streams = list(streams)
     if len(streams) == 0:
         raise ValueError("streams must be a non-empty sequence of TimeStream objects")
 
-    n_tones = streams[0].signal.shape[1]
+    # Validate every stream up front so failures name the offending index instead of
+    # surfacing as a cryptic AttributeError/ValueError deep in the loop or np.stack.
+    for i, ts in enumerate(streams):
+        if getattr(ts, "signal", None) is None:
+            raise ValueError(
+                f"streams[{i}].signal is None; run the measurement (or load a file that "
+                "stored signal data) before cleaning"
+            )
+        if ts.signal.ndim != 2:
+            raise ValueError(
+                f"streams[{i}].signal must be 2-D (n_samples, n_tones); got " f"{ts.signal.ndim}-D"
+            )
+    n_samples, n_tones = streams[0].signal.shape
+    for i, ts in enumerate(streams):
+        if ts.signal.shape[0] != n_samples:
+            raise ValueError(
+                "all streams must have the same number of samples; "
+                f"streams[0] has {n_samples} but streams[{i}] has {ts.signal.shape[0]}"
+            )
+        if ts.signal.shape[1] != n_tones:
+            raise ValueError(
+                "all streams must have the same number of tones; "
+                f"streams[0] has {n_tones} but streams[{i}] has {ts.signal.shape[1]}"
+            )
+    if getattr(streams[0], "signal_freqs", None) is None:
+        raise ValueError("streams[0].signal_freqs is None; cannot label the cleaned tones")
 
     if signal_indices is None and reference_indices is None:
         if n_tones % 2 != 0:
@@ -525,6 +556,23 @@ def clean_correlated_streams(
         raise ValueError(
             "signal_indices and reference_indices must have the same length "
             f"({len(signal_indices)} != {len(reference_indices)})"
+        )
+
+    for name, idx in (("signal_indices", signal_indices), ("reference_indices", reference_indices)):
+        out_of_range = [j for j in idx if j < 0 or j >= n_tones]
+        if out_of_range:
+            raise ValueError(
+                f"{name} contains out-of-range tone indices {out_of_range}; "
+                f"streams have {n_tones} tones (valid range 0..{n_tones - 1})"
+            )
+
+    self_paired = [si for si, ri in zip(signal_indices, reference_indices) if si == ri]
+    if self_paired:
+        warnings.warn(
+            f"signal tone(s) {self_paired} are paired with themselves as their own "
+            "reference; remove_correlated_noise then subtracts the signal from itself, "
+            "collapsing the cleaned tone to ~zero. Check signal_indices/reference_indices.",
+            stacklevel=2,
         )
 
     cleaned_all = []
@@ -574,8 +622,9 @@ def averaged_psd_cleaned(
     This is the PSD stage that follows :func:`clean_correlated_streams`: given its
     ``cleaned`` output (the per-acquisition, per-signal-tone complex time series after
     correlated-noise removal), it computes a per-tone PSD for every acquisition and
-    averages them across acquisitions with a running mean. It mirrors
-    :func:`averaged_psd_timestream`, so the two projections match:
+    accumulates them into a running-mean average (only the PSD sum is held, not every
+    acquisition's PSD). It mirrors :func:`averaged_psd_timestream`, so the two
+    projections match:
 
     * When *sweeps* is provided (one fitted :class:`~daq.measurements.sweep.Sweep` per
       **signal** tone, aligned with the last axis of *cleaned*), each tone is projected
