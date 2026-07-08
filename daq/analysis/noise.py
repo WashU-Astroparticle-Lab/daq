@@ -445,3 +445,111 @@ def averaged_psd_timestream(
     psd_b_avg = psd_b_sum / num_averages
 
     return f, psd_a_avg, psd_b_avg, streams
+
+
+def clean_correlated_streams(
+    streams: Sequence["TimeStream"],
+    signal_indices: Optional[Sequence[int]] = None,
+    reference_indices: Optional[Sequence[int]] = None,
+    min_t_s: Optional[float] = None,
+    max_t_s: Optional[float] = None,
+    return_coeffs: bool = False,
+) -> (
+    tuple[npt.NDArray[np.complexfloating], npt.NDArray[np.floating]]
+    | tuple[
+        npt.NDArray[np.complexfloating],
+        npt.NDArray[np.floating],
+        npt.NDArray[np.floating],
+        npt.NDArray[np.floating],
+    ]
+):
+    """Batch-clean interleaved signal/reference time streams with :func:`remove_correlated_noise`.
+
+    Designed for a list of :class:`~daq.measurements.timestream.TimeStream`
+    acquisitions (e.g. the ``streams`` returned by :func:`averaged_psd_timestream`)
+    whose tones are interleaved as ``[signal, reference, signal, reference, ...]``,
+    where each *reference* tone is placed off resonance to track correlated
+    electronics noise for its neighbouring on-resonance *signal* tone. For every
+    stream and every (signal, reference) pair, the on-resonance tone is cleaned
+    against its reference via :func:`remove_correlated_noise`, and only the cleaned
+    signal tones are returned.
+
+    By default the pairing is the interleaved layout above (signal = even tone
+    indices ``0, 2, 4, ...``; reference = odd indices ``1, 3, 5, ...``). Pass
+    *signal_indices* and *reference_indices* together to specify an arbitrary
+    pairing (e.g. one shared reference reused for several signal tones).
+
+    :param streams: Non-empty sequence of :class:`TimeStream` objects, all sharing
+        the same tone layout and sample count. Each must have ``signal`` populated
+        (shape ``(n_samples, n_tones)``).
+    :param signal_indices: Tone indices to treat as on-resonance signals. Defaults to
+        the even indices when *reference_indices* is also ``None``.
+    :param reference_indices: Tone indices of the off-resonance reference paired with
+        each entry of *signal_indices* (same length). Defaults to the odd indices.
+    :param min_t_s: Forwarded to :func:`remove_correlated_noise`; start of the time
+        window used to fit the cleaning coefficients (subtraction still applies to the
+        full record).
+    :param max_t_s: Forwarded to :func:`remove_correlated_noise`; end of that window.
+    :param return_coeffs: When ``True``, also return the per-stream, per-pair cleaning
+        coefficients ``x_r`` and ``x_rho``.
+    :returns: ``(cleaned, freqs)`` where *cleaned* is the complex cleaned signal-tone
+        data with shape ``(n_streams, n_samples, n_pairs)`` and *freqs* holds the
+        physical frequencies (Hz) of the signal tones (shape ``(n_pairs,)``). When
+        *return_coeffs* is ``True``, returns ``(cleaned, freqs, x_r, x_rho)`` with
+        *x_r* / *x_rho* of shape ``(n_streams, n_pairs)``.
+    :raises ValueError: If *streams* is empty, only one of *signal_indices* /
+        *reference_indices* is given, the two index lists differ in length, or the
+        default pairing is requested with an odd number of tones.
+    """
+    streams = list(streams)
+    if len(streams) == 0:
+        raise ValueError("streams must be a non-empty sequence of TimeStream objects")
+
+    n_tones = streams[0].signal.shape[1]
+
+    if signal_indices is None and reference_indices is None:
+        if n_tones % 2 != 0:
+            raise ValueError(
+                "Default interleaved pairing requires an even number of tones "
+                f"([signal, reference, ...]); got {n_tones}. Pass signal_indices and "
+                "reference_indices explicitly."
+            )
+        signal_indices = list(range(0, n_tones, 2))
+        reference_indices = list(range(1, n_tones, 2))
+    elif signal_indices is None or reference_indices is None:
+        raise ValueError("provide both signal_indices and reference_indices, or neither")
+
+    signal_indices = list(signal_indices)
+    reference_indices = list(reference_indices)
+    if len(signal_indices) != len(reference_indices):
+        raise ValueError(
+            "signal_indices and reference_indices must have the same length "
+            f"({len(signal_indices)} != {len(reference_indices)})"
+        )
+
+    cleaned_all = []
+    x_r_all = []
+    x_rho_all = []
+    for ts in streams:
+        sig = ts.signal
+        fs = ts.df
+        cleaned_pairs = []
+        x_r_pairs = []
+        x_rho_pairs = []
+        for si, ri in zip(signal_indices, reference_indices):
+            cleaned, x_r, x_rho = remove_correlated_noise(
+                sig[:, si], sig[:, ri], fs, min_t_s=min_t_s, max_t_s=max_t_s
+            )
+            cleaned_pairs.append(cleaned)
+            x_r_pairs.append(x_r)
+            x_rho_pairs.append(x_rho)
+        cleaned_all.append(np.stack(cleaned_pairs, axis=-1))  # (n_samples, n_pairs)
+        x_r_all.append(x_r_pairs)
+        x_rho_all.append(x_rho_pairs)
+
+    cleaned_arr = np.stack(cleaned_all, axis=0)  # (n_streams, n_samples, n_pairs)
+    freqs = np.asarray(streams[0].signal_freqs)[signal_indices]
+
+    if return_coeffs:
+        return cleaned_arr, freqs, np.asarray(x_r_all), np.asarray(x_rho_all)
+    return cleaned_arr, freqs

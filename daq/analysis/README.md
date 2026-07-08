@@ -8,6 +8,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [Correlated Noise Removal](#correlated-noise-removal)
+  - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
 - [Mattis-Bardeen Fitting](#mattis-bardeen-fitting)
 - [Helper Functions](#helper-functions)
 
@@ -307,6 +308,62 @@ plt.legend()
 plt.grid(True, which="both", alpha=0.3)
 plt.show()
 ```
+
+### Batch cleaning of interleaved streams
+
+`clean_correlated_streams` applies `remove_correlated_noise` across a whole list of `TimeStream` acquisitions — for example the `streams` returned by `averaged_psd_timestream` — when the tones are interleaved as `[signal, reference, signal, reference, ...]`. Each *reference* tone sits off resonance and cleans its neighbouring on-resonance *signal* tone. It returns only the cleaned signal tones.
+
+```python
+import numpy as np
+from daq.analysis import averaged_psd_timestream, clean_correlated_streams
+
+# frs_interleaved = [TONE1, CLEAN1, TONE2, CLEAN2, ...]
+lo = frs_interleaved[0] - 5e5
+_, _, _, streams = averaged_psd_timestream(
+    num_averages=100,
+    lo_freq=lo,
+    if_freqs=frs_interleaved - lo,
+    df=10e3,
+    pixel_counts=int(10e3 * 20),
+    amp=amps_interleaved,   # per-tone array (one amp per tone)
+    output_port=1,
+    input_port=1,
+)
+
+# Default pairing: signals = even indices, references = odd indices.
+cleaned, freqs = clean_correlated_streams(streams)
+# cleaned.shape == (n_streams, n_samples, n_signal_tones)  (complex)
+# freqs         == physical frequencies of the signal tones
+```
+
+Compute an averaged PSD of the cleaned tones (e.g. gain fluctuations) exactly as `averaged_psd_timestream` does internally:
+
+```python
+from daq.analysis import compute_psd
+
+psd_sum = None
+for t in range(cleaned.shape[0]):
+    r = np.abs(cleaned[t]).T                       # (n_signal_tones, n_samples)
+    r -= r.mean(axis=1, keepdims=True)
+    f, psd = compute_psd(r, streams[t].df)
+    psd_sum = psd if psd_sum is None else psd_sum + psd
+psd_avg = psd_sum / cleaned.shape[0]               # (n_signal_tones, n_freqs)
+```
+
+For non-interleaved layouts (e.g. a single shared reference tone), pass the pairing explicitly:
+
+```python
+# Signals at tones 0, 2, 4 all cleaned against one shared reference at tone 6
+cleaned, freqs = clean_correlated_streams(
+    streams, signal_indices=[0, 2, 4], reference_indices=[6, 6, 6]
+)
+
+# Also return the per-stream, per-pair cleaning coefficients
+cleaned, freqs, x_r, x_rho = clean_correlated_streams(streams, return_coeffs=True)
+# x_r.shape == x_rho.shape == (n_streams, n_signal_tones)
+```
+
+The `min_t_s` / `max_t_s` window arguments are forwarded to `remove_correlated_noise`. All streams must share the same tone layout and sample count.
 
 ---
 
