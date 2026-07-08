@@ -60,7 +60,7 @@ class SweepPower(Base):
         presto_address: Optional[str] = None,
         presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
-        save_filename: Optional[str] = None
+        save_filename: Optional[str] = None,
     ) -> str:
         if presto_address is None:
             presto_address = get_presto_address()
@@ -209,9 +209,7 @@ class SweepPower(Base):
             device = h5f.attrs.get("device", None)
             filter_param = h5f.attrs.get("filter", None)
             notes = h5f.attrs.get("notes", None)
-            auto_fit = bool(
-                h5f.attrs["auto_fit"]
-            ) if "auto_fit" in h5f.attrs else True
+            auto_fit = bool(h5f.attrs["auto_fit"]) if "auto_fit" in h5f.attrs else True
 
             amp_arr: npt.NDArray[np.float64] = h5f["amp_arr"][()]  # type: ignore
             freq_arr: npt.NDArray[np.float64] = h5f["freq_arr"][()]  # type: ignore
@@ -378,14 +376,16 @@ class SweepPower(Base):
             assert self.resp_arr is not None
             line_sel.set_ydata([power_dbm[self._AMP_IDX], power_dbm[self._AMP_IDX]])
             # ax1.set_title(f"amp = {amp_arr[AMP_IDX]:.2e}")
-            print(
-                f"drive amp {self._AMP_IDX:d}: Power = {power_dbm[self._AMP_IDX]:.1f} dBm"
-            )
+            print(f"drive amp {self._AMP_IDX:d}: Power = {power_dbm[self._AMP_IDX]:.1f} dBm")
             line_a.set_ydata(resp_dB[self._AMP_IDX])
             line_p.set_ydata(np.angle(self.resp_arr[self._AMP_IDX]))
             if _do_fit:
-                line_fit_a.set_ydata(np.full_like(self.freq_arr, np.nan))  # pyright: ignore [reportPossiblyUnboundVariable]
-                line_fit_p.set_ydata(np.full_like(self.freq_arr, np.nan))  # pyright: ignore [reportPossiblyUnboundVariable]
+                line_fit_a.set_ydata(
+                    np.full_like(self.freq_arr, np.nan)
+                )  # pyright: ignore [reportPossiblyUnboundVariable]
+                line_fit_p.set_ydata(
+                    np.full_like(self.freq_arr, np.nan)
+                )  # pyright: ignore [reportPossiblyUnboundVariable]
             # ax2.set_title("")
             if blit:
                 fig1.canvas.restore_region(self._bg)  # type: ignore
@@ -401,7 +401,9 @@ class SweepPower(Base):
 
             def onselect(xmin, xmax):
                 assert self.resp_arr is not None
-                port = circuit.notch_port(self.freq_arr, self.resp_arr[self._AMP_IDX])  # pyright: ignore [reportPossiblyUnboundVariable]
+                port = circuit.notch_port(
+                    self.freq_arr, self.resp_arr[self._AMP_IDX]
+                )  # pyright: ignore [reportPossiblyUnboundVariable]
                 port.autofit(fcrop=(xmin * 1e9, xmax * 1e9))
                 if norm:
                     line_fit_a.set_data(  # pyright: ignore [reportPossiblyUnboundVariable]
@@ -409,8 +411,12 @@ class SweepPower(Base):
                         20 * np.log10(np.abs(port.z_data_sim / self.amp_arr[self._AMP_IDX])),
                     )
                 else:
-                    line_fit_a.set_data(1e-9 * port.f_data, 20 * np.log10(np.abs(port.z_data_sim)))  # pyright: ignore
-                line_fit_p.set_data(1e-9 * port.f_data, np.angle(port.z_data_sim))  # pyright: ignore
+                    line_fit_a.set_data(
+                        1e-9 * port.f_data, 20 * np.log10(np.abs(port.z_data_sim))
+                    )  # pyright: ignore
+                line_fit_p.set_data(
+                    1e-9 * port.f_data, np.angle(port.z_data_sim)
+                )  # pyright: ignore
                 # print(port.fitresults)
                 print("----------------")
                 print(f"fr = {port.fitresults['fr']}")
