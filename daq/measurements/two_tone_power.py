@@ -391,7 +391,15 @@ class TwoTonePower(Base):
             fig1.canvas.mpl_connect("button_press_event", onbuttonpress)
             fig1.canvas.mpl_connect("key_press_event", onkeypress)
 
-        fig1.show()
+        if blit:
+            # Interactive (GUI-backend) blitting needs a non-blocking show so
+            # the background capture below can run before the window is closed.
+            fig1.show()
+        else:
+            # Non-interactive path: plt.show() renders immediately and closes
+            # the figure, so inside a notebook loop each figure appears right
+            # away instead of the inline backend queuing them until cell end.
+            plt.show()
         if linecut and blit:
             fig1.canvas.draw()
             self._bg = fig1.canvas.copy_from_bbox(
