@@ -315,6 +315,8 @@ class SweepPower(Base):
         :type norm: bool
         :param portrait: Stack the panels vertically instead of side-by-side.
         :type portrait: bool
+        :return: The created figure.
+        :rtype: matplotlib.figure.Figure
         """
         if self.freq_arr is None:
             raise RuntimeError
@@ -433,4 +435,9 @@ class SweepPower(Base):
         ax3.set_ylabel(r"Fit $Q_i$ (diag. corr.)")
         ax3.set_xlabel(power_label)
 
-        fig1.show()
+        # Use plt.show() (not fig1.show()) so that inside a notebook loop each
+        # figure renders immediately and is closed afterwards -- otherwise the
+        # inline backend queues every figure until the cell ends and shows them
+        # all at once. Matches the other measurement classes.
+        plt.show()
+        return fig1
