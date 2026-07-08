@@ -336,18 +336,38 @@ cleaned, freqs = clean_correlated_streams(streams)
 # freqs         == physical frequencies of the signal tones
 ```
 
-Compute an averaged PSD of the cleaned tones (e.g. gain fluctuations) exactly as `averaged_psd_timestream` does internally:
+### From cleaned tones to averaged PSDs
+
+`averaged_psd_cleaned` is the PSD stage that follows `clean_correlated_streams`. It takes the `cleaned` array, computes a per-tone PSD for every acquisition, and averages them across acquisitions (running mean). It mirrors `averaged_psd_timestream`: pass one fitted `Sweep` per **signal** tone to get resonator-basis dissipation/frequency PSDs, or omit `sweeps` for raw I/Q PSDs.
 
 ```python
-from daq.analysis import compute_psd
+from daq.analysis import averaged_psd_cleaned
 
-psd_sum = None
-for t in range(cleaned.shape[0]):
-    r = np.abs(cleaned[t]).T                       # (n_signal_tones, n_samples)
-    r -= r.mean(axis=1, keepdims=True)
-    f, psd = compute_psd(r, streams[t].df)
-    psd_sum = psd if psd_sum is None else psd_sum + psd
-psd_avg = psd_sum / cleaned.shape[0]               # (n_signal_tones, n_freqs)
+cleaned, freqs = clean_correlated_streams(streams)
+fs = streams[0].df
+
+# Resonator basis: one Sweep per signal tone (aligned with `freqs`)
+f, psd_diss, psd_freq = averaged_psd_cleaned(cleaned, fs, sweeps=signal_sweeps)
+# psd_diss.shape == psd_freq.shape == (n_signal_tones, len(f))
+
+# Or raw I/Q PSDs when you have no sweeps
+f, psd_i, psd_q = averaged_psd_cleaned(cleaned, fs)
+```
+
+Plot the cleaned, averaged PSDs per signal tone:
+
+```python
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+for ch in range(psd_diss.shape[0]):
+    axes[0].loglog(f[1:], psd_diss[ch, 1:], label=f"{freqs[ch]/1e9:.4f} GHz")
+    axes[1].loglog(f[1:], psd_freq[ch, 1:])
+axes[0].set(xlabel="Frequency [Hz]", ylabel="Dissipation PSD [1/Hz]")
+axes[1].set(xlabel="Frequency [Hz]", ylabel="Frequency PSD [1/Hz]")
+axes[0].legend()
+plt.tight_layout()
+plt.show()
 ```
 
 For non-interleaved layouts (e.g. a single shared reference tone), pass the pairing explicitly:

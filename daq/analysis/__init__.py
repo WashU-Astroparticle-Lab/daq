@@ -2,6 +2,7 @@
 """Analysis tools for DAQ measurements."""
 
 from .noise import (
+    averaged_psd_cleaned,
     averaged_psd_timestream,
     clean_correlated_streams,
     compute_psd,
@@ -21,6 +22,7 @@ from .mattis_bardeen import (
 )
 
 __all__ = [
+    "averaged_psd_cleaned",
     "averaged_psd_timestream",
     "clean_correlated_streams",
     "compute_psd",

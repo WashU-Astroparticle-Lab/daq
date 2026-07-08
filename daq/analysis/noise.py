@@ -553,3 +553,103 @@ def clean_correlated_streams(
     if return_coeffs:
         return cleaned_arr, freqs, np.asarray(x_r_all), np.asarray(x_rho_all)
     return cleaned_arr, freqs
+
+
+def averaged_psd_cleaned(
+    cleaned: npt.NDArray[np.complexfloating],
+    fs: float,
+    sweeps: Optional[Sequence["Sweep"]] = None,
+    welch: bool = False,
+    nperseg: Optional[int] = None,
+    noverlap: Optional[int] = None,
+    window: str = "hann",
+    detrend: str | bool = "constant",
+) -> tuple[
+    npt.NDArray[np.floating],
+    npt.NDArray[np.floating],
+    npt.NDArray[np.floating],
+]:
+    """Average the PSDs of cleaned signal tones across acquisitions.
+
+    This is the PSD stage that follows :func:`clean_correlated_streams`: given its
+    ``cleaned`` output (the per-acquisition, per-signal-tone complex time series after
+    correlated-noise removal), it computes a per-tone PSD for every acquisition and
+    averages them across acquisitions with a running mean. It mirrors
+    :func:`averaged_psd_timestream`, so the two projections match:
+
+    * When *sweeps* is provided (one fitted :class:`~daq.measurements.sweep.Sweep` per
+      **signal** tone, aligned with the last axis of *cleaned*), each tone is projected
+      into the resonator basis with :func:`from_elec_to_reson` and the two returned PSDs
+      are the **dissipation** (``rad``) and **frequency** (``arc``) responses.
+    * When *sweeps* is ``None``, the two returned PSDs are the PSDs of the raw **I**
+      (real) and **Q** (imaginary) quadratures of the cleaned signal.
+
+    :param cleaned: Complex cleaned signal data. Either the ``(n_streams, n_samples,
+        n_signal_tones)`` array from :func:`clean_correlated_streams`, or a single
+        ``(n_samples, n_signal_tones)`` acquisition (treated as one stream).
+    :param fs: Sampling frequency in Hz (e.g. ``streams[0].df``). All acquisitions are
+        assumed to share this rate.
+    :param sweeps: Optional sequence of fitted :class:`Sweep` objects, one per signal
+        tone. When given, PSDs are in the resonator (dissipation / frequency) basis;
+        otherwise the raw I / Q PSDs are returned.
+    :param welch: Forwarded to :func:`compute_psd` (Welch's method when ``True``).
+    :param nperseg: Forwarded to :func:`compute_psd` (Welch only).
+    :param noverlap: Forwarded to :func:`compute_psd` (Welch only).
+    :param window: Forwarded to :func:`compute_psd` (Welch only).
+    :param detrend: Forwarded to :func:`compute_psd` (Welch only).
+    :returns: ``(f, psd_a, psd_b)`` where *f* is the PSD frequency axis in Hz and
+        *psd_a* / *psd_b* are the averaged PSDs with shape
+        ``(n_signal_tones, n_freqs)`` (dissipation / frequency when *sweeps* is given,
+        else I / Q).
+    :raises ValueError: If *cleaned* is not 2-D or 3-D, or *sweeps* length does not match
+        the number of signal tones.
+    """
+    cleaned = np.asarray(cleaned)
+    if cleaned.ndim == 2:
+        cleaned = cleaned[np.newaxis, ...]
+    if cleaned.ndim != 3:
+        raise ValueError(
+            "cleaned must be 2-D (n_samples, n_signal_tones) or 3-D "
+            f"(n_streams, n_samples, n_signal_tones); got {cleaned.ndim}-D"
+        )
+
+    n_streams, _, n_signal = cleaned.shape
+    if sweeps is not None and len(sweeps) != n_signal:
+        raise ValueError(
+            f"sweeps must provide one Sweep per signal tone ({len(sweeps)} != {n_signal})"
+        )
+
+    f: Optional[npt.NDArray[np.floating]] = None
+    psd_a_sum: Optional[npt.NDArray[np.floating]] = None
+    psd_b_sum: Optional[npt.NDArray[np.floating]] = None
+
+    for t in range(n_streams):
+        if sweeps is not None:
+            rad_rows = []
+            arc_rows = []
+            for ch in range(n_signal):
+                _, rad, arc = from_elec_to_reson(cleaned[t, :, ch], sweeps[ch])
+                rad_rows.append(rad)
+                arc_rows.append(arc)
+            a = np.asarray(rad_rows)
+            b = np.asarray(arc_rows)
+        else:
+            # cleaned[t] has shape (n_samples, n_signal); PSD wants tones on rows.
+            a = cleaned[t].real.T
+            b = cleaned[t].imag.T
+
+        f, psd_a = compute_psd(
+            a, fs, welch=welch, nperseg=nperseg, noverlap=noverlap, window=window, detrend=detrend
+        )
+        _, psd_b = compute_psd(
+            b, fs, welch=welch, nperseg=nperseg, noverlap=noverlap, window=window, detrend=detrend
+        )
+
+        if psd_a_sum is None:
+            psd_a_sum = psd_a
+            psd_b_sum = psd_b
+        else:
+            psd_a_sum += psd_a
+            psd_b_sum += psd_b
+
+    return f, psd_a_sum / n_streams, psd_b_sum / n_streams
