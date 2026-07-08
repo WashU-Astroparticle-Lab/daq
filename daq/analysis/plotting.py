@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from daq.measurements.sweep import Sweep
 
 Basis = Literal["electronic", "fractional", "resonator"]
-Density = Literal["scatter", "kde", "hexbin", "hist2d"]
+Density = Literal["scatter", "kde", "contour", "hexbin", "hist2d"]
 
 
 def _to_basis(
@@ -112,6 +112,76 @@ def _add_kde_contours(
     )
 
 
+def _add_hist_contours(
+    ax: "matplotlib.axes.Axes",
+    real: npt.NDArray[np.floating],
+    imag: npt.NDArray[np.floating],
+    color: str,
+    bins: int,
+    smooth: float = 1.0,
+) -> None:
+    """Overlay 1-sigma / 2-sigma contours from a 2-D histogram on *ax*.
+
+    Much faster than :func:`_add_kde_contours` for large clouds -- it bins with
+    :func:`numpy.histogram2d` (no per-point kernel evaluation) and derives the
+    contour levels from the enclosed cumulative mass, so the 1-sigma / 2-sigma
+    lines bound the innermost 68.3% / 95.4% of the counts rather than fixed
+    count thresholds.
+
+    :param ax: Axis to draw on.
+    :param real: Real (I) component of the cloud.
+    :param imag: Imaginary (Q) component of the cloud.
+    :param color: Contour colour.
+    :param bins: Number of histogram bins per axis.
+    :param smooth: Gaussian smoothing (in bins) applied to the histogram before
+        contouring, to tame jagged lines. Set to ``0`` to disable. Defaults to
+        ``1.0``.
+    """
+    if real.size < 3:
+        return
+
+    counts, x_edges, y_edges = np.histogram2d(real, imag, bins=bins)
+    if smooth > 0:
+        from scipy.ndimage import gaussian_filter
+
+        counts = gaussian_filter(counts, smooth)
+
+    total = counts.sum()
+    if total <= 0:
+        return
+
+    # Density levels enclosing 68.3% / 95.4% of the mass (Z-values, decreasing).
+    flat = np.sort(counts.ravel())[::-1]
+    cum = np.cumsum(flat) / total
+    level_1sigma = flat[min(int(np.searchsorted(cum, 0.683)), flat.size - 1)]
+    level_2sigma = flat[min(int(np.searchsorted(cum, 0.954)), flat.size - 1)]
+
+    x_ctr = 0.5 * (x_edges[:-1] + x_edges[1:])
+    y_ctr = 0.5 * (y_edges[:-1] + y_edges[1:])
+
+    # counts is indexed [x, y]; contour wants Z[y, x], hence the transpose.
+    ax.contour(
+        x_ctr,
+        y_ctr,
+        counts.T,
+        levels=[level_2sigma],
+        colors=[color],
+        alpha=0.3,
+        linewidths=1.0,
+        linestyles=":",
+    )
+    ax.contour(
+        x_ctr,
+        y_ctr,
+        counts.T,
+        levels=[level_1sigma],
+        colors=[color],
+        alpha=0.6,
+        linewidths=1.5,
+        linestyles="--",
+    )
+
+
 def plot_iq_comparison(
     ts: npt.NDArray[np.complexfloating],
     sw: "Sweep",
@@ -159,14 +229,16 @@ def plot_iq_comparison(
     :param freq_shift: Detuning in Hz for the ``fr ± freq_shift`` marker
         diamonds. Defaults to ``400e3``.
     :param density: How to render the time-stream cloud: ``"scatter"`` (points),
-        ``"kde"`` (scatter plus Gaussian-KDE contours), ``"hexbin"``, or
-        ``"hist2d"``. Defaults to ``"scatter"``.
+        ``"kde"`` (scatter plus Gaussian-KDE contours; accurate but slow),
+        ``"contour"`` (scatter plus fast histogram-based 1-sigma / 2-sigma
+        contours), ``"hexbin"``, or ``"hist2d"``. Defaults to ``"scatter"``.
     :param fcrop: Optional ``(f_min, f_max)`` crop passed to the resonator
         autofit. When ``None``, the fit is cropped to the half-span centred on
         the amplitude minimum, matching :meth:`Sweep.fit`.
     :param max_points: Cap on the number of time-stream points used for KDE and
         scatter rendering; larger clouds are subsampled. Defaults to ``50_000``.
-    :param grid_size: KDE contour grid resolution per axis. Defaults to ``50``.
+    :param grid_size: Grid resolution per axis for the ``"kde"`` contour grid
+        and the ``"contour"`` histogram bins. Defaults to ``50``.
     :param hexbin_gridsize: Hexbin grid resolution. Defaults to ``30``.
     :param xlim: Optional x-axis limits ``(lo, hi)``.
     :param ylim: Optional y-axis limits ``(lo, hi)``.
@@ -186,9 +258,10 @@ def plot_iq_comparison(
     import matplotlib.pyplot as plt
     from resonator_tools import circuit
 
-    if density not in ("scatter", "kde", "hexbin", "hist2d"):
+    if density not in ("scatter", "kde", "contour", "hexbin", "hist2d"):
         raise ValueError(
-            f"density must be one of 'scatter', 'kde', 'hexbin', 'hist2d'; got {density!r}"
+            "density must be one of 'scatter', 'kde', 'contour', 'hexbin', 'hist2d'; "
+            f"got {density!r}"
         )
     if sw.freq_arr is None or sw.resp_arr is None:
         raise ValueError("sw must have freq_arr and resp_arr populated; run the sweep first")
@@ -226,7 +299,7 @@ def plot_iq_comparison(
     ts_imag = tsz.imag.ravel()
 
     # --- Time-stream cloud ---
-    if density in ("scatter", "kde"):
+    if density in ("scatter", "kde", "contour"):
         step = max(1, ts_real.size // max_points)
         ax.scatter(
             ts_real[::step],
@@ -238,6 +311,8 @@ def plot_iq_comparison(
         )
         if density == "kde":
             _add_kde_contours(ax, ts_real, ts_imag, "tab:blue", max_points, grid_size)
+        elif density == "contour":
+            _add_hist_contours(ax, ts_real, ts_imag, "tab:blue", grid_size)
     elif density == "hexbin":
         if ts_real.size > max_points:
             step = ts_real.size // max_points
