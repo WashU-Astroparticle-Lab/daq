@@ -32,6 +32,10 @@ class SweepPower(Base):
         input_port: int,
         dither: bool = True,
         num_skip: int = 0,
+        device: Optional[str] = None,
+        filter: Optional[str] = None,
+        notes: Optional[str] = None,
+        auto_fit: bool = True,
     ) -> None:
         self.freq_center = freq_center
         self.freq_span = freq_span
@@ -42,9 +46,14 @@ class SweepPower(Base):
         self.input_port = input_port
         self.dither = dither
         self.num_skip = num_skip
+        self.device = device
+        self.filter = filter
+        self.notes = notes
+        self.auto_fit = auto_fit
 
         self.freq_arr = None  # replaced by run
         self.resp_arr = None  # replaced by run
+        self.fit_results = None  # list of per-amp fit dicts, replaced by run
 
     def run(
         self,
@@ -131,10 +140,59 @@ class SweepPower(Base):
             og.set_amplitudes(0.0)
             lck.apply_settings()
 
+        # Perform automatic per-amp fit analysis before saving (if enabled)
+        if self.auto_fit:
+            self._perform_fit()
+
         return self.save(save_filename=save_filename)
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)
+
+    def _perform_fit(self) -> bool:
+        """Fit the resonator silently at each drive amplitude and store the results.
+
+        Populates :attr:`fit_results` with one entry per row of :attr:`amp_arr`
+        (i.e. per drive power): the ``resonator_tools`` ``fitresults`` dict on
+        success, or ``None`` if that amplitude's fit failed. The list is kept on
+        the object only -- it is not written to HDF5 or MongoDB.
+
+        :return: ``True`` if at least one amplitude was fit successfully.
+        :rtype: bool
+        """
+        if self.freq_arr is None or self.resp_arr is None:
+            return False
+
+        try:
+            from resonator_tools import circuit
+        except ImportError:
+            # resonator_tools not available, skip fitting
+            return False
+
+        fit_results = []
+        any_success = False
+        for jj in range(len(self.amp_arr)):
+            resp = self.resp_arr[jj]
+            try:
+                # Center the fit on the amplitude minimum for this drive power
+                f_ctr = self.freq_arr[np.argmin(np.abs(resp))]
+                # Fit at most half of the sweep span
+                f_min = max(f_ctr - self.freq_span / 4, self.freq_arr.min())
+                f_max = min(f_ctr + self.freq_span / 4, self.freq_arr.max())
+
+                port = circuit.notch_port(self.freq_arr, resp)
+                port.autofit(fcrop=(f_min, f_max))
+
+                fit_results.append(port.fitresults)
+                any_success = True
+            except Exception as e:
+                # Fit failed for this amp; keep going so one bad row does not
+                # prevent the measurement from being saved.
+                print(f"WARN: Fit analysis failed at amp index {jj}: {e}")
+                fit_results.append(None)
+
+        self.fit_results = fit_results
+        return any_success
 
     @classmethod
     def load(cls, load_filename: str) -> "SweepPower":
@@ -147,6 +205,13 @@ class SweepPower(Base):
             input_port = int(h5f.attrs["input_port"])  # type: ignore
             dither = bool(h5f.attrs["dither"])  # type: ignore
             num_skip = int(h5f.attrs["num_skip"])  # type: ignore
+            # Load optional parameters if they exist
+            device = h5f.attrs.get("device", None)
+            filter_param = h5f.attrs.get("filter", None)
+            notes = h5f.attrs.get("notes", None)
+            auto_fit = bool(
+                h5f.attrs["auto_fit"]
+            ) if "auto_fit" in h5f.attrs else True
 
             amp_arr: npt.NDArray[np.float64] = h5f["amp_arr"][()]  # type: ignore
             freq_arr: npt.NDArray[np.float64] = h5f["freq_arr"][()]  # type: ignore
@@ -162,6 +227,10 @@ class SweepPower(Base):
             input_port=input_port,
             dither=dither,
             num_skip=num_skip,
+            device=device,
+            filter=filter_param,
+            notes=notes,
+            auto_fit=auto_fit,
         )
         self.freq_arr = freq_arr
         self.resp_arr = resp_arr
