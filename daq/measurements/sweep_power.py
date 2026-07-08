@@ -36,6 +36,7 @@ class SweepPower(Base):
         filter: Optional[str] = None,
         notes: Optional[str] = None,
         auto_fit: bool = True,
+        attenuation_db: Optional[float] = None,
     ) -> None:
         self.freq_center = freq_center
         self.freq_span = freq_span
@@ -50,6 +51,7 @@ class SweepPower(Base):
         self.filter = filter
         self.notes = notes
         self.auto_fit = auto_fit
+        self.attenuation_db = attenuation_db
 
         self.freq_arr = None  # replaced by run
         self.resp_arr = None  # replaced by run
@@ -210,6 +212,9 @@ class SweepPower(Base):
             filter_param = h5f.attrs.get("filter", None)
             notes = h5f.attrs.get("notes", None)
             auto_fit = bool(h5f.attrs["auto_fit"]) if "auto_fit" in h5f.attrs else True
+            attenuation_db = (
+                float(h5f.attrs["attenuation_db"]) if "attenuation_db" in h5f.attrs else None
+            )
 
             amp_arr: npt.NDArray[np.float64] = h5f["amp_arr"][()]  # type: ignore
             freq_arr: npt.NDArray[np.float64] = h5f["freq_arr"][()]  # type: ignore
@@ -229,13 +234,88 @@ class SweepPower(Base):
             filter=filter_param,
             notes=notes,
             auto_fit=auto_fit,
+            attenuation_db=attenuation_db,
         )
         self.freq_arr = freq_arr
         self.resp_arr = resp_arr
 
         return self
 
-    def analyze(self, norm: bool = True, portrait: bool = True, blit: bool = False):
+    def _drive_power(self) -> "tuple[npt.NDArray[np.float64], str]":
+        """Return the drive-power axis and its label for plotting.
+
+        Converts :attr:`amp_arr` to calibrated output power in dBm at
+        :attr:`freq_center`. When :attr:`attenuation_db` is set, the power is
+        referenced to the device input -- ``drive power - attenuation_db`` --
+        and the label reflects that.
+
+        :return: ``(power_dbm, label)`` where *power_dbm* has the same length
+            as :attr:`amp_arr`.
+        :rtype: tuple[numpy.ndarray, str]
+        """
+        power_dbm = np.asarray(
+            amp_to_power_dbm_hz(self.freq_center, self.amp_arr), dtype=np.float64
+        )
+        if self.attenuation_db is not None:
+            power_dbm = power_dbm - self.attenuation_db
+            label = "Drive power at device [dBm]"
+        else:
+            label = "Drive power [dBm]"
+        return power_dbm, label
+
+    def _fit_vs_power(
+        self,
+    ) -> "tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]":
+        """Extract per-amp fitted ``fr`` and ``Qi`` (diagonally corrected).
+
+        Reads the ``resonator_tools`` ``fitresults`` dicts stored in
+        :attr:`fit_results`, one per drive amplitude. Amplitudes with a failed
+        (``None``) fit yield ``NaN`` so they are simply skipped when plotted.
+
+        :return: ``(fr, fr_err, qi, qi_err)``, each an array of length
+            ``len(amp_arr)``. ``fr``/``fr_err`` are in Hz.
+        :rtype: tuple[numpy.ndarray, numpy.ndarray, numpy.ndarray, numpy.ndarray]
+        """
+        nr_amps = len(self.amp_arr)
+        fr = np.full(nr_amps, np.nan)
+        fr_err = np.full(nr_amps, np.nan)
+        qi = np.full(nr_amps, np.nan)
+        qi_err = np.full(nr_amps, np.nan)
+
+        if self.fit_results is not None:
+            for jj, res in enumerate(self.fit_results):
+                if not res:
+                    continue
+                fr[jj] = res.get("fr", np.nan)
+                fr_err[jj] = res.get("fr_err", np.nan)
+                qi[jj] = res.get("Qi_dia_corr", np.nan)
+                qi_err[jj] = res.get("Qi_dia_corr_err", np.nan)
+
+        return fr, fr_err, qi, qi_err
+
+    def analyze(self, norm: bool = True, portrait: bool = True):
+        """Plot the 2D response map and the fitted resonator parameters.
+
+        The left/top panel shows the response-amplitude map over frequency and
+        drive power, overlaid with a scatter of the fitted resonant frequency
+        at each drive power. The remaining two panels show the best-fit
+        resonant frequency ``fr`` and internal quality factor ``Qi``
+        (diagonally corrected) as a function of drive power, each with
+        fit-error bars.
+
+        Fits frequently fail at some -- or all -- drive powers; those points
+        are simply omitted from every panel (and drawn without an error bar
+        where the fit succeeded but reported no uncertainty), so a partial or
+        empty fit never raises.
+
+        When :attr:`attenuation_db` is set, the drive-power axis is referenced
+        to the device input (drive power minus the attenuation).
+
+        :param norm: Normalise the response map by the per-row drive amplitude.
+        :type norm: bool
+        :param portrait: Stack the panels vertically instead of side-by-side.
+        :type portrait: bool
+        """
         if self.freq_arr is None:
             raise RuntimeError
         if self.resp_arr is None:
@@ -243,26 +323,27 @@ class SweepPower(Base):
 
         import matplotlib.pyplot as plt
 
-        try:
-            from resonator_tools import circuit
-            import matplotlib.widgets as mwidgets
-
-            _do_fit = True
-        except ImportError:
-            _do_fit = False
-
-        nr_amps = len(self.amp_arr)
-        self._AMP_IDX = nr_amps // 2
+        # Ensure per-amp fits are available (e.g. after load(), which does not
+        # persist fit_results); fit lazily so analyze() works standalone.
+        if self.fit_results is None:
+            self._perform_fit()
 
         if norm:
-            resp_scaled = np.zeros_like(self.resp_arr)
-            for jj in range(nr_amps):
-                resp_scaled[jj] = self.resp_arr[jj] / self.amp_arr[jj]
+            resp_scaled = self.resp_arr / self.amp_arr[:, None]
         else:
             resp_scaled = self.resp_arr
 
         resp_dB = 20.0 * np.log10(np.abs(resp_scaled))
-        power_dbm = amp_to_power_dbm_hz(self.freq_center, self.amp_arr)
+        power_dbm, power_label = self._drive_power()
+        fr, fr_err, qi, qi_err = self._fit_vs_power()
+
+        # Fits often fail for some (or all) drive powers -- those rows come back
+        # as NaN. Drop them from the markers and draw no error bar where the fit
+        # error is missing (NaN -> 0-length bar) so nothing raises or misleads.
+        finite_fr = np.isfinite(fr)
+        finite_qi = np.isfinite(qi)
+        fr_err_safe = np.where(np.isfinite(fr_err), fr_err, 0.0)
+        qi_err_safe = np.where(np.isfinite(qi_err), qi_err, 0.0)
 
         # choose limits for colorbar
         cutoff = 1.0  # %
@@ -292,17 +373,29 @@ class SweepPower(Base):
             vmin=lowlim,  # type: ignore
             vmax=highlim,  # type: ignore
         )
-        line_sel = ax1.axhline(power_dbm[self._AMP_IDX], ls="--", c="k", lw=3, animated=blit)
-        # ax1.set_title(f"amp = {amp_arr[AMP_IDX]:.2e}")
+        # Mark the fitted resonant frequency on the response map (skip failed
+        # fits). Constrain the axes to the map extent so stray points cannot
+        # rescale it.
+        if np.any(finite_fr):
+            ax1.scatter(
+                1e-9 * fr[finite_fr],
+                power_dbm[finite_fr],
+                s=16,
+                c="r",
+                marker="x",
+                linewidths=1.0,
+                label=r"fit $f_r$",
+            )
+            ax1.set_xlim(x_min - dx / 2, x_max + dx / 2)
+            ax1.set_ylim(y_min - dy / 2, y_max + dy / 2)
+            ax1.legend(loc="upper right", fontsize="small")
         ax1.set_xlabel("Frequency [GHz]")
-        ax1.set_ylabel("Drive power [dBm]")
+        ax1.set_ylabel(power_label)
         cb = fig1.colorbar(im)
         if portrait:
             cb.set_label("Response amplitude [dB]")
         else:
             ax1.set_title("Response amplitude [dB]")
-        fig1.show()
-        # return fig1
 
         if portrait:
             ax2 = fig1.add_subplot(4, 1, 3)
@@ -315,146 +408,29 @@ class SweepPower(Base):
             ax3.yaxis.set_label_position("right")
             ax3.yaxis.tick_right()
 
-        (line_a,) = ax2.plot(
-            1e-9 * self.freq_arr, resp_dB[self._AMP_IDX], ".", label="measured", animated=blit
-        )
-        (line_p,) = ax3.plot(
-            1e-9 * self.freq_arr, np.angle(self.resp_arr[self._AMP_IDX]), ".", animated=blit
-        )
-        if _do_fit:
-            (line_fit_a,) = ax2.plot(
-                1e-9 * self.freq_arr,
-                np.full_like(self.freq_arr, np.nan),
-                ls="--",
-                label="fit",
-                animated=blit,
+        # Fitted resonant frequency vs. drive power (in GHz); failed fits (NaN)
+        # are dropped so the line only connects successfully-fit points.
+        if np.any(finite_fr):
+            ax2.errorbar(
+                power_dbm[finite_fr],
+                1e-9 * fr[finite_fr],
+                yerr=1e-9 * fr_err_safe[finite_fr],
+                fmt=".-",
+                capsize=3,
             )
-            (line_fit_p,) = ax3.plot(
-                1e-9 * self.freq_arr, np.full_like(self.freq_arr, np.nan), ls="--", animated=blit
-            )
-
-        f_min = 1e-9 * self.freq_arr.min()
-        f_max = 1e-9 * self.freq_arr.max()
-        f_rng = f_max - f_min
-        a_min = resp_dB.min()
-        a_max = resp_dB.max()
-        a_rng = a_max - a_min
-        p_min = -np.pi
-        p_max = np.pi
-        p_rng = p_max - p_min
-        ax2.set_xlim(f_min - 0.05 * f_rng, f_max + 0.05 * f_rng)
-        ax2.set_ylim(a_min - 0.05 * a_rng, a_max + 0.05 * a_rng)
-        ax3.set_xlim(f_min - 0.05 * f_rng, f_max + 0.05 * f_rng)
-        ax3.set_ylim(p_min - 0.05 * p_rng, p_max + 0.05 * p_rng)
-
-        ax3.set_xlabel("Frequency [GHz]")
-        ax2.set_ylabel("Response amplitude [dB]")
-        ax3.set_ylabel("Response phase [rad]")
+        ax2.set_ylabel(r"Fit $f_r$ [GHz]")
         ax2.xaxis.set_tick_params(labelbottom=False)
 
-        ax2.legend(loc="lower right")
-
-        def onbuttonpress(event):
-            if event.inaxes == ax1:
-                self._AMP_IDX = np.argmin(np.abs(power_dbm - event.ydata))
-                update()
-
-        def onkeypress(event):
-            if event.inaxes == ax1:
-                if event.key == "up":
-                    self._AMP_IDX += 1
-                    if self._AMP_IDX >= len(power_dbm):
-                        self._AMP_IDX = len(power_dbm) - 1
-                    update()
-                elif event.key == "down":
-                    self._AMP_IDX -= 1
-                    if self._AMP_IDX < 0:
-                        self._AMP_IDX = 0
-                    update()
-
-        def update():
-            assert self.resp_arr is not None
-            line_sel.set_ydata([power_dbm[self._AMP_IDX], power_dbm[self._AMP_IDX]])
-            # ax1.set_title(f"amp = {amp_arr[AMP_IDX]:.2e}")
-            print(f"drive amp {self._AMP_IDX:d}: Power = {power_dbm[self._AMP_IDX]:.1f} dBm")
-            line_a.set_ydata(resp_dB[self._AMP_IDX])
-            line_p.set_ydata(np.angle(self.resp_arr[self._AMP_IDX]))
-            if _do_fit:
-                line_fit_a.set_ydata(
-                    np.full_like(self.freq_arr, np.nan)
-                )  # pyright: ignore [reportPossiblyUnboundVariable]
-                line_fit_p.set_ydata(
-                    np.full_like(self.freq_arr, np.nan)
-                )  # pyright: ignore [reportPossiblyUnboundVariable]
-            # ax2.set_title("")
-            if blit:
-                fig1.canvas.restore_region(self._bg)  # type: ignore
-                ax1.draw_artist(line_sel)
-                ax2.draw_artist(line_a)
-                ax3.draw_artist(line_p)
-                fig1.canvas.blit(fig1.bbox)
-                fig1.canvas.flush_events()
-            else:
-                fig1.canvas.draw()
-
-        if _do_fit:
-
-            def onselect(xmin, xmax):
-                assert self.resp_arr is not None
-                port = circuit.notch_port(
-                    self.freq_arr, self.resp_arr[self._AMP_IDX]
-                )  # pyright: ignore [reportPossiblyUnboundVariable]
-                port.autofit(fcrop=(xmin * 1e9, xmax * 1e9))
-                if norm:
-                    line_fit_a.set_data(  # pyright: ignore [reportPossiblyUnboundVariable]
-                        1e-9 * port.f_data,  # type: ignore
-                        20 * np.log10(np.abs(port.z_data_sim / self.amp_arr[self._AMP_IDX])),
-                    )
-                else:
-                    line_fit_a.set_data(
-                        1e-9 * port.f_data, 20 * np.log10(np.abs(port.z_data_sim))
-                    )  # pyright: ignore
-                line_fit_p.set_data(
-                    1e-9 * port.f_data, np.angle(port.z_data_sim)
-                )  # pyright: ignore
-                # print(port.fitresults)
-                print("----------------")
-                print(f"fr = {port.fitresults['fr']}")
-                print(f"Qi = {port.fitresults['Qi_dia_corr']}")
-                print(f"Qc = {port.fitresults['Qc_dia_corr']}")
-                print(f"Ql = {port.fitresults['Ql']}")
-                print(f"kappa = {port.fitresults['fr'] / port.fitresults['Qc_dia_corr']}")
-                print("----------------")
-                # ax2.set_title(
-                #     f"fr = {1e-6*fr:.0f} MHz, Ql = {Ql:.0f}, Qi = {Qi:.0f}, Qc = {Qc:.0f}, kappa = {1e-3*kappa:.0f} kHz")
-                if blit:
-                    fig1.canvas.restore_region(self._bg)  # type: ignore
-                    ax1.draw_artist(line_sel)
-                    ax2.draw_artist(line_a)
-                    ax2.draw_artist(line_fit_a)  # pyright: ignore [reportPossiblyUnboundVariable]
-                    ax3.draw_artist(line_p)
-                    ax3.draw_artist(line_fit_p)  # pyright: ignore [reportPossiblyUnboundVariable]
-                    fig1.canvas.blit(fig1.bbox)
-                    fig1.canvas.flush_events()
-                else:
-                    fig1.canvas.draw()
-
-            rectprops = dict(facecolor="tab:gray", alpha=0.5)
-            fig1._span_a = mwidgets.SpanSelector(  # type: ignore
-                ax2, onselect, "horizontal", props=rectprops, useblit=blit
+        # Fitted internal quality factor (diag. corrected) vs. drive power
+        if np.any(finite_qi):
+            ax3.errorbar(
+                power_dbm[finite_qi],
+                qi[finite_qi],
+                yerr=qi_err_safe[finite_qi],
+                fmt=".-",
+                capsize=3,
             )
-            fig1._span_p = mwidgets.SpanSelector(  # type: ignore
-                ax3, onselect, "horizontal", props=rectprops, useblit=blit
-            )
+        ax3.set_ylabel(r"Fit $Q_i$ (diag. corr.)")
+        ax3.set_xlabel(power_label)
 
-        fig1.canvas.mpl_connect("button_press_event", onbuttonpress)
-        fig1.canvas.mpl_connect("key_press_event", onkeypress)
         fig1.show()
-        if blit:
-            fig1.canvas.draw()
-            fig1.canvas.flush_events()
-            self._bg = fig1.canvas.copy_from_bbox(fig1.bbox)  # type: ignore
-            ax1.draw_artist(line_sel)
-            ax2.draw_artist(line_a)
-            ax3.draw_artist(line_p)
-            fig1.canvas.blit(fig1.bbox)
