@@ -173,7 +173,7 @@ f, psd_i, psd_q, streams = averaged_psd_timestream(
 
 ### Discarding leading junk
 
-The first fraction of a millisecond of an acquisition is often startup junk. Pass `discard_start_s` (seconds) to drop it before analysis — e.g. `2e-4` for the first 0.2 ms:
+The first tens of milliseconds of an acquisition are often startup junk. `TimeStream` owns the trimming via its `discard_start_ms` field (default `25.0`); `averaged_psd_timestream` simply forwards it. Override it to change the amount, or set `0` to keep everything:
 
 ```python
 f, psd_diss, psd_freq, streams = averaged_psd_timestream(
@@ -186,11 +186,11 @@ f, psd_diss, psd_freq, streams = averaged_psd_timestream(
     output_port=1,
     input_port=1,
     sweeps=sweeps,
-    discard_start_s=2e-4,   # drop the first 0.2 ms of every acquisition
+    discard_start_ms=25.0,   # drop the first 25 ms of every acquisition (default)
 )
 ```
 
-The number of samples dropped is `round(discard_start_s * fs)` using the actual hardware sample rate. The cut is applied to both the PSD input and the time-axis arrays of the returned `TimeStream` objects (`signal`, `usb`, `lsb`, `pixel_i`, `pixel_q`), so the in-memory objects match the analysed window. The HDF5 file saved by each `run()` still holds the full, untrimmed acquisition.
+The number of samples dropped is `round(discard_start_ms * 1e-3 * fs)` using the actual hardware sample rate. `TimeStream` applies the cut to its in-memory time-axis arrays (`signal`, `usb`, `lsb`, `pixel_i`, `pixel_q`) after `run()` (and again after `load()`), so both the PSD input and the returned `TimeStream` objects reflect the analysed window. The HDF5 file saved by each `run()` still holds the full, untrimmed acquisition.
 
 Welch's method and its parameters (`welch`, `nperseg`, `noverlap`, `window`, `detrend`) are forwarded to `compute_psd`, and `is_usb` is forwarded to `TimeStream` for per-tone sideband selection.
 
