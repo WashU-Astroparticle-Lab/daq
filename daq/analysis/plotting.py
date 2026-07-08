@@ -194,6 +194,8 @@ def plot_iq_comparison(
     max_points: int = 50_000,
     grid_size: int = 50,
     hexbin_gridsize: int = 30,
+    scatter_size: float = 0.05,
+    scatter_alpha: float = 0.005,
     xlim: Optional[Tuple[float, float]] = None,
     ylim: Optional[Tuple[float, float]] = None,
     ax: Optional["matplotlib.axes.Axes"] = None,
@@ -219,8 +221,9 @@ def plot_iq_comparison(
 
     :param ts: Complex time-stream data in the electronic (raw I/Q) basis. Any
         shape; it is flattened for the density plot.
-    :param sw: A fitted :class:`~daq.measurements.sweep.Sweep` providing
-        ``freq_arr`` and ``resp_arr``.
+    :param sw: A :class:`~daq.measurements.sweep.Sweep` that has been run,
+        providing populated ``freq_arr`` and ``resp_arr``. The resonator fit is
+        performed internally, so ``sw`` need not be fitted beforehand.
     :param qc: Optional complex "QC trace" calibration points (electronic
         basis) drawn as red circles. Skipped when ``None``.
     :param basis: Display basis passed to :func:`_to_basis`. One of
@@ -233,13 +236,22 @@ def plot_iq_comparison(
         ``"contour"`` (scatter plus fast histogram-based 1-sigma / 2-sigma
         contours), ``"hexbin"``, or ``"hist2d"``. Defaults to ``"scatter"``.
     :param fcrop: Optional ``(f_min, f_max)`` crop passed to the resonator
-        autofit. When ``None``, the fit is cropped to the half-span centred on
-        the amplitude minimum, matching :meth:`Sweep.fit`.
+        autofit. When ``None``, the fit is cropped to the half-span (a quarter
+        of the data span on each side) centred on the amplitude minimum,
+        mirroring :meth:`Sweep.fit`. Note the span is taken from the data
+        (``freq_arr``) and may differ from ``sw.freq_span`` by up to one step.
     :param max_points: Cap on the number of time-stream points used for KDE and
         scatter rendering; larger clouds are subsampled. Defaults to ``50_000``.
     :param grid_size: Grid resolution per axis for the ``"kde"`` contour grid
         and the ``"contour"`` histogram bins. Defaults to ``50``.
     :param hexbin_gridsize: Hexbin grid resolution. Defaults to ``30``.
+    :param scatter_size: Marker size for the ``"scatter"``/``"kde"``/``"contour"``
+        cloud. The default ``0.05`` is tuned for million-point clouds; raise it
+        (e.g. to ``1``-``5``) for smaller time streams so the points are
+        visible.
+    :param scatter_alpha: Marker alpha for the scatter cloud. The default
+        ``0.005`` is tuned for million-point clouds; raise it (e.g. to
+        ``0.1``-``0.5``) for smaller time streams.
     :param xlim: Optional x-axis limits ``(lo, hi)``.
     :param ylim: Optional y-axis limits ``(lo, hi)``.
     :param ax: Optional existing axis to draw on. A new figure is created when
@@ -252,8 +264,8 @@ def plot_iq_comparison(
     :param show: When ``True``, call :func:`matplotlib.pyplot.show`. Defaults to
         ``False``.
     :returns: The matplotlib axis the data was drawn on.
-    :raises ValueError: If *basis* or *density* is not recognised, or *sw* is
-        not fitted.
+    :raises ValueError: If *basis* or *density* is not recognised, or *sw* has
+        no ``freq_arr``/``resp_arr`` (i.e. has not been run).
     """
     import matplotlib.pyplot as plt
     from resonator_tools import circuit
@@ -305,14 +317,16 @@ def plot_iq_comparison(
             ts_real[::step],
             ts_imag[::step],
             color="tab:blue",
-            s=0.05,
-            alpha=0.005,
+            s=scatter_size,
+            alpha=scatter_alpha,
             label="time stream",
         )
         if density == "kde":
             _add_kde_contours(ax, ts_real, ts_imag, "tab:blue", max_points, grid_size)
         elif density == "contour":
             _add_hist_contours(ax, ts_real, ts_imag, "tab:blue", grid_size)
+    elif ts_real.size == 0:
+        pass  # nothing to bin
     elif density == "hexbin":
         if ts_real.size > max_points:
             step = ts_real.size // max_points
@@ -322,7 +336,7 @@ def plot_iq_comparison(
         if ts_real.size > max_points:
             step = ts_real.size // max_points
             ts_real, ts_imag = ts_real[::step], ts_imag[::step]
-        ax.hist2d(ts_real, ts_imag, bins=50, alpha=0.6, cmap="Blues")
+        ax.hist2d(ts_real, ts_imag, bins=grid_size, alpha=0.6, cmap="Blues")
 
     # --- Marker points ---
     ax.scatter(
@@ -378,7 +392,7 @@ def plot_iq_comparison(
             parts.append(str(device))
         parts.append(f"{basis} basis")
         if power_dbm is not None:
-            parts.append(f"{power_dbm} dBm at device")
+            parts.append(f"{power_dbm:g} dBm at device")
         title = "\n".join(parts)
     ax.set_title(title)
 

@@ -288,6 +288,13 @@ ax = plot_iq_comparison(
 
 Pass an existing `ax` to compose subplots, `xlim`/`ylim` to zoom, or `title` to override the auto-generated label. The function returns the matplotlib axis.
 
+The scatter defaults (`scatter_size=0.05`, `scatter_alpha=0.005`) are tuned for million-point clouds and render nearly invisibly on small time streams. For a modest cloud, raise them:
+
+```python
+# A few thousand points: make the scatter visible
+ax = plot_iq_comparison(ts.signal[:, 0], sw, scatter_size=2, scatter_alpha=0.2)
+```
+
 ---
 
 ## Correlated Noise Removal
