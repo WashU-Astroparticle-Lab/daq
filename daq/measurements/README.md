@@ -83,6 +83,9 @@ results.
   upper sideband (`LO + IF`), `False` on the lower sideband (`LO - IF`). A single
   bool applies to every tone. The single-sideband output phases are derived
   automatically, so you never set them by hand.
+- `discard_start_ms`: Milliseconds of startup junk dropped from the in-memory
+  time-axis arrays after `run()`/`load()` (default `25.0`; set `0` to keep
+  everything). The saved HDF5 keeps the full, untrimmed acquisition.
 - `device`: Device name (required for DB)
 - `filter`: Filter name (optional)
 - `notes`: Measurement notes (optional)

@@ -36,6 +36,7 @@ class TimeStream(Base):
         filter: Optional[str] = None,
         notes: Optional[str] = None,
         external_trigger: bool = False,
+        discard_start_ms: float = 25.0,
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
@@ -74,6 +75,11 @@ class TimeStream(Base):
         self.filter = filter
         self.notes = notes
         self.external_trigger = external_trigger
+        # The first tens of milliseconds of an acquisition are typically startup
+        # junk. discard_start_ms leading milliseconds are dropped from the
+        # in-memory time-axis arrays after run()/load() (the saved HDF5 keeps the
+        # full acquisition). Set to 0 to keep everything.
+        self.discard_start_ms = float(discard_start_ms)
 
         # Data arrays - set by run method
         self.freq_arr = None
@@ -91,6 +97,7 @@ class TimeStream(Base):
 
         self.check_amp()
         self.check_sideband()
+        self.check_discard()
 
     def check_amp(self) -> None:
         assert self.amp.shape == self.if_freqs.shape, (
@@ -104,6 +111,43 @@ class TimeStream(Base):
             "is_usb must have the same length as if_freqs "
             f"({self.is_usb.shape} != {self.if_freqs.shape})"
         )
+
+    def check_discard(self) -> None:
+        if self.discard_start_ms < 0:
+            raise ValueError(f"discard_start_ms must be non-negative, got {self.discard_start_ms}")
+        # Rough guard against discarding ~everything, using the requested df (the
+        # tuned rate is nearly identical), so we fail before running the hardware.
+        if int(round(self.discard_start_ms * 1e-3 * self.df)) >= self.pixel_counts - 1:
+            raise ValueError(
+                f"discard_start_ms={self.discard_start_ms} ms discards ~all of the "
+                f"{self.pixel_counts} samples at df={self.df} Hz; leaves fewer than 2 samples"
+            )
+
+    def _apply_discard_start(self) -> None:
+        """Drop the leading ``discard_start_ms`` of startup junk in place.
+
+        Trims the in-memory time-axis arrays (``signal``, ``usb``, ``lsb``,
+        ``pixel_i``, ``pixel_q``) by ``round(discard_start_ms * 1e-3 * df)``
+        samples using the tuned hardware sample rate :attr:`df`. Frequency-axis
+        arrays (``freq_arr``, ``signal_freqs``) are left untouched. Only the
+        in-memory arrays are trimmed -- the HDF5 file written by :meth:`run`
+        keeps the full, untrimmed acquisition.
+        """
+        if self.discard_start_ms <= 0 or self.signal is None:
+            return
+        n_discard = int(round(self.discard_start_ms * 1e-3 * self.df))
+        if n_discard <= 0:
+            return
+        n_samples = self.signal.shape[0]
+        if n_discard >= n_samples - 1:
+            raise ValueError(
+                f"discard_start_ms={self.discard_start_ms} ms drops {n_discard} of "
+                f"{n_samples} samples at df={self.df} Hz; leaves fewer than 2 samples"
+            )
+        for attr in ("signal", "usb", "lsb", "pixel_i", "pixel_q"):
+            arr = getattr(self, attr, None)
+            if arr is not None:
+                setattr(self, attr, arr[n_discard:])
 
     def run(
         self,
@@ -173,7 +217,11 @@ class TimeStream(Base):
             og.set_amplitudes(0.0)
             lck.apply_settings()
 
-        return self.save(save_filename=save_filename)
+        # Save the full acquisition first, then drop the leading junk from the
+        # in-memory arrays so the returned object matches the analysed window.
+        save_path = self.save(save_filename=save_filename)
+        self._apply_discard_start()
+        return save_path
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)
@@ -187,6 +235,11 @@ class TimeStream(Base):
             output_port = int(h5f.attrs["output_port"])  # type: ignore
             input_port = int(h5f.attrs["input_port"])  # type: ignore
             dither = bool(h5f.attrs["dither"])  # type: ignore
+            # discard_start_ms is absent in files saved before this field existed;
+            # default to the standard trim so old and new files behave the same.
+            discard_start_ms = (
+                float(h5f.attrs["discard_start_ms"]) if "discard_start_ms" in h5f.attrs else 25.0
+            )
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
@@ -233,6 +286,7 @@ class TimeStream(Base):
             input_port=input_port,
             is_usb=is_usb,
             dither=dither,
+            discard_start_ms=discard_start_ms,
         )
 
         # Restore data arrays
@@ -252,6 +306,10 @@ class TimeStream(Base):
             self.signal = np.where(self.is_usb[np.newaxis, :], self.usb, self.lsb)
         if self.signal_freqs is None and freqs_usb is not None and freqs_lsb is not None:
             self.signal_freqs = np.where(self.is_usb, freqs_usb, freqs_lsb)
+
+        # Files written by run() hold the full acquisition, so re-apply the trim
+        # to match the in-memory state produced by a live run.
+        self._apply_discard_start()
 
         return self
 
