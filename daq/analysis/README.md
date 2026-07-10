@@ -108,7 +108,7 @@ f, psd = compute_psd(data_2d, fs)
 PSD(f) = F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw
 ```
 
-The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it.
+The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it. The fit is run with [`iminuit`](https://iminuit.readthedocs.io/) (`LeastSquares` cost, `MIGRAD` + `HESSE`), so parameter errors come straight from Minuit's Hesse step.
 
 The function takes the `(f, psd)` output of `compute_psd` directly:
 
@@ -121,13 +121,14 @@ from daq.analysis import compute_psd, fit_parity_psd, parity_psd_model
 fs = ts.df  # Hz -- this is also f_bw
 f, psd = compute_psd(parity, fs)
 
-res = fit_parity_psd(f, psd, f_bw=fs)
-print(f"fidelity F = {res['fidelity']:.3f} +/- {res['fidelity_err']:.3f}")
-print(f"Gamma_p    = {res['gamma_p']:.2f} +/- {res['gamma_p_err']:.2f} Hz")
-print(f"f_corner   = {res['f_corner']:.2f} Hz")   # Lorentzian half-power = Gamma_p / pi
+fit_results = fit_parity_psd(f, psd, f_bw=fs)
+print(f"fidelity F = {fit_results['fidelity']:.3f} +/- {fit_results['fidelity_err']:.3f}")
+print(f"Gamma_p    = {fit_results['gamma_p']:.2f} +/- {fit_results['gamma_p_err']:.2f} Hz")
+print(f"f_corner   = {fit_results['f_corner']:.2f} Hz")   # Lorentzian half-power = Gamma_p / pi
+print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
 ```
 
-`res` is a dict with `fidelity`, `gamma_p` (Hz), their `*_err`, the Lorentzian half-power frequency `f_corner` (= `Gamma_p / pi`), the fixed `f_bw`, the raw `popt`/`pcov`, a `model` array (the fitted curve evaluated at every input `f`), and a `success` flag.
+`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`), a `model` array (the fitted curve evaluated at every input `f`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
 
 ### Plotting the fit
 
@@ -146,9 +147,10 @@ plt.show()
 
 ### Weighting, DC bin, and initial guess
 
-- By default a PSD-proportional weighting (`relative_weight=True`) is used so the multi-decade dynamic range does not let the low-frequency plateau dominate the fit. Pass explicit `sigma` (e.g. `1/sqrt(num_averages)` scaled errors) to override, or set `relative_weight=False` for uniform weighting.
+- By default a PSD-proportional weighting (`relative_weight=True`) sets the Minuit `LeastSquares` `yerror` to the PSD value, so the multi-decade dynamic range does not let the low-frequency plateau dominate the fit. Pass explicit `sigma` (true per-point uncertainties, e.g. `psd / sqrt(num_averages)`) to override, or set `relative_weight=False` for uniform weighting.
+- Because that weighting is only relative, the reported errors are rescaled by `sqrt(chi2/ndof)` so they reflect the observed scatter (matching `scipy`'s `absolute_sigma=False`). If you pass a true `sigma` and want the raw Hesse errors instead, set `absolute_sigma=True`.
 - The `f == 0` DC bin is dropped by default (`drop_dc=True`), since it is meaningless after mean removal.
-- Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` to override. Extra keyword arguments (e.g. `maxfev`) are forwarded to `scipy.optimize.curve_fit`.
+- Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` (in the order of the enabled free terms) to override.
 
 ### Low-frequency 1/f noise
 
@@ -187,7 +189,7 @@ for ch, r in enumerate(results):
     print(ch, r["fidelity"], r["gamma_p"])
 ```
 
-`parity_psd_model(f, fidelity, gamma_p, f_bw)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation).
+`parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=0.0, alpha=1.0)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation); with `a_onef=0` it is pure Eqn. 18.
 
 ---
 
