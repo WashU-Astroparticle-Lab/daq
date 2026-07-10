@@ -5,6 +5,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 ## Contents
 
 - [Noise PSD](#noise-psd)
+- [Parity PSD fit (random-telegraph model)](#parity-psd-fit-random-telegraph-model)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [I/Q Comparison Plot](#iq-comparison-plot)
@@ -96,6 +97,71 @@ data_2d = np.vstack([i_data, q_data])  # shape: (2, N)
 f, psd = compute_psd(data_2d, fs)
 # psd.shape == (2, len(f))
 ```
+
+---
+
+## Parity PSD fit (random-telegraph model)
+
+`fit_parity_psd` fits the PSD of a parity (random-telegraph) time-stream to Eqn. 18 of [arXiv:2601.16261](https://arxiv.org/pdf/2601.16261):
+
+```
+PSD(f) = F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw
+```
+
+The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it.
+
+The function takes the `(f, psd)` output of `compute_psd` directly:
+
+```python
+import numpy as np
+from daq.analysis import compute_psd, fit_parity_psd, parity_psd_model
+
+# `parity` is the projected parity time-stream (e.g. IQ data projected onto the
+# maximal-separation axis), sampled at fs.
+fs = ts.df  # Hz -- this is also f_bw
+f, psd = compute_psd(parity, fs)
+
+res = fit_parity_psd(f, psd, f_bw=fs)
+print(f"fidelity F = {res['fidelity']:.3f} +/- {res['fidelity_err']:.3f}")
+print(f"Gamma_p    = {res['gamma_p']:.2f} +/- {res['gamma_p_err']:.2f} Hz")
+print(f"f_corner   = {res['f_corner']:.2f} Hz")   # Lorentzian half-power = Gamma_p / pi
+```
+
+`res` is a dict with `fidelity`, `gamma_p` (Hz), their `*_err`, the Lorentzian half-power frequency `f_corner` (= `Gamma_p / pi`), the fixed `f_bw`, the raw `popt`/`pcov`, a `model` array (the fitted curve evaluated at every input `f`), and a `success` flag.
+
+### Plotting the fit
+
+```python
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.loglog(f[1:], psd[1:], ".", ms=2, label="Data")
+plt.loglog(f[1:], res["model"][1:], "-", label="Eqn. 18 fit")
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("PSD [a.u.$^2$/Hz]")
+plt.legend()
+plt.grid(True, which="both", alpha=0.3)
+plt.show()
+```
+
+### Weighting, DC bin, and initial guess
+
+- By default a PSD-proportional weighting (`relative_weight=True`) is used so the multi-decade dynamic range does not let the low-frequency plateau dominate the fit. Pass explicit `sigma` (e.g. `1/sqrt(num_averages)` scaled errors) to override, or set `relative_weight=False` for uniform weighting.
+- The `f == 0` DC bin is dropped by default (`drop_dc=True`), since it is meaningless after mean removal.
+- Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` to override. Extra keyword arguments (e.g. `maxfev`) are forwarded to `scipy.optimize.curve_fit`.
+
+### Batch fitting (2-D PSD)
+
+If you pass a 2-D `psd` of shape `(n_rows, n_freqs)` — for example the per-tone PSDs from `averaged_psd_timestream` — each row is fit independently and a **list** of result dicts is returned:
+
+```python
+f, psd_a, psd_b, streams = averaged_psd_timestream(...)
+results = fit_parity_psd(f, psd_a, f_bw=streams[0].df)
+for ch, r in enumerate(results):
+    print(ch, r["fidelity"], r["gamma_p"])
+```
+
+`parity_psd_model(f, fidelity, gamma_p, f_bw)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation).
 
 ---
 

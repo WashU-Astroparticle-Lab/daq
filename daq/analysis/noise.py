@@ -103,6 +103,201 @@ def compute_psd(
     return f, psd
 
 
+def parity_psd_model(
+    f: npt.ArrayLike,
+    fidelity: float,
+    gamma_p: float,
+    f_bw: float,
+) -> npt.NDArray[np.floating]:
+    r"""Random-telegraph parity PSD model (Eqn. 18 of arXiv:2601.16261).
+
+    A parity time-stream that switches between two states at a characteristic rate
+    :math:`\Gamma_p`, read out with fidelity :math:`F`, has a one-sided power
+    spectral density
+
+    .. math::
+
+        \mathrm{PSD}(f) = F^2\,\frac{4\Gamma_p}{(2\Gamma_p)^2 + (2\pi f)^2}
+                          + (1 - F^2)\,f_\mathrm{bw}^{-1}.
+
+    The first term is the Lorentzian of the random-telegraph (parity-switching)
+    process; the second is a white noise floor set by the finite readout fidelity
+    and the sampling bandwidth. At :math:`f = 0` the Lorentzian reduces to the
+    finite value :math:`F^2 / \Gamma_p`.
+
+    :param f: Fourier frequency or frequencies in Hz (as returned by
+        :func:`compute_psd`).
+    :param fidelity: Readout fidelity :math:`F` (dimensionless, ``0`` to ``1``).
+    :param gamma_p: Characteristic parity-switching rate :math:`\Gamma_p` in Hz.
+    :param f_bw: Sampling bandwidth :math:`f_\mathrm{bw}` in Hz (typically the
+        acquisition sample rate, e.g. ``TimeStream.df``).
+    :returns: The model PSD evaluated at *f*, same shape as *f*, in
+        (units of the time series)²/Hz.
+    """
+    f = np.asarray(f, dtype=np.float64)
+    lorentzian = fidelity**2 * (4.0 * gamma_p) / ((2.0 * gamma_p) ** 2 + (2.0 * np.pi * f) ** 2)
+    floor = (1.0 - fidelity**2) / f_bw
+    return lorentzian + floor
+
+
+def fit_parity_psd(
+    f: npt.ArrayLike,
+    psd: npt.ArrayLike,
+    f_bw: float,
+    p0: Optional[Sequence[float]] = None,
+    sigma: Optional[npt.ArrayLike] = None,
+    relative_weight: bool = True,
+    drop_dc: bool = True,
+    **curve_fit_kwargs,
+) -> dict:
+    r"""Fit a parity-timestream PSD to Eqn. 18 of arXiv:2601.16261.
+
+    Fits the output of :func:`compute_psd` to :func:`parity_psd_model` to extract
+    the readout fidelity :math:`F` and the characteristic parity-switching rate
+    :math:`\Gamma_p`. The sampling bandwidth :math:`f_\mathrm{bw}` is held fixed at
+    *f_bw* (pass the acquisition sample rate, e.g. ``TimeStream.df``); only *F* and
+    :math:`\Gamma_p` are free parameters.
+
+    For 2-D *psd* (shape ``(n_rows, n_freqs)``, as produced by
+    :func:`compute_psd`, :func:`averaged_psd_timestream`, etc.), each row is fit
+    independently and a list of result dicts is returned.
+
+    :param f: Frequency axis in Hz (1-D), as returned by :func:`compute_psd`.
+    :param psd: Power spectral density to fit. Either 1-D (``len(f)``) or 2-D
+        (``(n_rows, len(f))``) with one PSD per row.
+    :param f_bw: Sampling bandwidth in Hz, held fixed during the fit.
+    :param p0: Optional initial guess ``(fidelity, gamma_p)``. When ``None`` the
+        guess is estimated from the PSD (fidelity from the high-frequency floor,
+        :math:`\Gamma_p` from the low-frequency plateau).
+    :param sigma: Optional per-point uncertainties passed to
+        :func:`scipy.optimize.curve_fit`. Overrides *relative_weight* when given.
+    :param relative_weight: When ``True`` (default) and *sigma* is not given, weight
+        each point by its PSD value (``sigma = psd``). Because a PSD spans many
+        decades, this fits the fractional residuals and stops the low-frequency
+        plateau from dominating. Set ``False`` for uniform (absolute) weighting.
+    :param drop_dc: When ``True`` (default), exclude the ``f == 0`` (DC) bin from the
+        fit; it is typically meaningless after mean removal / detrending.
+    :param curve_fit_kwargs: Extra keyword arguments forwarded to
+        :func:`scipy.optimize.curve_fit` (e.g. ``maxfev``).
+    :returns: For 1-D *psd*, a dict with keys ``fidelity``, ``fidelity_err``,
+        ``gamma_p`` (Hz), ``gamma_p_err`` (Hz), ``f_corner`` (Hz, the Lorentzian
+        half-power frequency :math:`\Gamma_p/\pi`), ``f_corner_err``, ``f_bw``,
+        ``popt``, ``pcov``, ``model`` (the fitted PSD evaluated at every input *f*,
+        including any dropped DC bin), and ``success``. For 2-D *psd*, a list of such
+        dicts, one per row.
+    :raises ValueError: If *f* is not 1-D, *psd* is not 1-D or 2-D, or their
+        frequency lengths do not match.
+    """
+    from scipy.optimize import curve_fit
+
+    f = np.asarray(f, dtype=np.float64)
+    psd = np.asarray(psd, dtype=np.float64)
+    if f.ndim != 1:
+        raise ValueError(f"f must be 1-D, got {f.ndim}-D")
+    if psd.ndim not in (1, 2):
+        raise ValueError(f"psd must be 1-D or 2-D, got {psd.ndim}-D")
+    if psd.shape[-1] != f.shape[0]:
+        raise ValueError(f"psd last axis ({psd.shape[-1]}) must match len(f) ({f.shape[0]})")
+
+    if psd.ndim == 2:
+        return [
+            fit_parity_psd(
+                f,
+                row,
+                f_bw,
+                p0=p0,
+                sigma=sigma,
+                relative_weight=relative_weight,
+                drop_dc=drop_dc,
+                **curve_fit_kwargs,
+            )
+            for row in psd
+        ]
+
+    # --- Select the frequencies used for fitting ---
+    mask = f > 0 if drop_dc else np.ones_like(f, dtype=bool)
+    f_fit = f[mask]
+    psd_fit = psd[mask]
+    if f_fit.size < 3:
+        raise ValueError("need at least 3 positive-frequency points to fit two parameters")
+
+    # --- Initial guess ---
+    if p0 is None:
+        # White floor from the top decade of the spectrum; fidelity from it.
+        hi = f_fit >= 0.1 * f_fit.max()
+        floor0 = float(np.median(psd_fit[hi])) if np.any(hi) else float(np.median(psd_fit))
+        floor0 = max(floor0, 0.0)
+        fidelity0 = float(np.sqrt(np.clip(1.0 - floor0 * f_bw, 1e-6, 1.0)))
+        # Low-frequency plateau -> Lorentzian DC value F^2 / gamma_p.
+        lo = f_fit <= max(f_fit.min() * 3.0, f_fit[min(4, f_fit.size - 1)])
+        plateau0 = float(np.median(psd_fit[lo])) if np.any(lo) else float(psd_fit[0])
+        lorentz_dc0 = max(plateau0 - floor0, np.finfo(float).tiny)
+        gamma_p0 = float(fidelity0**2 / lorentz_dc0)
+        p0 = (fidelity0, max(gamma_p0, 1e-3))
+
+    if sigma is None and relative_weight:
+        # Weight by PSD value so the multi-decade dynamic range does not let the
+        # low-frequency plateau dominate the residuals. Guard against zeros.
+        s = np.asarray(psd_fit, dtype=np.float64).copy()
+        positive = s[s > 0]
+        floor_val = positive.min() if positive.size else 1.0
+        s[s <= 0] = floor_val
+        sigma_fit = s
+    elif sigma is not None:
+        sigma_fit = np.asarray(sigma, dtype=np.float64)[mask]
+    else:
+        sigma_fit = None
+
+    def _model(ff, fidelity, gamma_p):
+        return parity_psd_model(ff, fidelity, gamma_p, f_bw)
+
+    result = {
+        "fidelity": np.nan,
+        "fidelity_err": np.nan,
+        "gamma_p": np.nan,
+        "gamma_p_err": np.nan,
+        "f_corner": np.nan,
+        "f_corner_err": np.nan,
+        "f_bw": float(f_bw),
+        "popt": None,
+        "pcov": None,
+        "model": None,
+        "success": False,
+    }
+
+    try:
+        popt, pcov = curve_fit(
+            _model,
+            f_fit,
+            psd_fit,
+            p0=p0,
+            sigma=sigma_fit,
+            absolute_sigma=False,
+            bounds=([0.0, 0.0], [1.0, np.inf]),
+            **curve_fit_kwargs,
+        )
+    except (RuntimeError, ValueError):
+        return result
+
+    perr = np.sqrt(np.diag(pcov))
+    fidelity, gamma_p = float(popt[0]), float(popt[1])
+    fidelity_err, gamma_p_err = float(perr[0]), float(perr[1])
+
+    result.update(
+        fidelity=fidelity,
+        fidelity_err=fidelity_err,
+        gamma_p=gamma_p,
+        gamma_p_err=gamma_p_err,
+        f_corner=gamma_p / np.pi,
+        f_corner_err=gamma_p_err / np.pi,
+        popt=popt,
+        pcov=pcov,
+        model=parity_psd_model(f, fidelity, gamma_p, f_bw),
+        success=True,
+    )
+    return result
+
+
 def from_elec_to_reson(ts: npt.NDArray[np.complexfloating], sw: Sweep) -> tuple[
     npt.NDArray[np.complexfloating],
     npt.NDArray[np.floating],

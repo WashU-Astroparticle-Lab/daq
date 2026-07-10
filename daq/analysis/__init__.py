@@ -6,7 +6,9 @@ from .noise import (
     averaged_psd_timestream,
     clean_correlated_streams,
     compute_psd,
+    fit_parity_psd,
     from_elec_to_reson,
+    parity_psd_model,
     remove_correlated_noise,
 )
 from .mattis_bardeen import (
@@ -27,7 +29,9 @@ __all__ = [
     "averaged_psd_timestream",
     "clean_correlated_streams",
     "compute_psd",
+    "fit_parity_psd",
     "from_elec_to_reson",
+    "parity_psd_model",
     "remove_correlated_noise",
     "plot_iq_comparison",
     "signed_log10",
