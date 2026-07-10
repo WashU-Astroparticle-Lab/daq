@@ -108,6 +108,8 @@ def parity_psd_model(
     fidelity: float,
     gamma_p: float,
     f_bw: float,
+    a_onef: float = 0.0,
+    alpha: float = 1.0,
 ) -> npt.NDArray[np.floating]:
     r"""Random-telegraph parity PSD model (Eqn. 18 of arXiv:2601.16261).
 
@@ -118,12 +120,16 @@ def parity_psd_model(
     .. math::
 
         \mathrm{PSD}(f) = F^2\,\frac{4\Gamma_p}{(2\Gamma_p)^2 + (2\pi f)^2}
-                          + (1 - F^2)\,f_\mathrm{bw}^{-1}.
+                          + (1 - F^2)\,f_\mathrm{bw}^{-1}
+                          + \frac{A}{f^{\alpha}}.
 
     The first term is the Lorentzian of the random-telegraph (parity-switching)
     process; the second is a white noise floor set by the finite readout fidelity
-    and the sampling bandwidth. At :math:`f = 0` the Lorentzian reduces to the
-    finite value :math:`F^2 / \Gamma_p`.
+    and the sampling bandwidth. The optional third term is a ``1/f``-like
+    low-frequency excess (e.g. drift or two-level-system noise); it is disabled by
+    default (``a_onef = 0``), which recovers the two-term form of Eqn. 18. At
+    :math:`f = 0` the Lorentzian reduces to the finite value :math:`F^2 / \Gamma_p`
+    and the (divergent) ``1/f`` term is set to zero.
 
     :param f: Fourier frequency or frequencies in Hz (as returned by
         :func:`compute_psd`).
@@ -131,13 +137,21 @@ def parity_psd_model(
     :param gamma_p: Characteristic parity-switching rate :math:`\Gamma_p` in Hz.
     :param f_bw: Sampling bandwidth :math:`f_\mathrm{bw}` in Hz (typically the
         acquisition sample rate, e.g. ``TimeStream.df``).
+    :param a_onef: Amplitude :math:`A` of the ``1/f`` term, in
+        (units of the time series)²/Hz at ``f = 1 Hz``. ``0`` (default) disables it.
+    :param alpha: Exponent :math:`\alpha` of the ``1/f`` term (``1.0`` for pure
+        ``1/f``). Only relevant when *a_onef* is non-zero.
     :returns: The model PSD evaluated at *f*, same shape as *f*, in
         (units of the time series)²/Hz.
     """
     f = np.asarray(f, dtype=np.float64)
     lorentzian = fidelity**2 * (4.0 * gamma_p) / ((2.0 * gamma_p) ** 2 + (2.0 * np.pi * f) ** 2)
     floor = (1.0 - fidelity**2) / f_bw
-    return lorentzian + floor
+    # 1/f term, guarded so that f == 0 (and the a_onef == 0 case) stays finite.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        onef = a_onef * np.abs(f) ** (-alpha)
+    onef = np.where(np.isfinite(onef), onef, 0.0)
+    return lorentzian + floor + onef
 
 
 def fit_parity_psd(
@@ -148,6 +162,9 @@ def fit_parity_psd(
     sigma: Optional[npt.ArrayLike] = None,
     relative_weight: bool = True,
     drop_dc: bool = True,
+    fit_onef: bool = False,
+    fit_alpha: bool = False,
+    alpha: float = 1.0,
     **curve_fit_kwargs,
 ) -> dict:
     r"""Fit a parity-timestream PSD to Eqn. 18 of arXiv:2601.16261.
@@ -158,6 +175,12 @@ def fit_parity_psd(
     *f_bw* (pass the acquisition sample rate, e.g. ``TimeStream.df``); only *F* and
     :math:`\Gamma_p` are free parameters.
 
+    Set *fit_onef* to add a ``1/f``-like low-frequency term :math:`A / f^{\alpha}`
+    (e.g. drift or two-level-system noise that would otherwise bias :math:`\Gamma_p`
+    and :math:`F`). The amplitude :math:`A` then becomes a free parameter; the
+    exponent :math:`\alpha` is fixed at *alpha* unless *fit_alpha* is also ``True``,
+    in which case it is fit too.
+
     For 2-D *psd* (shape ``(n_rows, n_freqs)``, as produced by
     :func:`compute_psd`, :func:`averaged_psd_timestream`, etc.), each row is fit
     independently and a list of result dicts is returned.
@@ -166,9 +189,9 @@ def fit_parity_psd(
     :param psd: Power spectral density to fit. Either 1-D (``len(f)``) or 2-D
         (``(n_rows, len(f))``) with one PSD per row.
     :param f_bw: Sampling bandwidth in Hz, held fixed during the fit.
-    :param p0: Optional initial guess ``(fidelity, gamma_p)``. When ``None`` the
-        guess is estimated from the PSD (fidelity from the high-frequency floor,
-        :math:`\Gamma_p` from the low-frequency plateau).
+    :param p0: Optional initial guess for the free parameters, in order
+        ``(fidelity, gamma_p[, a_onef[, alpha]])`` — length must match the enabled
+        terms. When ``None`` the guess is estimated from the PSD.
     :param sigma: Optional per-point uncertainties passed to
         :func:`scipy.optimize.curve_fit`. Overrides *relative_weight* when given.
     :param relative_weight: When ``True`` (default) and *sigma* is not given, weight
@@ -177,18 +200,30 @@ def fit_parity_psd(
         plateau from dominating. Set ``False`` for uniform (absolute) weighting.
     :param drop_dc: When ``True`` (default), exclude the ``f == 0`` (DC) bin from the
         fit; it is typically meaningless after mean removal / detrending.
+    :param fit_onef: When ``True``, add a ``1/f`` term :math:`A / f^{\alpha}` with a
+        free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18).
+    :param fit_alpha: When ``True`` (requires *fit_onef*), also fit the ``1/f``
+        exponent :math:`\alpha`; otherwise it is held fixed at *alpha*.
+    :param alpha: Fixed ``1/f`` exponent when *fit_alpha* is ``False`` (``1.0`` for
+        pure ``1/f``), or the initial guess for :math:`\alpha` when *fit_alpha* is
+        ``True``. Ignored when *fit_onef* is ``False``.
     :param curve_fit_kwargs: Extra keyword arguments forwarded to
         :func:`scipy.optimize.curve_fit` (e.g. ``maxfev``).
     :returns: For 1-D *psd*, a dict with keys ``fidelity``, ``fidelity_err``,
         ``gamma_p`` (Hz), ``gamma_p_err`` (Hz), ``f_corner`` (Hz, the Lorentzian
-        half-power frequency :math:`\Gamma_p/\pi`), ``f_corner_err``, ``f_bw``,
-        ``popt``, ``pcov``, ``model`` (the fitted PSD evaluated at every input *f*,
-        including any dropped DC bin), and ``success``. For 2-D *psd*, a list of such
-        dicts, one per row.
-    :raises ValueError: If *f* is not 1-D, *psd* is not 1-D or 2-D, or their
-        frequency lengths do not match.
+        half-power frequency :math:`\Gamma_p/\pi`), ``f_corner_err``, ``a_onef``,
+        ``a_onef_err``, ``alpha``, ``alpha_err``, ``f_bw``, ``popt``, ``pcov``,
+        ``model`` (the fitted PSD evaluated at every input *f*, including any dropped
+        DC bin), and ``success``. When a ``1/f`` parameter is held fixed, its value is
+        reported with a ``nan`` error (``a_onef = 0`` when *fit_onef* is ``False``).
+        For 2-D *psd*, a list of such dicts, one per row.
+    :raises ValueError: If *f* is not 1-D, *psd* is not 1-D or 2-D, their frequency
+        lengths do not match, or *fit_alpha* is ``True`` without *fit_onef*.
     """
     from scipy.optimize import curve_fit
+
+    if fit_alpha and not fit_onef:
+        raise ValueError("fit_alpha=True requires fit_onef=True")
 
     f = np.asarray(f, dtype=np.float64)
     psd = np.asarray(psd, dtype=np.float64)
@@ -209,6 +244,9 @@ def fit_parity_psd(
                 sigma=sigma,
                 relative_weight=relative_weight,
                 drop_dc=drop_dc,
+                fit_onef=fit_onef,
+                fit_alpha=fit_alpha,
+                alpha=alpha,
                 **curve_fit_kwargs,
             )
             for row in psd
@@ -218,8 +256,12 @@ def fit_parity_psd(
     mask = f > 0 if drop_dc else np.ones_like(f, dtype=bool)
     f_fit = f[mask]
     psd_fit = psd[mask]
-    if f_fit.size < 3:
-        raise ValueError("need at least 3 positive-frequency points to fit two parameters")
+    n_params = 2 + int(fit_onef) + int(fit_alpha)
+    if f_fit.size < n_params + 1:
+        raise ValueError(
+            f"need at least {n_params + 1} positive-frequency points to fit "
+            f"{n_params} parameters"
+        )
 
     # --- Initial guess ---
     if p0 is None:
@@ -233,7 +275,25 @@ def fit_parity_psd(
         plateau0 = float(np.median(psd_fit[lo])) if np.any(lo) else float(psd_fit[0])
         lorentz_dc0 = max(plateau0 - floor0, np.finfo(float).tiny)
         gamma_p0 = float(fidelity0**2 / lorentz_dc0)
-        p0 = (fidelity0, max(gamma_p0, 1e-3))
+        guess = [fidelity0, max(gamma_p0, 1e-3)]
+        if fit_onef:
+            # Attribute the excess at the lowest fitted frequency (above the
+            # Lorentzian plateau + floor) to the 1/f term: A ~ excess * f_min^alpha.
+            f_min = float(f_fit.min())
+            excess = max(plateau0 - (lorentz_dc0 + floor0), 0.0)
+            a_onef0 = excess * f_min**alpha
+            if a_onef0 <= 0.0:
+                a_onef0 = 0.1 * plateau0 * f_min**alpha
+            guess.append(a_onef0)
+        if fit_alpha:
+            guess.append(alpha)
+        p0 = tuple(guess)
+    else:
+        p0 = tuple(p0)
+        if len(p0) != n_params:
+            raise ValueError(
+                f"p0 must have {n_params} entries for the enabled terms, got {len(p0)}"
+            )
 
     if sigma is None and relative_weight:
         # Weight by PSD value so the multi-decade dynamic range does not let the
@@ -248,8 +308,23 @@ def fit_parity_psd(
     else:
         sigma_fit = None
 
-    def _model(ff, fidelity, gamma_p):
-        return parity_psd_model(ff, fidelity, gamma_p, f_bw)
+    def _model(ff, *params):
+        fidelity, gamma_p = params[0], params[1]
+        idx = 2
+        a = params[idx] if fit_onef else 0.0
+        idx += int(fit_onef)
+        al = params[idx] if fit_alpha else alpha
+        return parity_psd_model(ff, fidelity, gamma_p, f_bw, a_onef=a, alpha=al)
+
+    # Bounds: F in [0, 1], gamma_p >= 0, A >= 0, alpha >= 0.
+    lower = [0.0, 0.0]
+    upper = [1.0, np.inf]
+    if fit_onef:
+        lower.append(0.0)
+        upper.append(np.inf)
+    if fit_alpha:
+        lower.append(0.0)
+        upper.append(np.inf)
 
     result = {
         "fidelity": np.nan,
@@ -258,6 +333,10 @@ def fit_parity_psd(
         "gamma_p_err": np.nan,
         "f_corner": np.nan,
         "f_corner_err": np.nan,
+        "a_onef": 0.0 if not fit_onef else np.nan,
+        "a_onef_err": np.nan,
+        "alpha": alpha,
+        "alpha_err": np.nan,
         "f_bw": float(f_bw),
         "popt": None,
         "pcov": None,
@@ -273,7 +352,7 @@ def fit_parity_psd(
             p0=p0,
             sigma=sigma_fit,
             absolute_sigma=False,
-            bounds=([0.0, 0.0], [1.0, np.inf]),
+            bounds=(lower, upper),
             **curve_fit_kwargs,
         )
     except (RuntimeError, ValueError):
@@ -283,6 +362,15 @@ def fit_parity_psd(
     fidelity, gamma_p = float(popt[0]), float(popt[1])
     fidelity_err, gamma_p_err = float(perr[0]), float(perr[1])
 
+    idx = 2
+    a_onef, a_onef_err = 0.0, np.nan
+    if fit_onef:
+        a_onef, a_onef_err = float(popt[idx]), float(perr[idx])
+        idx += 1
+    alpha_fit, alpha_err = alpha, np.nan
+    if fit_alpha:
+        alpha_fit, alpha_err = float(popt[idx]), float(perr[idx])
+
     result.update(
         fidelity=fidelity,
         fidelity_err=fidelity_err,
@@ -290,9 +378,13 @@ def fit_parity_psd(
         gamma_p_err=gamma_p_err,
         f_corner=gamma_p / np.pi,
         f_corner_err=gamma_p_err / np.pi,
+        a_onef=a_onef,
+        a_onef_err=a_onef_err,
+        alpha=alpha_fit,
+        alpha_err=alpha_err,
         popt=popt,
         pcov=pcov,
-        model=parity_psd_model(f, fidelity, gamma_p, f_bw),
+        model=parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit),
         success=True,
     )
     return result

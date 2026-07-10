@@ -150,6 +150,32 @@ plt.show()
 - The `f == 0` DC bin is dropped by default (`drop_dc=True`), since it is meaningless after mean removal.
 - Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` to override. Extra keyword arguments (e.g. `maxfev`) are forwarded to `scipy.optimize.curve_fit`.
 
+### Low-frequency 1/f noise
+
+Real parity time-streams often have a `1/f`-like excess at low frequency (drift, two-level-system noise). Left unmodelled it is absorbed into `Gamma_p`/`F` and biases them badly — the plain two-term fit can even collapse. Set `fit_onef=True` to add a `A / f^alpha` term:
+
+```
+PSD(f) = F^2 * 4*Gamma_p/((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2)/f_bw + A / f^alpha
+```
+
+```python
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True)   # alpha fixed at 1.0
+print(res["a_onef"], res["alpha"])          # 1/f amplitude and exponent
+```
+
+By default the exponent `alpha` is held fixed at `1.0` (pure `1/f`). Change the fixed value with `alpha=...`, or let it float as a free parameter with `fit_alpha=True`:
+
+```python
+# Fix a steeper slope
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True, alpha=1.5)
+
+# Or fit the slope too (needs fit_onef=True)
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True, fit_alpha=True)
+print(res["alpha"], res["alpha_err"])
+```
+
+Floating `alpha` and `Gamma_p` together can be weakly identifiable (the `1/f` slope and the Lorentzian shoulder trade off), so prefer a fixed `alpha` unless the data clearly warrant fitting it. The returned dict always carries `a_onef`, `a_onef_err`, `alpha`, `alpha_err` (with `a_onef = 0` and `nan` errors when a term is held fixed), and `res["model"]` includes the `1/f` contribution. When you pass your own `p0`, give it in the order `(fidelity, gamma_p[, a_onef[, alpha]])` matching the enabled terms.
+
 ### Batch fitting (2-D PSD)
 
 If you pass a 2-D `psd` of shape `(n_rows, n_freqs)` — for example the per-tone PSDs from `averaged_psd_timestream` — each row is fit independently and a **list** of result dicts is returned:
