@@ -5,6 +5,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 ## Contents
 
 - [Noise PSD](#noise-psd)
+- [Parity PSD fit (random-telegraph model)](#parity-psd-fit-random-telegraph-model)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [I/Q Comparison Plot](#iq-comparison-plot)
@@ -96,6 +97,99 @@ data_2d = np.vstack([i_data, q_data])  # shape: (2, N)
 f, psd = compute_psd(data_2d, fs)
 # psd.shape == (2, len(f))
 ```
+
+---
+
+## Parity PSD fit (random-telegraph model)
+
+`fit_parity_psd` fits the PSD of a parity (random-telegraph) time-stream to Eqn. 18 of [arXiv:2601.16261](https://arxiv.org/pdf/2601.16261):
+
+```
+PSD(f) = F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw
+```
+
+The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it. The fit is run with [`iminuit`](https://iminuit.readthedocs.io/) (`LeastSquares` cost, `MIGRAD` + `HESSE`), so parameter errors come straight from Minuit's Hesse step.
+
+The function takes the `(f, psd)` output of `compute_psd` directly:
+
+```python
+import numpy as np
+from daq.analysis import compute_psd, fit_parity_psd, parity_psd_model
+
+# `parity` is the projected parity time-stream (e.g. IQ data projected onto the
+# maximal-separation axis), sampled at fs.
+fs = ts.df  # Hz -- this is also f_bw
+f, psd = compute_psd(parity, fs)
+
+fit_results = fit_parity_psd(f, psd, f_bw=fs)
+print(f"fidelity F = {fit_results['fidelity']:.3f} +/- {fit_results['fidelity_err']:.3f}")
+print(f"Gamma_p    = {fit_results['gamma_p']:.2f} +/- {fit_results['gamma_p_err']:.2f} Hz")
+print(f"f_corner   = {fit_results['f_corner']:.2f} Hz")   # Lorentzian half-power = Gamma_p / pi
+print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
+```
+
+`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`), a `model` array (the fitted curve evaluated at every input `f`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
+
+### Plotting the fit
+
+```python
+import matplotlib.pyplot as plt
+
+plt.figure()
+plt.loglog(f[1:], psd[1:], ".", ms=2, label="Data")
+plt.loglog(f[1:], res["model"][1:], "-", label="Eqn. 18 fit")
+plt.xlabel("Frequency [Hz]")
+plt.ylabel("PSD [a.u.$^2$/Hz]")
+plt.legend()
+plt.grid(True, which="both", alpha=0.3)
+plt.show()
+```
+
+### Weighting, DC bin, and initial guess
+
+- By default a PSD-proportional weighting (`relative_weight=True`) sets the Minuit `LeastSquares` `yerror` to the PSD value, so the multi-decade dynamic range does not let the low-frequency plateau dominate the fit. Pass explicit `sigma` (true per-point uncertainties, e.g. `psd / sqrt(num_averages)`) to override, or set `relative_weight=False` for uniform weighting.
+- Because that weighting is only relative, the reported errors are rescaled by `sqrt(chi2/ndof)` so they reflect the observed scatter (matching `scipy`'s `absolute_sigma=False`). If you pass a true `sigma` and want the raw Hesse errors instead, set `absolute_sigma=True`.
+- The `f == 0` DC bin is dropped by default (`drop_dc=True`), since it is meaningless after mean removal.
+- Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` (in the order of the enabled free terms) to override.
+
+### Low-frequency 1/f noise
+
+Real parity time-streams often have a `1/f`-like excess at low frequency (drift, two-level-system noise). Left unmodelled it is absorbed into `Gamma_p`/`F` and biases them badly — the plain two-term fit can even collapse. Set `fit_onef=True` to add a `A / f^alpha` term:
+
+```
+PSD(f) = F^2 * 4*Gamma_p/((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2)/f_bw + A / f^alpha
+```
+
+```python
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True)   # alpha fixed at 1.0
+print(res["a_onef"], res["alpha"])          # 1/f amplitude and exponent
+```
+
+By default the exponent `alpha` is held fixed at `1.0` (pure `1/f`). Change the fixed value with `alpha=...`, or let it float as a free parameter with `fit_alpha=True`:
+
+```python
+# Fix a steeper slope
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True, alpha=1.5)
+
+# Or fit the slope too (needs fit_onef=True)
+res = fit_parity_psd(f, psd, f_bw=fs, fit_onef=True, fit_alpha=True)
+print(res["alpha"], res["alpha_err"])
+```
+
+Floating `alpha` and `Gamma_p` together can be weakly identifiable (the `1/f` slope and the Lorentzian shoulder trade off), so prefer a fixed `alpha` unless the data clearly warrant fitting it. The returned dict always carries `a_onef`, `a_onef_err`, `alpha`, `alpha_err` (with `a_onef = 0` and `nan` errors when a term is held fixed), and `res["model"]` includes the `1/f` contribution. When you pass your own `p0`, give it in the order `(fidelity, gamma_p[, a_onef[, alpha]])` matching the enabled terms.
+
+### Batch fitting (2-D PSD)
+
+If you pass a 2-D `psd` of shape `(n_rows, n_freqs)` — for example the per-tone PSDs from `averaged_psd_timestream` — each row is fit independently and a **list** of result dicts is returned:
+
+```python
+f, psd_a, psd_b, streams = averaged_psd_timestream(...)
+results = fit_parity_psd(f, psd_a, f_bw=streams[0].df)
+for ch, r in enumerate(results):
+    print(ch, r["fidelity"], r["gamma_p"])
+```
+
+`parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=0.0, alpha=1.0)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation); with `a_onef=0` it is pure Eqn. 18.
 
 ---
 
