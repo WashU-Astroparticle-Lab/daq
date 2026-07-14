@@ -110,6 +110,8 @@ PSD(f) = F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw
 
 The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it. The fit is run with [`iminuit`](https://iminuit.readthedocs.io/) (`LeastSquares` cost, `MIGRAD` + `HESSE`), so parameter errors come straight from Minuit's Hesse step.
 
+The fit is done in **log-log space**, the natural representation of a PSD. A periodogram is linearly spaced in frequency, so nearly all of its points sit in the top decade; a plain linear-units fit is therefore steered by high-frequency structure. To avoid that, `fit_parity_psd` first averages the spectrum onto `n_bins` logarithmically-spaced frequency bins (default 60 — geometric-mean frequency, linear-mean power per bin, which is unbiased for the underlying spectrum) so every decade is represented equally, then minimizes the residual of `log10(PSD)` against `log10(model)`. The `f = 0` DC bin (and any non-positive frequency) is always excluded, since a log axis needs `f > 0`.
+
 The function takes the `(f, psd)` output of `compute_psd` directly:
 
 ```python
@@ -128,7 +130,7 @@ print(f"f_corner   = {fit_results['f_corner']:.2f} Hz")   # Lorentzian half-powe
 print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
 ```
 
-`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`), a `model` array (the fitted curve evaluated at every input `f`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
+`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`, computed over the log-binned points), a `model` array (the fitted curve evaluated at every input `f`), the log-binned points that were actually fit (`f_binned`, `psd_binned`) and the number of non-empty bins (`n_bins`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
 
 ### Plotting the fit
 
@@ -136,7 +138,8 @@ print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
 import matplotlib.pyplot as plt
 
 plt.figure()
-plt.loglog(f[1:], psd[1:], ".", ms=2, label="Data")
+plt.loglog(f[1:], psd[1:], ".", ms=2, alpha=0.3, label="Data")
+plt.loglog(res["f_binned"], res["psd_binned"], "o", ms=4, label="Log-binned (fit input)")
 plt.loglog(f[1:], res["model"][1:], "-", label="Eqn. 18 fit")
 plt.xlabel("Frequency [Hz]")
 plt.ylabel("PSD [a.u.$^2$/Hz]")
@@ -145,12 +148,18 @@ plt.grid(True, which="both", alpha=0.3)
 plt.show()
 ```
 
-### Weighting, DC bin, and initial guess
+`res["f_binned"]` / `res["psd_binned"]` are the log-binned points the fit actually saw (overplot them to see what drove the fit); `res["n_bins"]` is how many non-empty bins were used.
 
-- By default a PSD-proportional weighting (`relative_weight=True`) sets the Minuit `LeastSquares` `yerror` to the PSD value, so the multi-decade dynamic range does not let the low-frequency plateau dominate the fit. Pass explicit `sigma` (true per-point uncertainties, e.g. `psd / sqrt(num_averages)`) to override, or set `relative_weight=False` for uniform weighting.
-- Because that weighting is only relative, the reported errors are rescaled by `sqrt(chi2/ndof)` so they reflect the observed scatter (matching `scipy`'s `absolute_sigma=False`). If you pass a true `sigma` and want the raw Hesse errors instead, set `absolute_sigma=True`.
-- The `f == 0` DC bin is dropped by default (`drop_dc=True`), since it is meaningless after mean removal.
-- Initial guesses for `F` and `Gamma_p` are estimated from the spectrum automatically; pass `p0=(F0, gamma0)` (in the order of the enabled free terms) to override.
+### Binning, weighting, and initial guess
+
+- The spectrum is averaged onto `n_bins` (default 60) logarithmically-spaced frequency bins before fitting, so every decade contributes equally and the fit is not dictated by the densely-sampled high-frequency structure. Raise `n_bins` for finer resolution or lower it if a short record leaves bins empty (empty bins are dropped; the count used is returned as `n_bins`).
+- `bin_weighting` controls how the binned points are weighted (when you don't pass `sigma`):
+  - `"uniform"` (default) — every bin weighted equally, so **each decade contributes equally** and the fit is not steered by the high frequencies. This is the intended behaviour of a log-log fit and the right choice for **Welch / averaged PSDs** (`compute_psd(..., welch=True)`), where each point is already smooth.
+  - `"count"` — weight by each bin's statistical precision (`~ 1/sqrt(m)`, with `m` points in the bin). This is statistically optimal and the better choice for a **bare periodogram** (`compute_psd` default), whose low-frequency bins hold only a point or two and are genuinely noisy — but it hands the populous high-frequency bins far more influence (the high-f dominance `"uniform"` is meant to avoid).
+  - Or pass explicit `sigma` (true per-point 1-sigma uncertainties on the *linear* PSD, e.g. `psd / sqrt(num_averages)`) to propagate real errors, which overrides `bin_weighting`.
+- Because the default weighting is only relative, the reported errors are rescaled by `sqrt(chi2/ndof)` so they reflect the observed scatter (matching `scipy`'s `absolute_sigma=False`). If you pass a true `sigma` and want the raw Hesse errors instead, set `absolute_sigma=True`.
+- `drop_dc` is kept for compatibility but has no effect — a log fit always excludes `f <= 0`.
+- Initial guesses for `F` and `Gamma_p` are estimated from the binned spectrum automatically; pass `p0=(F0, gamma0)` (in the order of the enabled free terms) to override.
 
 ### Low-frequency 1/f noise
 

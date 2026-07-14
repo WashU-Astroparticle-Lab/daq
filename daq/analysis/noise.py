@@ -160,7 +160,8 @@ def fit_parity_psd(
     f_bw: float,
     p0: Optional[Sequence[float]] = None,
     sigma: Optional[npt.ArrayLike] = None,
-    relative_weight: bool = True,
+    n_bins: int = 60,
+    bin_weighting: str = "uniform",
     absolute_sigma: bool = False,
     drop_dc: bool = True,
     fit_onef: bool = False,
@@ -174,6 +175,19 @@ def fit_parity_psd(
     :math:`\Gamma_p`. The sampling bandwidth :math:`f_\mathrm{bw}` is held fixed at
     *f_bw* (pass the acquisition sample rate, e.g. ``TimeStream.df``); only *F* and
     :math:`\Gamma_p` are free parameters.
+
+    The fit is performed in **log-log space** — the natural representation of a
+    PSD. A periodogram is linearly spaced in frequency, so roughly all of its
+    points sit in the top decade; a plain least-squares fit in linear units is
+    therefore dominated by high-frequency structure. To avoid this, the spectrum
+    is first averaged onto *n_bins* logarithmically-spaced frequency bins (each
+    bin's frequency is the geometric mean of its members and its PSD the linear
+    mean of the periodogram power, which is unbiased for the underlying spectrum),
+    giving every decade equal representation. The fit then minimizes the residual
+    of :math:`\log_{10}\mathrm{PSD}` against :math:`\log_{10}\text{model}`, so the
+    multi-decade dynamic range is handled and no single frequency region drives
+    the result. The DC (:math:`f = 0`) bin and any non-positive frequency are
+    always excluded (a log axis requires :math:`f > 0`).
 
     Set *fit_onef* to add a ``1/f``-like low-frequency term :math:`A / f^{\alpha}`
     (e.g. drift or two-level-system noise that would otherwise bias :math:`\Gamma_p`
@@ -192,19 +206,31 @@ def fit_parity_psd(
     :param p0: Optional initial guess for the free parameters, in order
         ``(fidelity, gamma_p[, a_onef[, alpha]])`` — length must match the enabled
         terms. When ``None`` the guess is estimated from the PSD.
-    :param sigma: Optional per-point uncertainties on the PSD (the ``yerror`` handed
-        to :class:`iminuit.cost.LeastSquares`). Overrides *relative_weight* when given.
-    :param relative_weight: When ``True`` (default) and *sigma* is not given, weight
-        each point by its PSD value (``yerror = psd``). Because a PSD spans many
-        decades, this fits the fractional residuals and stops the low-frequency
-        plateau from dominating. Set ``False`` for uniform weighting.
+    :param sigma: Optional per-point 1-sigma uncertainties on the *linear* PSD (same
+        length as *f*). When given, they are propagated into the log-space,
+        log-binned fit (the per-bin log-PSD error becomes the standard error of the
+        bin's mean, delta-method converted to :math:`\log_{10}`). When ``None``
+        (default), each bin's log-PSD error is estimated empirically from the scatter
+        of the periodogram points that fall in it.
+    :param n_bins: Number of logarithmically-spaced frequency bins to average the
+        spectrum onto before fitting (default ``60``). Empty bins are dropped, so the
+        effective count may be smaller; the value actually used is returned as
+        ``n_bins``.
+    :param bin_weighting: How to weight the log-binned points when *sigma* is not
+        given. ``"uniform"`` (default) weights every bin equally, so each decade
+        contributes equally and the fit is not dictated by the densely-sampled high
+        frequencies — the intended behaviour of a log-log fit. ``"count"`` instead
+        weights by each bin's statistical precision (:math:`\sim 1/\sqrt{m}` for
+        :math:`m` points in the bin), which is optimal when the model is trusted
+        everywhere but hands the populous high-frequency bins far more influence.
+        Ignored when *sigma* is supplied.
     :param absolute_sigma: When ``False`` (default), the reported parameter errors are
         rescaled by :math:`\sqrt{\chi^2/\mathrm{ndof}}` so they reflect the observed
-        scatter (matching ``scipy``'s ``absolute_sigma=False``); use this when *sigma*
-        is only a relative weight. Set ``True`` when *sigma* is a true 1-sigma
-        uncertainty and the raw Hesse errors should be kept.
-    :param drop_dc: When ``True`` (default), exclude the ``f == 0`` (DC) bin from the
-        fit; it is typically meaningless after mean removal / detrending.
+        scatter (matching ``scipy``'s ``absolute_sigma=False``); appropriate when the
+        per-bin errors are only relative weights. Set ``True`` when *sigma* is a true
+        1-sigma uncertainty and the raw Hesse errors should be kept.
+    :param drop_dc: Retained for compatibility. The DC bin is always excluded from a
+        log-log fit (a log frequency axis requires ``f > 0``), so this has no effect.
     :param fit_onef: When ``True``, add a ``1/f`` term :math:`A / f^{\alpha}` with a
         free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18).
     :param fit_alpha: When ``True`` (requires *fit_onef*), also fit the ``1/f``
@@ -217,19 +243,25 @@ def fit_parity_psd(
         ``gamma_p_err``, ``a_onef`` / ``a_onef_err``, ``alpha`` / ``alpha_err`` — plus
         the derived Lorentzian half-power frequency ``f_corner`` (Hz,
         :math:`\Gamma_p/\pi`) / ``f_corner_err``, the fixed ``f_bw``, the fit quality
-        (``chi2``, ``ndof``, ``reduced_chi2``), the fitted ``model`` evaluated at every
-        input *f* (including any dropped DC bin), the underlying :class:`iminuit.Minuit`
-        object under ``minuit``, and ``success`` (``Minuit.valid``). A held-fixed
-        ``1/f`` parameter is reported with a ``nan`` error (``a_onef = 0`` when
-        *fit_onef* is ``False``). For 2-D *psd*, a list of such dicts, one per row.
+        (``chi2``, ``ndof``, ``reduced_chi2`` — computed over the log-binned points),
+        the fitted ``model`` evaluated at every input *f* (including the dropped DC
+        bin), the log-binned points that were actually fit (``f_binned``,
+        ``psd_binned``) and the number of non-empty bins (``n_bins``), the underlying
+        :class:`iminuit.Minuit` object under ``minuit``, and ``success``
+        (``Minuit.valid``). A held-fixed ``1/f`` parameter is reported with a ``nan``
+        error (``a_onef = 0`` when *fit_onef* is ``False``). For 2-D *psd*, a list of
+        such dicts, one per row.
     :raises ValueError: If *f* is not 1-D, *psd* is not 1-D or 2-D, their frequency
-        lengths do not match, or *fit_alpha* is ``True`` without *fit_onef*.
+        lengths do not match, *fit_alpha* is ``True`` without *fit_onef*, or
+        *bin_weighting* is not ``"uniform"`` or ``"count"``.
     """
     from iminuit import Minuit
     from iminuit.cost import LeastSquares
 
     if fit_alpha and not fit_onef:
         raise ValueError("fit_alpha=True requires fit_onef=True")
+    if bin_weighting not in ("uniform", "count"):
+        raise ValueError(f"bin_weighting must be 'uniform' or 'count', got {bin_weighting!r}")
 
     f = np.asarray(f, dtype=np.float64)
     psd = np.asarray(psd, dtype=np.float64)
@@ -248,7 +280,8 @@ def fit_parity_psd(
                 f_bw,
                 p0=p0,
                 sigma=sigma,
-                relative_weight=relative_weight,
+                n_bins=n_bins,
+                bin_weighting=bin_weighting,
                 absolute_sigma=absolute_sigma,
                 drop_dc=drop_dc,
                 fit_onef=fit_onef,
@@ -258,51 +291,91 @@ def fit_parity_psd(
             for row in psd
         ]
 
-    # --- Select the frequencies used for fitting ---
-    mask = f > 0 if drop_dc else np.ones_like(f, dtype=bool)
-    f_fit = f[mask]
-    psd_fit = psd[mask]
+    # --- Restrict to positive frequencies (a log-log fit requires f > 0) ---
+    # `drop_dc` is retained for compatibility but a log axis always excludes f <= 0.
+    mask = f > 0
+    f_pos = f[mask]
+    psd_pos = psd[mask]
+    sigma_pos = np.asarray(sigma, dtype=np.float64)[mask] if sigma is not None else None
+    if f_pos.size == 0:
+        raise ValueError("no positive-frequency points to fit (all f <= 0)")
     free_names = ["fidelity", "gamma_p"]
     if fit_onef:
         free_names.append("a_onef")
     if fit_alpha:
         free_names.append("alpha")
     n_free = len(free_names)
-    if f_fit.size < n_free + 1:
-        raise ValueError(
-            f"need at least {n_free + 1} positive-frequency points to fit {n_free} parameters"
-        )
 
-    # --- Per-point uncertainty (yerror) handed to LeastSquares ---
-    if sigma is not None:
-        yerr = np.asarray(sigma, dtype=np.float64)[mask].copy()
-    elif relative_weight:
-        # Weight by PSD value so the multi-decade dynamic range does not let the
-        # low-frequency plateau dominate the residuals.
-        yerr = np.asarray(psd_fit, dtype=np.float64).copy()
-    else:
-        yerr = np.ones_like(psd_fit)
+    # --- Average onto log-spaced frequency bins, then fit in log-log space ---
+    # A periodogram is linearly spaced in f, so most of its points crowd into the
+    # top decade and would dominate a linear least-squares sum. Averaging onto
+    # log-spaced bins gives every decade equal representation, and fitting the
+    # residual of log10(PSD) handles the multi-decade dynamic range.
+    ln10 = np.log(10.0)
+    edges = np.logspace(np.log10(f_pos.min()), np.log10(f_pos.max()), int(n_bins) + 1)
+    which = np.digitize(f_pos, edges[1:-1])  # -> bins 0 .. n_bins-1
+    f_b, psd_b, logerr_b = [], [], []
+    for b in range(int(n_bins)):
+        sel = which == b
+        m = int(np.count_nonzero(sel))
+        if m == 0:
+            continue
+        pb = float(np.mean(psd_pos[sel]))  # linear-mean power (unbiased for the spectrum)
+        if pb <= 0.0 or not np.isfinite(pb):
+            continue
+        fb = float(np.exp(np.mean(np.log(f_pos[sel]))))  # geometric-mean frequency
+        # Uncertainty on log10(pb), i.e. the LeastSquares yerror in log space.
+        #  * With true per-point errors (`sigma`): propagate them — the error on the
+        #    bin mean is sqrt(sum sigma_i^2)/m, converted to log10 by the delta method
+        #    (d log10 y = dy / (y ln 10)).
+        #  * bin_weighting="uniform" (default): every bin gets the same weight, so each
+        #    log-frequency bin — hence each decade — contributes equally and the fit is
+        #    not dictated by the densely-sampled high frequencies.
+        #  * bin_weighting="count": weight by the statistical precision of the bin mean
+        #    (~1/sqrt(m)); optimal if the model is trusted everywhere, but it hands the
+        #    populous high-frequency bins much more weight than the sparse low-frequency
+        #    ones (the very high-f dominance "uniform" avoids).
+        if sigma_pos is not None:
+            logerr = float(np.sqrt(np.sum(sigma_pos[sel] ** 2))) / m / (pb * ln10)
+        elif bin_weighting == "count":
+            logerr = 1.0 / (np.sqrt(m) * ln10)
+        else:
+            logerr = 1.0
+        f_b.append(fb)
+        psd_b.append(pb)
+        logerr_b.append(logerr)
+
+    f_b = np.asarray(f_b, dtype=np.float64)
+    psd_b = np.asarray(psd_b, dtype=np.float64)
+    logerr_b = np.asarray(logerr_b, dtype=np.float64)
+    n_binned = int(f_b.size)
+    if n_binned < n_free + 1:
+        raise ValueError(
+            f"need at least {n_free + 1} non-empty log-frequency bins to fit {n_free} "
+            f"parameters, got {n_binned} (try lowering n_bins)"
+        )
     # Guard non-positive / non-finite errors (LeastSquares divides by yerror).
-    positive = yerr[np.isfinite(yerr) & (yerr > 0)]
-    floor_val = positive.min() if positive.size else 1.0
-    yerr[~(np.isfinite(yerr) & (yerr > 0))] = floor_val
+    good = np.isfinite(logerr_b) & (logerr_b > 0)
+    floor_val = float(np.min(logerr_b[good])) if np.any(good) else 1.0
+    logerr_b[~good] = floor_val
+    logpsd_b = np.log10(psd_b)
 
     # --- Initial guess: start from all four parameters, then fix the disabled ones ---
     start = {"fidelity": 0.9, "gamma_p": 1.0, "a_onef": 0.0, "alpha": alpha}
-    # White floor from the top decade of the spectrum; fidelity from it.
-    hi = f_fit >= 0.1 * f_fit.max()
-    floor0 = float(np.median(psd_fit[hi])) if np.any(hi) else float(np.median(psd_fit))
+    # White floor from the top decade of the (binned) spectrum; fidelity from it.
+    hi = f_b >= 0.1 * f_b.max()
+    floor0 = float(np.median(psd_b[hi])) if np.any(hi) else float(np.median(psd_b))
     floor0 = max(floor0, 0.0)
     start["fidelity"] = float(np.sqrt(np.clip(1.0 - floor0 * f_bw, 1e-6, 1.0)))
     # Low-frequency plateau -> Lorentzian DC value F^2 / gamma_p.
-    lo = f_fit <= max(f_fit.min() * 3.0, f_fit[min(4, f_fit.size - 1)])
-    plateau0 = float(np.median(psd_fit[lo])) if np.any(lo) else float(psd_fit[0])
+    lo = f_b <= max(f_b.min() * 3.0, f_b[min(4, f_b.size - 1)])
+    plateau0 = float(np.median(psd_b[lo])) if np.any(lo) else float(psd_b[0])
     lorentz_dc0 = max(plateau0 - floor0, np.finfo(float).tiny)
     start["gamma_p"] = max(float(start["fidelity"] ** 2 / lorentz_dc0), 1e-3)
     if fit_onef:
         # Attribute the excess at the lowest fitted frequency (above the Lorentzian
         # plateau + floor) to the 1/f term: A ~ excess * f_min^alpha.
-        f_min = float(f_fit.min())
+        f_min = float(f_b.min())
         excess = max(plateau0 - (lorentz_dc0 + floor0), 0.0)
         a_onef0 = excess * f_min**alpha
         start["a_onef"] = a_onef0 if a_onef0 > 0.0 else 0.1 * plateau0 * f_min**alpha
@@ -314,9 +387,12 @@ def fit_parity_psd(
         for name, value in zip(free_names, p0):
             start[name] = float(value)
 
-    # Full four-parameter model; disabled terms are frozen below.
-    def _model(x, fidelity, gamma_p, a_onef, alpha):
-        return parity_psd_model(x, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha)
+    tiny = float(np.finfo(np.float64).tiny)
+
+    # Full four-parameter model in log10 space; disabled terms are frozen below.
+    def _model_log(x, fidelity, gamma_p, a_onef, alpha):
+        y = parity_psd_model(x, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha)
+        return np.log10(np.maximum(y, tiny))
 
     fit_results = {
         "fidelity": np.nan,
@@ -331,15 +407,18 @@ def fit_parity_psd(
         "alpha_err": np.nan,
         "f_bw": float(f_bw),
         "chi2": np.nan,
-        "ndof": int(f_fit.size - n_free),
+        "ndof": int(n_binned - n_free),
         "reduced_chi2": np.nan,
         "model": None,
+        "f_binned": f_b,
+        "psd_binned": psd_b,
+        "n_bins": n_binned,
         "minuit": None,
         "success": False,
     }
 
     try:
-        cost = LeastSquares(f_fit, psd_fit, yerr, _model)
+        cost = LeastSquares(f_b, logpsd_b, logerr_b, _model_log)
         minuit = Minuit(
             cost,
             fidelity=start["fidelity"],
@@ -362,7 +441,7 @@ def fit_parity_psd(
     except (RuntimeError, ValueError):
         return fit_results
 
-    ndof = int(f_fit.size - n_free)
+    ndof = int(n_binned - n_free)
     chi2 = float(minuit.fval)
     reduced_chi2 = chi2 / ndof if ndof > 0 else np.nan
     # Rescale Hesse errors to the observed scatter unless the caller supplied true
@@ -797,7 +876,7 @@ def clean_correlated_streams(
             )
         if ts.signal.ndim != 2:
             raise ValueError(
-                f"streams[{i}].signal must be 2-D (n_samples, n_tones); got " f"{ts.signal.ndim}-D"
+                f"streams[{i}].signal must be 2-D (n_samples, n_tones); got {ts.signal.ndim}-D"
             )
     n_samples, n_tones = streams[0].signal.shape
     for i, ts in enumerate(streams):
