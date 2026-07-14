@@ -161,7 +161,6 @@ def fit_parity_psd(
     p0: Optional[Sequence[float]] = None,
     sigma: Optional[npt.ArrayLike] = None,
     n_bins: int = 60,
-    bin_reduce: str = "median",
     bin_weighting: str = "uniform",
     absolute_sigma: bool = False,
     drop_dc: bool = True,
@@ -181,9 +180,9 @@ def fit_parity_psd(
     PSD. A periodogram is linearly spaced in frequency, so roughly all of its
     points sit in the top decade; a plain least-squares fit in linear units is
     therefore dominated by high-frequency structure. To avoid this, the spectrum
-    is first reduced onto *n_bins* logarithmically-spaced frequency bins (each
-    bin's frequency is the geometric mean of its members and its PSD the median of
-    the periodogram power within it — robust to line-noise spikes; see *bin_reduce*),
+    is first averaged onto *n_bins* logarithmically-spaced frequency bins (each
+    bin's frequency is the geometric mean of its members and its PSD the linear
+    mean of the periodogram power, which is unbiased for the underlying spectrum),
     giving every decade equal representation. The fit then minimizes the residual
     of :math:`\log_{10}\mathrm{PSD}` against :math:`\log_{10}\text{model}`, so the
     multi-decade dynamic range is handled and no single frequency region drives
@@ -217,12 +216,6 @@ def fit_parity_psd(
         spectrum onto before fitting (default ``60``). Empty bins are dropped, so the
         effective count may be smaller; the value actually used is returned as
         ``n_bins``.
-    :param bin_reduce: How to reduce the periodogram points within each bin.
-        ``"median"`` (default) is robust to sparse line-noise spikes (50/60 Hz pickup
-        and harmonics, glitches), which an arithmetic mean would otherwise let bleed
-        into a spurious ``1/f`` term (a runaway low-frequency overshoot). ``"mean"``
-        uses the arithmetic mean, which is unbiased for the underlying spectrum but
-        spike-sensitive; prefer it only for clean, well-averaged, spike-free spectra.
     :param bin_weighting: How to weight the log-binned points when *sigma* is not
         given. ``"uniform"`` (default) weights every bin equally, so each decade
         contributes equally and the fit is not dictated by the densely-sampled high
@@ -266,17 +259,14 @@ def fit_parity_psd(
         error (``a_onef = 0`` when *fit_onef* is ``False``). For 2-D *psd*, a list of
         such dicts, one per row.
     :raises ValueError: If *f* is not 1-D, *psd* is not 1-D or 2-D, their frequency
-        lengths do not match, *fit_alpha* is ``True`` without *fit_onef*,
-        *bin_reduce* is not ``"median"`` or ``"mean"``, or *bin_weighting* is not
-        ``"uniform"`` or ``"count"``.
+        lengths do not match, *fit_alpha* is ``True`` without *fit_onef*, or
+        *bin_weighting* is not ``"uniform"`` or ``"count"``.
     """
     from iminuit import Minuit
     from iminuit.cost import LeastSquares
 
     if fit_alpha and not fit_onef:
         raise ValueError("fit_alpha=True requires fit_onef=True")
-    if bin_reduce not in ("median", "mean"):
-        raise ValueError(f"bin_reduce must be 'median' or 'mean', got {bin_reduce!r}")
     if bin_weighting not in ("uniform", "count"):
         raise ValueError(f"bin_weighting must be 'uniform' or 'count', got {bin_weighting!r}")
 
@@ -298,7 +288,6 @@ def fit_parity_psd(
                 p0=p0,
                 sigma=sigma,
                 n_bins=n_bins,
-                bin_reduce=bin_reduce,
                 bin_weighting=bin_weighting,
                 absolute_sigma=absolute_sigma,
                 drop_dc=drop_dc,
@@ -324,16 +313,11 @@ def fit_parity_psd(
         free_names.append("alpha")
     n_free = len(free_names)
 
-    # --- Reduce onto log-spaced frequency bins, then fit in log-log space ---
+    # --- Average onto log-spaced frequency bins, then fit in log-log space ---
     # A periodogram is linearly spaced in f, so most of its points crowd into the
-    # top decade and would dominate a linear least-squares sum. Binning onto
+    # top decade and would dominate a linear least-squares sum. Averaging onto
     # log-spaced bins gives every decade equal representation, and fitting the
-    # residual of log10(PSD) handles the multi-decade dynamic range. Each bin is
-    # reduced by its median (default), which rejects sparse line-noise spikes
-    # (50/60 Hz pickup and harmonics, glitches) that an arithmetic mean would let
-    # bleed into a spurious 1/f term; pass bin_reduce="mean" for the (unbiased but
-    # spike-sensitive) arithmetic mean.
-    reduce_fn = np.mean if bin_reduce == "mean" else np.median
+    # residual of log10(PSD) handles the multi-decade dynamic range.
     ln10 = np.log(10.0)
     edges = np.logspace(np.log10(f_pos.min()), np.log10(f_pos.max()), int(n_bins) + 1)
     which = np.digitize(f_pos, edges[1:-1])  # -> bins 0 .. n_bins-1
@@ -343,7 +327,7 @@ def fit_parity_psd(
         m = int(np.count_nonzero(sel))
         if m == 0:
             continue
-        pb = float(reduce_fn(psd_pos[sel]))  # median (robust) or mean power in the bin
+        pb = float(np.mean(psd_pos[sel]))  # linear-mean power (unbiased for the spectrum)
         if pb <= 0.0 or not np.isfinite(pb):
             continue
         fb = float(np.exp(np.mean(np.log(f_pos[sel]))))  # geometric-mean frequency
