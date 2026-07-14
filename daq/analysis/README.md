@@ -105,10 +105,14 @@ f, psd = compute_psd(data_2d, fs)
 `fit_parity_psd` fits the PSD of a parity (random-telegraph) time-stream to Eqn. 18 of [arXiv:2601.16261](https://arxiv.org/pdf/2601.16261):
 
 ```
-PSD(f) = F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw
+PSD(f) = sigma^2 * [ F^2 * 4*Gamma_p / ((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2) / f_bw ]
 ```
 
+(`sigma^2` is the overall signal variance — see **Signal normalization** below; it is `1` for a normalized ±1 parity signal, i.e. the original two-term Eqn. 18.)
+
 The first term is the Lorentzian of the parity-switching process; the second is a white noise floor set by the readout fidelity `F` and the sampling bandwidth `f_bw`. The fit extracts the fidelity `F` and the characteristic parity-switching rate `Gamma_p` (in Hz); `f_bw` is held **fixed** — pass the acquisition sample rate (e.g. `TimeStream.df`) for it. The fit is run with [`iminuit`](https://iminuit.readthedocs.io/) (`LeastSquares` cost, `MIGRAD` + `HESSE`), so parameter errors come straight from Minuit's Hesse step.
+
+**Signal normalization (`fit_amplitude`).** Eqn. 18 as written assumes a *normalized* parity signal — a dimensionless ±1 telegraph whose variance is 1 — so its white floor is exactly `(1 - F^2) / f_bw ≈ 1/f_bw`. If you feed an **un-normalized** time series (e.g. raw electronic I/Q in arbitrary units, variance ≪ 1), that floor is orders of magnitude above the data's actual floor, and *no* `(F, Gamma_p)` can match both the signal and the floor: the fit collapses to `F → 1` with the corner shoved out of band and a flat or fake-`1/f` model. To handle this, `fit_parity_psd` fits an overall amplitude `sigma^2` (the signal variance) **by default** (`fit_amplitude=True`), which decouples the level — `F` is then set by the Lorentzian-to-floor *ratio* and `Gamma_p` by the corner, both scale-free. Set `fit_amplitude=False` only when your input is already normalized to unit variance, to recover the strict two-parameter Eqn. 18.
 
 The fit is done in **log-log space**, the natural representation of a PSD. A periodogram is linearly spaced in frequency, so nearly all of its points sit in the top decade; a plain linear-units fit is therefore steered by high-frequency structure. To avoid that, `fit_parity_psd` first averages the spectrum onto `n_bins` logarithmically-spaced frequency bins (default 60 — geometric-mean frequency, linear-mean power per bin, which is unbiased for the underlying spectrum) so every decade is represented equally, then minimizes the residual of `log10(PSD)` against `log10(model)`. The `f = 0` DC bin (and any non-positive frequency) is always excluded, since a log axis needs `f > 0`.
 
@@ -130,7 +134,7 @@ print(f"f_corner   = {fit_results['f_corner']:.2f} Hz")   # Lorentzian half-powe
 print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
 ```
 
-`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`, computed over the log-binned points), `resid_dex_rms`, a `model` array (the fitted curve evaluated at every input `f`), the log-binned points that were actually fit (`f_binned`, `psd_binned`) and the number of non-empty bins (`n_bins`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
+`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err`, `amplitude`/`amplitude_err` (the signal variance `sigma^2`; `1` with a `nan` error when `fit_amplitude=False`) — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`, computed over the log-binned points), `resid_dex_rms`, a `model` array (the fitted curve evaluated at every input `f`), the log-binned points that were actually fit (`f_binned`, `psd_binned`) and the number of non-empty bins (`n_bins`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
 
 `resid_dex_rms` is the RMS of the `log10` data-vs-model residual over the binned points, in **decades** — a weighting-independent goodness-of-fit. `~0.1` is a good fit; `~1` means the model is roughly a decade off across the band (e.g. a flat fit to a sloped spectrum). Prefer it over `reduced_chi2` for flagging bad fits in a sweep, since the default `"uniform"` weighting makes `reduced_chi2` an unreliable quality measure (a flat fit to 1/f data can still show `reduced_chi2 < 1`):
 
@@ -207,7 +211,7 @@ for ch, r in enumerate(results):
     print(ch, r["fidelity"], r["gamma_p"])
 ```
 
-`parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=0.0, alpha=1.0)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation); with `a_onef=0` it is pure Eqn. 18.
+`parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=0.0, alpha=1.0, amplitude=1.0)` is exposed separately if you want to evaluate the model directly (e.g. for overplotting or simulation); with `a_onef=0` and `amplitude=1` it is pure Eqn. 18.
 
 ---
 
