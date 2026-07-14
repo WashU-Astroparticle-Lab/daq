@@ -130,7 +130,16 @@ print(f"f_corner   = {fit_results['f_corner']:.2f} Hz")   # Lorentzian half-powe
 print(f"chi2/ndof  = {fit_results['reduced_chi2']:.2f}")
 ```
 
-`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`, computed over the log-binned points), a `model` array (the fitted curve evaluated at every input `f`), the log-binned points that were actually fit (`f_binned`, `psd_binned`) and the number of non-empty bins (`n_bins`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
+`fit_results` is a dict carrying a best-fit value and Minuit Hesse error for every term — `fidelity`/`fidelity_err`, `gamma_p` (Hz)/`gamma_p_err`, `a_onef`/`a_onef_err`, `alpha`/`alpha_err` — plus the derived `f_corner` (= `Gamma_p / pi`)/`f_corner_err`, the fixed `f_bw`, the fit quality (`chi2`, `ndof`, `reduced_chi2`, computed over the log-binned points), `resid_dex_rms`, a `model` array (the fitted curve evaluated at every input `f`), the log-binned points that were actually fit (`f_binned`, `psd_binned`) and the number of non-empty bins (`n_bins`), the underlying `iminuit.Minuit` object under `minuit` (for `draw_mnprofile`, MINOS, etc.), and a `success` flag (`Minuit.valid`). A term that is held fixed reports a `nan` error (`a_onef = 0` when `fit_onef` is off).
+
+`resid_dex_rms` is the RMS of the `log10` data-vs-model residual over the binned points, in **decades** — a weighting-independent goodness-of-fit. `~0.1` is a good fit; `~1` means the model is roughly a decade off across the band (e.g. a flat fit to a sloped spectrum). Prefer it over `reduced_chi2` for flagging bad fits in a sweep, since the default `"uniform"` weighting makes `reduced_chi2` an unreliable quality measure (a flat fit to 1/f data can still show `reduced_chi2 < 1`):
+
+```python
+results = fit_parity_psd(f, psd_2d, f_bw=fs, fit_onef=True)
+for ch, r in enumerate(results):
+    if (not r["success"]) or r["resid_dex_rms"] > 0.5:
+        print(f"tone {ch}: suspect fit (resid={r['resid_dex_rms']:.2f} dex)")
+```
 
 ### Plotting the fit
 
@@ -164,7 +173,7 @@ plt.show()
 
 ### Low-frequency 1/f noise
 
-Real parity time-streams often have a `1/f`-like excess at low frequency (drift, two-level-system noise). Left unmodelled it is absorbed into `Gamma_p`/`F` and biases them badly — the plain two-term fit can even collapse. Set `fit_onef=True` to add a `A / f^alpha` term:
+Real parity time-streams often have a `1/f`-like excess at low frequency (drift, two-level-system noise). Left unmodelled it is absorbed into `Gamma_p`/`F` and biases them badly. If the low-frequency rise is `1/f`-like rather than a genuine parity Lorentzian (common in the electronic I/Q basis), the plain two-term model has **nothing to describe the rise** and collapses to the flat white floor — a horizontal `model` line far below the data at low `f`, with `Gamma_p` running off to a huge value (corner pushed out of band). The cure is to model the rise: set `fit_onef=True` to add a `A / f^alpha` term:
 
 ```
 PSD(f) = F^2 * 4*Gamma_p/((2*Gamma_p)^2 + (2*pi*f)^2) + (1 - F^2)/f_bw + A / f^alpha

@@ -239,7 +239,10 @@ def fit_parity_psd(
     :param drop_dc: Retained for compatibility. The DC bin is always excluded from a
         log-log fit (a log frequency axis requires ``f > 0``), so this has no effect.
     :param fit_onef: When ``True``, add a ``1/f`` term :math:`A / f^{\alpha}` with a
-        free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18).
+        free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18). Enable it for a
+        spectrum whose low-frequency rise is ``1/f``-like (drift / TLS noise) rather
+        than a parity Lorentzian: without it the two-term model has nothing to describe
+        the rise and collapses to the flat white floor.
     :param fit_alpha: When ``True`` (requires *fit_onef*), also fit the ``1/f``
         exponent :math:`\alpha`; otherwise it is held fixed at *alpha*.
     :param alpha: Fixed ``1/f`` exponent when *fit_alpha* is ``False`` (``1.0`` for
@@ -251,6 +254,10 @@ def fit_parity_psd(
         the derived Lorentzian half-power frequency ``f_corner`` (Hz,
         :math:`\Gamma_p/\pi`) / ``f_corner_err``, the fixed ``f_bw``, the fit quality
         (``chi2``, ``ndof``, ``reduced_chi2`` — computed over the log-binned points),
+        ``resid_dex_rms`` (the RMS of the ``log10`` data-vs-model residual over the
+        binned points, in decades — a weighting-independent goodness-of-fit: ``~0.1`` is
+        good, ``~1`` means the model is a decade off across the band, which
+        ``reduced_chi2`` can hide under uniform weighting),
         the fitted ``model`` evaluated at every input *f* (including the dropped DC
         bin), the log-binned points that were actually fit (``f_binned``,
         ``psd_binned``) and the number of non-empty bins (``n_bins``), the underlying
@@ -383,11 +390,23 @@ def fit_parity_psd(
     floor0 = float(np.median(psd_b[hi])) if np.any(hi) else float(np.median(psd_b))
     floor0 = max(floor0, 0.0)
     start["fidelity"] = float(np.sqrt(np.clip(1.0 - floor0 * f_bw, 1e-6, 1.0)))
-    # Low-frequency plateau -> Lorentzian DC value F^2 / gamma_p.
+    # Low-frequency plateau (Lorentzian DC value F^2 / gamma_p, sitting above floor).
     lo = f_b <= max(f_b.min() * 3.0, f_b[min(4, f_b.size - 1)])
     plateau0 = float(np.median(psd_b[lo])) if np.any(lo) else float(psd_b[0])
     lorentz_dc0 = max(plateau0 - floor0, np.finfo(float).tiny)
-    start["gamma_p"] = max(float(start["fidelity"] ** 2 / lorentz_dc0), 1e-3)
+    # Guess gamma_p from the rolloff LOCATION, not the amplitude: the first frequency
+    # where the spectrum falls to the geometric midpoint between the low-f plateau and
+    # the high-f floor is the Lorentzian corner f_c, and gamma_p = pi * f_c. Deriving
+    # gamma_p from the amplitude (F^2 / DC) instead misplaces the corner far outside the
+    # band for a small-amplitude or 1/f-like spectrum, trapping MIGRAD in a flat solution.
+    if plateau0 > floor0 > 0.0:
+        mid_level = np.sqrt(plateau0 * floor0)  # geometric midpoint of the two levels
+        below = np.nonzero(psd_b <= mid_level)[0]
+        f_c0 = float(f_b[below[0]]) if below.size else float(f_b[-1])
+    else:
+        f_c0 = float(np.sqrt(f_b[0] * f_b[-1]))  # mid-band fallback
+    f_c0 = float(np.clip(f_c0, f_b[0], f_b[-1]))
+    start["gamma_p"] = max(np.pi * f_c0, 1e-3)
     if fit_onef:
         # Attribute the excess at the lowest fitted frequency (above the Lorentzian
         # plateau + floor) to the 1/f term: A ~ excess * f_min^alpha.
@@ -425,6 +444,7 @@ def fit_parity_psd(
         "chi2": np.nan,
         "ndof": int(n_binned - n_free),
         "reduced_chi2": np.nan,
+        "resid_dex_rms": np.nan,
         "model": None,
         "f_binned": f_b,
         "psd_binned": psd_b,
@@ -476,6 +496,14 @@ def fit_parity_psd(
     alpha_fit = float(minuit.values["alpha"])
     gamma_p_err = _err("gamma_p", True)
 
+    # Weighting-independent goodness-of-fit: RMS of the log10 data-vs-model residual
+    # over the binned points, in decades. ~0.1 is a good fit; ~1 means the model is
+    # roughly a decade off across the band (e.g. a flat fit to a sloped spectrum),
+    # which reduced_chi2 can hide under uniform weighting. Use it to flag bad fits.
+    model_b = parity_psd_model(f_b, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit)
+    resid = logpsd_b - np.log10(np.maximum(model_b, tiny))
+    resid_dex_rms = float(np.sqrt(np.mean(resid**2)))
+
     fit_results.update(
         fidelity=fidelity,
         fidelity_err=_err("fidelity", True),
@@ -490,6 +518,7 @@ def fit_parity_psd(
         chi2=chi2,
         ndof=ndof,
         reduced_chi2=reduced_chi2,
+        resid_dex_rms=resid_dex_rms,
         model=parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit),
         minuit=minuit,
         success=bool(minuit.valid),
