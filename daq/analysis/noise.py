@@ -110,6 +110,7 @@ def parity_psd_model(
     f_bw: float,
     a_onef: float = 0.0,
     alpha: float = 1.0,
+    amplitude: float = 1.0,
 ) -> npt.NDArray[np.floating]:
     r"""Random-telegraph parity PSD model (Eqn. 18 of arXiv:2601.16261).
 
@@ -119,17 +120,29 @@ def parity_psd_model(
 
     .. math::
 
-        \mathrm{PSD}(f) = F^2\,\frac{4\Gamma_p}{(2\Gamma_p)^2 + (2\pi f)^2}
-                          + (1 - F^2)\,f_\mathrm{bw}^{-1}
+        \mathrm{PSD}(f) = \sigma^2\left[F^2\,\frac{4\Gamma_p}{(2\Gamma_p)^2 + (2\pi f)^2}
+                          + (1 - F^2)\,f_\mathrm{bw}^{-1}\right]
                           + \frac{A}{f^{\alpha}}.
 
     The first term is the Lorentzian of the random-telegraph (parity-switching)
     process; the second is a white noise floor set by the finite readout fidelity
-    and the sampling bandwidth. The optional third term is a ``1/f``-like
+    and the sampling bandwidth. The optional last term is a ``1/f``-like
     low-frequency excess (e.g. drift or two-level-system noise); it is disabled by
     default (``a_onef = 0``), which recovers the two-term form of Eqn. 18. At
     :math:`f = 0` the Lorentzian reduces to the finite value :math:`F^2 / \Gamma_p`
     and the (divergent) ``1/f`` term is set to zero.
+
+    :math:`\sigma^2` (*amplitude*) is the overall signal variance. Eqn. 18 as written
+    assumes a *normalized* parity signal (:math:`\sigma^2 = 1`, i.e. a dimensionless
+    :math:`\pm 1` telegraph), for which the white floor is exactly
+    :math:`(1-F^2)/f_\mathrm{bw}`. For an **un-normalized** time series (e.g. raw
+    electronic I/Q in arbitrary units) the whole parity term scales by the signal
+    variance :math:`\sigma^2`; leaving *amplitude* at ``1`` then makes the floor
+    ``~1/f_bw`` — many orders of magnitude above a real, small-variance PSD — so the
+    fit cannot match both the signal and the floor. Pass the signal variance (or fit
+    it, see :func:`fit_parity_psd`'s *fit_amplitude*) for such data. :math:`F` and
+    :math:`\Gamma_p` are unchanged by :math:`\sigma^2`: the fidelity is set by the
+    Lorentzian-to-floor *ratio* and the rate by the corner, both scale-free.
 
     :param f: Fourier frequency or frequencies in Hz (as returned by
         :func:`compute_psd`).
@@ -141,6 +154,10 @@ def parity_psd_model(
         (units of the time series)²/Hz at ``f = 1 Hz``. ``0`` (default) disables it.
     :param alpha: Exponent :math:`\alpha` of the ``1/f`` term (``1.0`` for pure
         ``1/f``). Only relevant when *a_onef* is non-zero.
+    :param amplitude: Overall signal variance :math:`\sigma^2` scaling the parity
+        (Lorentzian + floor) term. ``1.0`` (default) is the normalized Eqn. 18; pass
+        the signal variance for an un-normalized time series. Does not scale the
+        ``1/f`` term, which carries its own amplitude *a_onef*.
     :returns: The model PSD evaluated at *f*, same shape as *f*, in
         (units of the time series)²/Hz.
     """
@@ -151,7 +168,7 @@ def parity_psd_model(
     with np.errstate(divide="ignore", invalid="ignore"):
         onef = a_onef * np.abs(f) ** (-alpha)
     onef = np.where(np.isfinite(onef), onef, 0.0)
-    return lorentzian + floor + onef
+    return amplitude * (lorentzian + floor) + onef
 
 
 def fit_parity_psd(
@@ -167,14 +184,39 @@ def fit_parity_psd(
     fit_onef: bool = False,
     fit_alpha: bool = False,
     alpha: float = 1.0,
+    fit_amplitude: bool = True,
 ) -> dict:
     r"""Fit a parity-timestream PSD to Eqn. 18 of arXiv:2601.16261.
 
     Fits the output of :func:`compute_psd` to :func:`parity_psd_model` to extract
     the readout fidelity :math:`F` and the characteristic parity-switching rate
     :math:`\Gamma_p`. The sampling bandwidth :math:`f_\mathrm{bw}` is held fixed at
-    *f_bw* (pass the acquisition sample rate, e.g. ``TimeStream.df``); only *F* and
-    :math:`\Gamma_p` are free parameters.
+    *f_bw* (pass the acquisition sample rate, e.g. ``TimeStream.df``).
+
+    By default an overall amplitude :math:`\sigma^2` (the signal variance) is also fit
+    (*fit_amplitude*), which lets the model describe an **un-normalized** spectrum such
+    as raw electronic I/Q. Eqn. 18 as written assumes a normalized :math:`\pm 1` parity
+    signal, so its white floor is locked at :math:`(1-F^2)/f_\mathrm{bw}\approx 1/f_
+    \mathrm{bw}`; on a small-variance PSD that floor is orders of magnitude too high and
+    the fit collapses (:math:`F\to 1`, corner shoved out of band, slope faked by the
+    ``1/f`` term). Fitting :math:`\sigma^2` decouples the level: :math:`F` is then set by
+    the Lorentzian-to-floor *ratio* and :math:`\Gamma_p` by the corner, both scale-free.
+    Set ``fit_amplitude=False`` only when the input is already normalized to unit
+    variance, to recover the strict two-parameter Eqn. 18.
+
+    The fit is performed in **log-log space** — the natural representation of a
+    PSD. A periodogram is linearly spaced in frequency, so roughly all of its
+    points sit in the top decade; a plain least-squares fit in linear units is
+    therefore dominated by high-frequency structure. To avoid this, the spectrum
+    is first averaged onto *n_bins* logarithmically-spaced frequency bins (each
+    bin's frequency is the geometric mean of its members and its PSD the linear
+    mean of the periodogram power, which is unbiased for the underlying spectrum),
+    giving every decade equal representation. The fit then minimizes the residual
+    of :math:`\log_{10}\mathrm{PSD}` against :math:`\log_{10}\text{model}`, so the
+    multi-decade dynamic range is handled and no single frequency region drives
+    the result. The DC (:math:`f = 0`) bin and any non-positive frequency are
+    always excluded (a log axis requires :math:`f > 0`).
+
 
     The fit is performed in **log-log space** — the natural representation of a
     PSD. A periodogram is linearly spaced in frequency, so roughly all of its
@@ -232,18 +274,32 @@ def fit_parity_psd(
     :param drop_dc: Retained for compatibility. The DC bin is always excluded from a
         log-log fit (a log frequency axis requires ``f > 0``), so this has no effect.
     :param fit_onef: When ``True``, add a ``1/f`` term :math:`A / f^{\alpha}` with a
-        free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18).
+        free amplitude :math:`A`. Defaults to ``False`` (pure Eqn. 18). Enable it for a
+        spectrum whose low-frequency rise is ``1/f``-like (drift / TLS noise) rather
+        than a parity Lorentzian: without it the two-term model has nothing to describe
+        the rise and collapses to the flat white floor.
     :param fit_alpha: When ``True`` (requires *fit_onef*), also fit the ``1/f``
         exponent :math:`\alpha`; otherwise it is held fixed at *alpha*.
     :param alpha: Fixed ``1/f`` exponent when *fit_alpha* is ``False`` (``1.0`` for
         pure ``1/f``), or the initial guess for :math:`\alpha` when *fit_alpha* is
         ``True``. Ignored when *fit_onef* is ``False``.
+    :param fit_amplitude: When ``True`` (default), fit an overall amplitude
+        :math:`\sigma^2` (signal variance) scaling the parity (Lorentzian + floor) term,
+        so the model works on un-normalized data (e.g. raw electronic I/Q). Set
+        ``False`` only for a spectrum already normalized to unit variance, to recover
+        the strict two-parameter Eqn. 18 (``amplitude = 1``).
     :returns: For 1-D *psd*, a ``fit_results`` dict with a best-fit value and Hesse
         error for every term — ``fidelity`` / ``fidelity_err``, ``gamma_p`` (Hz) /
-        ``gamma_p_err``, ``a_onef`` / ``a_onef_err``, ``alpha`` / ``alpha_err`` — plus
+        ``gamma_p_err``, ``a_onef`` / ``a_onef_err``, ``alpha`` / ``alpha_err``,
+        ``amplitude`` / ``amplitude_err`` (signal variance :math:`\sigma^2`; ``1`` with
+        ``nan`` error when *fit_amplitude* is ``False``) — plus
         the derived Lorentzian half-power frequency ``f_corner`` (Hz,
         :math:`\Gamma_p/\pi`) / ``f_corner_err``, the fixed ``f_bw``, the fit quality
         (``chi2``, ``ndof``, ``reduced_chi2`` — computed over the log-binned points),
+        ``resid_dex_rms`` (the RMS of the ``log10`` data-vs-model residual over the
+        binned points, in decades — a weighting-independent goodness-of-fit: ``~0.1`` is
+        good, ``~1`` means the model is a decade off across the band, which
+        ``reduced_chi2`` can hide under uniform weighting),
         the fitted ``model`` evaluated at every input *f* (including the dropped DC
         bin), the log-binned points that were actually fit (``f_binned``,
         ``psd_binned``) and the number of non-empty bins (``n_bins``), the underlying
@@ -287,6 +343,7 @@ def fit_parity_psd(
                 fit_onef=fit_onef,
                 fit_alpha=fit_alpha,
                 alpha=alpha,
+                fit_amplitude=fit_amplitude,
             )
             for row in psd
         ]
@@ -304,6 +361,8 @@ def fit_parity_psd(
         free_names.append("a_onef")
     if fit_alpha:
         free_names.append("alpha")
+    if fit_amplitude:
+        free_names.append("amplitude")
     n_free = len(free_names)
 
     # --- Average onto log-spaced frequency bins, then fit in log-log space ---
@@ -360,18 +419,41 @@ def fit_parity_psd(
     logerr_b[~good] = floor_val
     logpsd_b = np.log10(psd_b)
 
-    # --- Initial guess: start from all four parameters, then fix the disabled ones ---
-    start = {"fidelity": 0.9, "gamma_p": 1.0, "a_onef": 0.0, "alpha": alpha}
+    # --- Initial guess: start from all parameters, then fix the disabled ones ---
+    start = {"fidelity": 0.9, "gamma_p": 1.0, "a_onef": 0.0, "alpha": alpha, "amplitude": 1.0}
     # White floor from the top decade of the (binned) spectrum; fidelity from it.
     hi = f_b >= 0.1 * f_b.max()
     floor0 = float(np.median(psd_b[hi])) if np.any(hi) else float(np.median(psd_b))
     floor0 = max(floor0, 0.0)
     start["fidelity"] = float(np.sqrt(np.clip(1.0 - floor0 * f_bw, 1e-6, 1.0)))
-    # Low-frequency plateau -> Lorentzian DC value F^2 / gamma_p.
+    # Low-frequency plateau (Lorentzian DC value F^2 / gamma_p, sitting above floor).
     lo = f_b <= max(f_b.min() * 3.0, f_b[min(4, f_b.size - 1)])
     plateau0 = float(np.median(psd_b[lo])) if np.any(lo) else float(psd_b[0])
     lorentz_dc0 = max(plateau0 - floor0, np.finfo(float).tiny)
-    start["gamma_p"] = max(float(start["fidelity"] ** 2 / lorentz_dc0), 1e-3)
+    # Guess gamma_p from the rolloff LOCATION, not the amplitude: the first frequency
+    # where the spectrum falls to the geometric midpoint between the low-f plateau and
+    # the high-f floor is the Lorentzian corner f_c, and gamma_p = pi * f_c. Deriving
+    # gamma_p from the amplitude (F^2 / DC) instead misplaces the corner far outside the
+    # band for a small-amplitude or 1/f-like spectrum, trapping MIGRAD in a flat solution.
+    if plateau0 > floor0 > 0.0:
+        mid_level = np.sqrt(plateau0 * floor0)  # geometric midpoint of the two levels
+        below = np.nonzero(psd_b <= mid_level)[0]
+        f_c0 = float(f_b[below[0]]) if below.size else float(f_b[-1])
+    else:
+        f_c0 = float(np.sqrt(f_b[0] * f_b[-1]))  # mid-band fallback
+    f_c0 = float(np.clip(f_c0, f_b[0], f_b[-1]))
+    start["gamma_p"] = max(np.pi * f_c0, 1e-3)
+    if fit_amplitude:
+        # Free overall amplitude sigma^2: F is set by the Lorentzian:floor RATIO and
+        # sigma^2 absorbs the normalization. From the plateau and floor levels,
+        #   plateau - floor = amp * F^2 / gamma_p  and  floor = amp * (1 - F^2) / f_bw,
+        # so amp = (plateau - floor) * gamma_p + floor * f_bw and F^2 = amp*F^2 / amp.
+        amp_f2 = lorentz_dc0 * start["gamma_p"]  # amp * F^2
+        amp_1mf2 = floor0 * f_bw  # amp * (1 - F^2)
+        amp0 = amp_f2 + amp_1mf2
+        if amp0 > 0.0:
+            start["amplitude"] = amp0
+            start["fidelity"] = float(np.sqrt(np.clip(amp_f2 / amp0, 1e-6, 1.0)))
     if fit_onef:
         # Attribute the excess at the lowest fitted frequency (above the Lorentzian
         # plateau + floor) to the 1/f term: A ~ excess * f_min^alpha.
@@ -389,9 +471,11 @@ def fit_parity_psd(
 
     tiny = float(np.finfo(np.float64).tiny)
 
-    # Full four-parameter model in log10 space; disabled terms are frozen below.
-    def _model_log(x, fidelity, gamma_p, a_onef, alpha):
-        y = parity_psd_model(x, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha)
+    # Full five-parameter model in log10 space; disabled terms are frozen below.
+    def _model_log(x, fidelity, gamma_p, a_onef, alpha, amplitude):
+        y = parity_psd_model(
+            x, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha, amplitude=amplitude
+        )
         return np.log10(np.maximum(y, tiny))
 
     fit_results = {
@@ -405,10 +489,13 @@ def fit_parity_psd(
         "a_onef_err": np.nan,
         "alpha": alpha,
         "alpha_err": np.nan,
+        "amplitude": np.nan if fit_amplitude else 1.0,
+        "amplitude_err": np.nan,
         "f_bw": float(f_bw),
         "chi2": np.nan,
         "ndof": int(n_binned - n_free),
         "reduced_chi2": np.nan,
+        "resid_dex_rms": np.nan,
         "model": None,
         "f_binned": f_b,
         "psd_binned": psd_b,
@@ -425,17 +512,22 @@ def fit_parity_psd(
             gamma_p=start["gamma_p"],
             a_onef=start["a_onef"],
             alpha=start["alpha"],
+            amplitude=start["amplitude"],
         )
         minuit.limits["fidelity"] = (0.0, 1.0)
         minuit.limits["gamma_p"] = (0.0, None)
         minuit.limits["a_onef"] = (0.0, None)
         minuit.limits["alpha"] = (0.0, None)
+        minuit.limits["amplitude"] = (0.0, None)
         if not fit_onef:
             minuit.values["a_onef"] = 0.0
             minuit.fixed["a_onef"] = True
         if not fit_alpha:
             minuit.values["alpha"] = alpha
             minuit.fixed["alpha"] = True
+        if not fit_amplitude:
+            minuit.values["amplitude"] = 1.0
+            minuit.fixed["amplitude"] = True
         minuit.migrad()
         minuit.hesse()
     except (RuntimeError, ValueError):
@@ -458,7 +550,18 @@ def fit_parity_psd(
     gamma_p = float(minuit.values["gamma_p"])
     a_onef = float(minuit.values["a_onef"])
     alpha_fit = float(minuit.values["alpha"])
+    amplitude = float(minuit.values["amplitude"])
     gamma_p_err = _err("gamma_p", True)
+
+    # Weighting-independent goodness-of-fit: RMS of the log10 data-vs-model residual
+    # over the binned points, in decades. ~0.1 is a good fit; ~1 means the model is
+    # roughly a decade off across the band (e.g. a flat fit to a sloped spectrum),
+    # which reduced_chi2 can hide under uniform weighting. Use it to flag bad fits.
+    model_b = parity_psd_model(
+        f_b, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit, amplitude=amplitude
+    )
+    resid = logpsd_b - np.log10(np.maximum(model_b, tiny))
+    resid_dex_rms = float(np.sqrt(np.mean(resid**2)))
 
     fit_results.update(
         fidelity=fidelity,
@@ -471,10 +574,15 @@ def fit_parity_psd(
         a_onef_err=_err("a_onef", fit_onef),
         alpha=alpha_fit,
         alpha_err=_err("alpha", fit_alpha),
+        amplitude=amplitude,
+        amplitude_err=_err("amplitude", fit_amplitude),
         chi2=chi2,
         ndof=ndof,
         reduced_chi2=reduced_chi2,
-        model=parity_psd_model(f, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit),
+        resid_dex_rms=resid_dex_rms,
+        model=parity_psd_model(
+            f, fidelity, gamma_p, f_bw, a_onef=a_onef, alpha=alpha_fit, amplitude=amplitude
+        ),
         minuit=minuit,
         success=bool(minuit.valid),
     )
