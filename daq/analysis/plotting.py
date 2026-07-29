@@ -402,3 +402,79 @@ def plot_iq_comparison(
         plt.show()
 
     return ax
+
+
+def plot_qc_trace(
+    time_ms: npt.ArrayLike,
+    avg_iq: npt.ArrayLike,
+    raw: Optional[npt.ArrayLike] = None,
+    *,
+    ax: Optional[Tuple["matplotlib.axes.Axes", "matplotlib.axes.Axes"]] = None,
+    tone: int = 0,
+    title: str = "QC trace (block-averaged)",
+    savefig: Optional[str] = None,
+    show: bool = False,
+) -> Tuple["matplotlib.axes.Axes", "matplotlib.axes.Axes"]:
+    """Plot a block-averaged QC trace: I and Q against time over one drive period.
+
+    Takes the output of :func:`~daq.analysis.folding.fold_timestream`. Passing the unfolded
+    time stream as *raw* overlays a single un-averaged period on the same panels, which shows
+    directly how much the averaging bought.
+
+    :param time_ms: Time axis of one drive period in milliseconds.
+    :param avg_iq: Block-averaged trace of shape ``(2, n_samples)``; row 0 is I, row 1 is Q.
+    :param raw: Optional unfolded time stream or complex array to overlay. It is aligned from
+        the start and truncated to the length of one period.
+    :param ax: Existing ``(ax_i, ax_q)`` pair to draw into. A new figure is created when
+        ``None``.
+    :param tone: Which tone to take from *raw*, for a multi-tone time stream.
+    :param title: Figure title.
+    :param savefig: Optional path to save the figure to.
+    :param show: Whether to call ``plt.show()``.
+    :raises ValueError: If *avg_iq* does not have two rows.
+    :returns: The ``(ax_i, ax_q)`` pair that was drawn into.
+
+    """
+    import matplotlib.pyplot as plt
+
+    from .folding import _as_complex
+
+    time_ms = np.asarray(time_ms)
+    avg_iq = np.asarray(avg_iq)
+    if avg_iq.ndim != 2 or avg_iq.shape[0] != 2:
+        raise ValueError(f"avg_iq must have shape (2, n_samples), got {avg_iq.shape}")
+
+    if ax is None:
+        _, axes = plt.subplots(2, 1, sharex=True, figsize=(8, 6), tight_layout=True)
+        ax_i, ax_q = axes
+    else:
+        ax_i, ax_q = ax
+
+    if raw is not None:
+        # Draw the raw trace first so the averaged curve stays readable on top of it.
+        z = _as_complex(raw, tone=tone)
+        n = min(len(time_ms), avg_iq.shape[1], len(z))
+        ax_i.plot(time_ms[:n], z.real[:n], color="tab:gray", alpha=0.6, lw=0.7, label="raw")
+        ax_q.plot(time_ms[:n], z.imag[:n], color="tab:gray", alpha=0.6, lw=0.7, label="raw")
+
+    ax_i.plot(time_ms, avg_iq[0], color="tab:blue", label="block-averaged")
+    ax_i.set_ylabel("I [FS]")
+    ax_i.grid(True, alpha=0.3)
+
+    ax_q.plot(time_ms, avg_iq[1], color="tab:red", label="block-averaged")
+    ax_q.set_ylabel("Q [FS]")
+    ax_q.set_xlabel("Time [ms]")
+    ax_q.grid(True, alpha=0.3)
+
+    if raw is not None:
+        ax_i.legend(loc="best", fontsize=8)
+        ax_q.legend(loc="best", fontsize=8)
+
+    ax_i.get_figure().suptitle(title)
+
+    if savefig is not None:
+        ax_i.get_figure().savefig(savefig, bbox_inches="tight")
+    if show:
+        plt.show()
+
+    return ax_i, ax_q

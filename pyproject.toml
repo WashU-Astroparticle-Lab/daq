@@ -22,6 +22,12 @@ python = ">=3.11"
 numpy = "*"
 pymongo = "*"
 scipy = "*"
+# Only needed to talk to VISA benchtop instruments (daq.instruments); the analysis-side
+# installs have no VISA runtime, so daq.instruments imports it lazily.
+pyvisa = {version = "*", optional = true}
+
+[tool.poetry.extras]
+instruments = ["pyvisa"]
 
 [build-system]
 requires = ["poetry-core>=1.0.8", "setuptools>=61.0"]
