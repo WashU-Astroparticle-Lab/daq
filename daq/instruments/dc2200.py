@@ -154,7 +154,7 @@ class DC2200(VisaInstrument):
         self.write(f"SOURCE1:CCURENT:CURRENT {current_a}")
         self.output = output
 
-    def configure_ttl(self, current_a: float, *, output: bool = True) -> None:
+    def configure_ttl(self, current_a: float, *, output: bool = False) -> None:
         """Configure TTL modulation: the LED follows the rear-panel modulation input.
 
         In this mode the LED drives at *current_a* while the SMA modulation input on the rear
@@ -164,9 +164,17 @@ class DC2200(VisaInstrument):
 
         The input accepts 0-5 V at up to 250 kHz.
 
+        Configuring the mode does **not** arm the LED. Enabling the output (``output=True``
+        here, or ``led.output = True`` later) arms the output stage, after which the LED
+        follows the modulation input. Whether it illuminates the instant you arm it therefore
+        depends on the level the trigger line happens to be sitting at, so arm immediately
+        before the acquisition rather than during setup -- ``TimeStream.run()`` spends a
+        while connecting, configuring and tuning before it acquires, and an armed LED would
+        be lit for all of it if the line idles high.
+
         :param current_a: Current applied while the modulation input is high, in amperes.
-        :param output: Whether to enable the output afterwards. Defaults to ``True``, since
-            in this mode the output being enabled is what arms the LED for the trigger.
+        :param output: Whether to arm the output afterwards. Defaults to ``False`` so that
+            configuring never illuminates the LED as a side effect.
         :raises ValueError: If *current_a* exceeds the instrument's current limit.
         :raises InstrumentError: If the instrument rejects every candidate current header,
             in which case check the SCPI section of the DC2200 manual for your firmware.

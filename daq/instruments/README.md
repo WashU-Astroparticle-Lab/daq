@@ -163,7 +163,7 @@ from daq import DC2200, TimeStream
 TIME_TOTAL_S, FS = 1.0, 5e4
 
 with DC2200() as led:
-    led.configure_ttl(current_a=0.01)      # LED current while the trigger is high
+    led.configure_ttl(current_a=0.01)      # sets the mode + current; LED NOT armed yet
 
     ts = TimeStream(
         lo_freq=fr, if_freqs=[0], df=FS,
@@ -174,11 +174,31 @@ with DC2200() as led:
         external_trigger=True,             # Presto gates the LED
         discard_start_ms=0,                # keep the pulse -- see the warning above
     )
+
+    led.output = True                      # arm: from here the LED follows the trigger
     ts.attach(led=led)                     # led_mode, led_ttl_current_a, ... -> HDF5 + MongoDB
     ts.run()
 
 ts.analyze()                               # the pulse sits in the first 30 ms
 ```
+
+**Configuring is not arming.** `configure_ttl()` only selects the mode and the current — it
+leaves the output disabled, so it cannot illuminate the LED as a side effect. Enabling the
+output (`led.output = True`) arms the output stage, and only from that point does the LED
+follow the modulation input. Pass `configure_ttl(..., output=True)` to do both at once if you
+want, but the two-step form above is what the recipe uses deliberately:
+
+> **Arm as late as possible.** `TimeStream.run()` connects to the Presto, configures the mixer
+> and tunes before it acquires anything, which takes appreciably longer than the 30 ms pulse
+> you are trying to record. If the trigger line idles high, everything armed before that point
+> sits illuminated for the whole setup — shining on the detector with no data being taken.
+> Arming immediately before `run()` keeps that window as short as the API allows.
+>
+> The idle level of the Presto trigger output between acquisitions is **not something this
+> library controls, and we have not measured it.** `run()` drives it low at the end of a
+> triggered acquisition, so it should idle low once a triggered run has happened, but after a
+> fresh Presto boot it is unverified. Check it on a scope before trusting a long armed window,
+> and if it idles high, keep the LED disarmed until the last moment (as above).
 
 On exit the LED is switched off even if the acquisition raises.
 
@@ -189,7 +209,7 @@ per acquisition, and each is saved and logged as usual:
 
 ```python
 with DC2200() as led:
-    led.configure_ttl(current_a=0.01)
+    led.configure_ttl(current_a=0.01, output=True)   # arm once, fire once per run()
     streams = []
     for i in range(50):
         ts = TimeStream(..., external_trigger=True, discard_start_ms=0,
@@ -271,6 +291,7 @@ with DC2200() as led, Agilent33220A() as bias:
     led.configure_ttl(current_a=0.01)
     bias.constant(0.98)
     ts = TimeStream(..., external_trigger=True, discard_start_ms=0)
+    led.output = True                      # arm last, immediately before run()
     ts.attach(led=led, bias=bias)
     ts.run()
 ```
