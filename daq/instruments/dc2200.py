@@ -243,14 +243,34 @@ class DC2200(VisaInstrument):
     ) -> None:
         """Configure and emit one PWM pulse train, blocking until it has finished.
 
-        The output is turned off afterwards, including if the wait is interrupted.
+        Loads the PWM settings, enables the output, sleeps for the train's own duration
+        (``count / freq_hz``) plus *settle_s*, then disables the output again. The DC2200's
+        PWM engine generates the pulses and stops itself after *count* of them, so pulse
+        timing is instrument-accurate; only the moment the train *starts* is software-timed,
+        set by a USB write, with millisecond-scale jitter.
 
-        :param current_a: Peak drive current in amperes.
-        :param freq_hz: Pulse repetition frequency in hertz.
-        :param duty_pct: Duty cycle in percent.
-        :param count: Number of pulses to emit.
-        :param settle_s: Extra delay added to the computed train duration before switching
-            the output off.
+        For example ``pulse_train(current_a=0.01, freq_hz=100, duty_pct=50, count=10)`` emits
+        ten 10 ms periods -- 5 ms on at 10 mA, 5 ms off -- so a 100 ms train carrying 50 ms of
+        total LED-on time, and the call blocks for 0.6 s (0.1 s of train plus the 0.5 s
+        settle margin).
+
+        **This is not synchronised with anything.** Because the start is software-timed, it
+        cannot be placed reliably within a :class:`~daq.measurements.timestream.TimeStream`
+        acquisition. To pulse the LED at a known point in a time stream, use
+        :meth:`configure_ttl` and gate it from the Presto trigger output instead.
+
+        The output is turned off in a ``finally``, so it is disabled even if the wait is
+        interrupted. The instrument is left in PWM mode with these settings, so a subsequent
+        :meth:`settings` call (or :meth:`daq._base.Base.attach`) reports them.
+
+        :param current_a: Peak drive current in amperes, applied during the on-phase of each
+            pulse.
+        :param freq_hz: Pulse repetition frequency in hertz; each period lasts ``1 / freq_hz``.
+        :param duty_pct: Duty cycle in percent -- the fraction of each period the LED is on.
+        :param count: Number of pulses to emit. The instrument stops after this many; very
+            large counts are firmware-limited (100000 on firmware 1.3.0 and later).
+        :param settle_s: Extra delay added to the computed train duration before switching the
+            output off, so a slightly slow instrument is not cut off mid-train.
         :raises ValueError: If any parameter is out of range.
 
         """

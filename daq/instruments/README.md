@@ -208,13 +208,59 @@ records.
 
 ### Free-running pulse trains
 
-If you do not need the pulse tied to an acquisition, `pulse_train()` runs the DC2200's own
-PWM burst and blocks until it finishes, with no trigger involved:
+If you do not need the pulse tied to an acquisition, `pulse_train()` runs the DC2200's own PWM
+burst and blocks until it finishes, with no trigger involved:
 
 ```python
 with DC2200() as led:
     led.pulse_train(current_a=0.01, freq_hz=100, duty_pct=50, count=10)
 ```
+
+**What that call does, exactly.** The four arguments describe the pulse train:
+
+| Argument | Value | Meaning |
+|---|---|---|
+| `current_a` | 0.01 | Drive the LED at 10 mA during the on-phase of each pulse |
+| `freq_hz` | 100 | Repeat every 1/100 s = **10 ms** |
+| `duty_pct` | 50 | The LED is on for 50 % of each period = **5 ms on, 5 ms off** |
+| `count` | 10 | Emit **10 pulses**, then stop |
+
+So the train is 10 × 10 ms = **100 ms long** and carries 10 × 5 ms = **50 ms of total LED-on
+time**:
+
+```
+10 mA ┐  ┌─┐  ┌─┐  ┌─┐          ... 10 pulses ...
+      │  │ │  │ │  │ │
+   0 ─┴──┘ └──┘ └──┘ └──                        ──────────
+      |<5ms>|                                   ^ train ends after 100 ms
+      |<--10 ms-->|
+```
+
+Step by step, the method:
+
+1. Writes the PWM settings — `SOURCE1:MODE PWM`, then `PWM:CURRENT 0.01`, `PWM:FREQ 100`,
+   `PWM:DCYCLE 50`, `PWM:COUNT 10` — and explicitly writes `OUTPUT1:STATE OFF`, so the train
+   cannot start part-way through configuration.
+2. Enables the output (`OUTPUT1:STATE ON`), which starts the train.
+3. Sleeps `count / freq_hz + settle_s` = 0.1 s + 0.5 s = **0.6 s**, so the Python call blocks
+   for 0.6 s even though the train itself lasts 100 ms. The extra `settle_s` margin means a
+   slightly slow instrument is not cut off mid-train.
+4. Disables the output in a `finally`, so the LED is off even if the wait is interrupted.
+
+The DC2200's own PWM engine generates the pulses and stops itself after `count` of them, so
+the *pulse* timing is instrument-accurate. Only the moment the train **starts** is
+software-timed — a USB write, with millisecond-scale jitter.
+
+> **This is not synchronised with anything.** Because the start is software-timed, the train
+> cannot be placed reliably inside a `TimeStream` acquisition. To pulse the LED at a known
+> point in a time stream, use `configure_ttl()` and gate it from the Presto trigger, as above.
+
+Afterwards the instrument is left in PWM mode with these settings and the output off, so
+`settings()` — and therefore `attach()` — reports `led_pwm_current_a`, `led_pwm_freq_hz`,
+`led_pwm_duty_pct` and `led_pwm_count`.
+
+`count` must be a whole number. Very large values are firmware-limited (100000 on firmware
+1.3.0 and later).
 
 ### Both instruments at once
 
