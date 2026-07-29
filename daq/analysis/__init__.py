@@ -22,7 +22,8 @@ from .mattis_bardeen import (
     S_2,
     MB_fitter,
 )
-from .plotting import plot_iq_comparison
+from .folding import fold_timestream
+from .plotting import plot_iq_comparison, plot_qc_trace
 
 __all__ = [
     "averaged_psd_cleaned",
@@ -30,10 +31,12 @@ __all__ = [
     "clean_correlated_streams",
     "compute_psd",
     "fit_parity_psd",
+    "fold_timestream",
     "from_elec_to_reson",
     "parity_psd_model",
     "remove_correlated_noise",
     "plot_iq_comparison",
+    "plot_qc_trace",
     "signed_log10",
     "n_qp",
     "f_T",

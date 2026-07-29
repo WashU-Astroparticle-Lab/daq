@@ -43,6 +43,9 @@ Runtime settings are loaded from environment variables (see `daq/config.py`):
 | `DAQ_MONGODB_URI` | `mongodb://localhost:27017` |
 | `DAQ_MONGODB_DB_NAME` | `WashU_Astroparticle_Detector` |
 | `DAQ_MONGODB_COLLECTION_NAME` | `measurement` |
+| `DAQ_FGEN_RESOURCE` | `None` (autodiscover) |
+| `DAQ_LED_RESOURCE` | `None` (autodiscover) |
+| `DAQ_VISA_BACKEND` | `""` (system NI-VISA) |
 
 Settings are cached after first access via `get_settings()`. Call `reload_settings()` to pick up environment changes.
 
@@ -61,6 +64,18 @@ All measurement classes inherit from `Base` (`daq/_base.py`). Each runs a hardwa
 ### Base Class (`daq/_base.py`)
 
 Provides `_save()` (writes HDF5 + inserts MongoDB document) and `_build_document()`. Defines hardware constants: `DAC_CURRENT = 40_500` μA, `ADC_ATTENUATION = 0` dB.
+
+`attach(**instruments)` records auxiliary instrument state on a measurement: each instrument's read-back `settings()` mapping is flattened onto the object as `<prefix>_<key>` scalar attributes, which `_save()`/`_build_document()` then pick up for free (no per-instrument code in `_base.py`). Call it before `run()` so bias voltages and LED parameters land in HDF5 and MongoDB — and become `select_runs()`-queryable — instead of surviving only inside a `notes` string. Accepts anything with a `settings()` method, or a plain dict; `None` values are skipped since they have no HDF5 representation.
+
+### Instruments (`daq/instruments/`)
+
+Drivers for non-Presto benchtop hardware reached over VISA/SCPI. These are **instruments, not measurements** — they produce no data arrays and do not subclass `Base`; you compose them with the ordinary measurement classes in a notebook and record their state via `Base.attach()`. Deliberately no per-experiment measurement classes: improvised combinations stay in user code.
+
+- **`VisaInstrument`** (`_visa.py`) — shared base. Lazy `pyvisa` import (so `import daq` works with no VISA runtime); resource resolution by explicit argument → env var → autodiscovery filtered on `*IDN?`, **raising** on zero or multiple matches rather than taking `list_resources()[0]`; every write bracketed by a `SYST:ERR?` drain and check that raises `InstrumentError`; context manager whose `__exit__` always forces `safe_state()`; optional `transcript_path` SCPI log. Subclasses set `IDN_KEYWORDS`/`RESOURCE_HINTS`, override `env_resource()` and `safe_state()`, and extend `settings()`.
+- **`Agilent33220A`** (`function_generator.py`) — gate-bias source. `constant(offset_v)` for DC; `sawtooth(vpp, freq_hz, ...)` for a ramp, gated on the Presto trigger by default (pair with `TimeStream(external_trigger=True)`), with `offset_v` defaulting to `vpp/2` (unipolar-positive). Both setters are **hermetic** — each writes the full state its mode depends on, and `constant()` disables burst *before* selecting the DC carrier, since the 33220A rejects that combination. `samples_for_periods(n_periods, sample_rate)` returns the `pixel_counts` spanning whole ramp periods plus the `TimeStream` discard window, keeping generator and acquisition in step. Amplitudes below the instrument minimum (20 mVpp into high-Z, 10 mVpp into 50 Ω) raise.
+- **`DC2200`** (`dc2200.py`) — Thorlabs LED driver. `configure_cc()`, `configure_pwm()`, `pulse_train()` (configure → on → wait → off, off guaranteed), `measured_current`. Currents are validated against the instrument's own queried `SOURCE1:CURRENT:LIMIT?`. Preserves the two required Thorlabs spellings: `SOURCE1:CCURENT:CURRENT` (their misspelling) and `SOURCE1:PWM:FREQ` (the long form `FREQUENCY` is rejected).
+
+Setup, SCPI gotchas and troubleshooting are in `daq/instruments/README.md`. `pyvisa` is an optional extra (`pip install daq[instruments]`).
 
 ### Database (`daq/db/database.py`)
 
@@ -90,6 +105,8 @@ Power calibration module. Translates between DAC full-scale amplitude (`amp`) an
 - **`clean_correlated_streams`** (`noise.py`) — Batch wrapper that applies `remove_correlated_noise` across a list of `TimeStream` acquisitions (e.g. the `streams` from `averaged_psd_timestream`) whose tones are interleaved as `[signal, reference, ...]`. Defaults to pairing even-indexed signal tones with odd-indexed reference tones (override via `signal_indices`/`reference_indices`), and returns only the cleaned signal tones as `(cleaned, freqs)` with `cleaned` shape `(n_streams, n_samples, n_signal_tones)`.
 - **`averaged_psd_cleaned`** (`noise.py`) — PSD stage following `clean_correlated_streams`: takes its `cleaned` array and returns per-signal-tone PSDs averaged across acquisitions (running mean) as `(f, psd_a, psd_b)`. Mirrors `averaged_psd_timestream` — pass one `Sweep` per signal tone for resonator-basis dissipation/frequency PSDs, else raw I/Q.
 - **`plot_iq_comparison`** (`plotting.py`) — Overlays a `TimeStream` I/Q cloud on the smooth fitted resonator sweep circle in the complex plane. Re-fits the `Sweep` internally (via `resonator_tools`) so the smooth `z_data_sim` trace and the calibration parameters (`environmental_term`, `phi0`, `fr`) come from one self-consistent fit, then projects the time stream, sweep trace, and optional QC-trace points into a common `basis` (`"electronic"`/`"fractional"`/`"resonator"`). Renders the cloud via `density` (`"scatter"`/`"kde"`/`"contour"`/`"hexbin"`/`"hist2d"`; `"contour"` gives fast histogram-based 1σ/2σ rings, ~5× faster than the KDE path on large clouds), marks `fr` and `fr ± freq_shift`, colours the sweep trace by detuning, and returns the matplotlib axis. `device`/`power_dbm` feed the auto-title (replacing the previously hardcoded globals).
+- **`fold_timestream`** (`folding.py`) — block-average a periodically-driven time stream into a single drive period (the sawtooth-biased "QC trace"): the bias ramp repeats at a fixed rate while the stream records continuously, so averaging in blocks of one period beats uncorrelated noise down by `sqrt(n_periods)`. Accepts a `TimeStream` (uses `signal`, already trimmed by `discard_start_ms`) or a raw complex array; specify the period either as `period_s` or as `n_periods` (exactly one). Leftover samples after the last whole period are dropped. Returns `(time_ms, avg_iq)` with `avg_iq` shape `(2, n_samples)` holding averaged I and Q.
+- **`plot_qc_trace`** (`plotting.py`) — plot the `fold_timestream` output as I and Q versus time over one drive period, optionally overlaying the unfolded stream via `raw=` to show what the averaging bought.
 - **`MB_fitter`** (`mattis_bardeen.py`) — Mattis-Bardeen superconductor theory fit for temperature-dependent resonant frequency and internal quality factor using `iminuit`.
 - Helper functions: `n_qp`, `f_T`, `Qi_T`, `kappa_1`, `kappa_2`, `S_1`, `S_2`, `signed_log10`.
 
@@ -101,6 +118,7 @@ When adding or modifying measurement classes or analysis modules, update the cor
 
 - **Measurement classes** — Document new classes in the Architecture > Measurement Classes section of this file.
 - **Analysis tools** — Add usage examples to `daq/analysis/README.md` and update the Architecture > Analysis section of this file.
+- **Instrument drivers** — Add usage and SCPI gotchas to `daq/instruments/README.md` and update the Architecture > Instruments section of this file.
 
 ## Style Conventions
 

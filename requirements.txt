@@ -3,3 +3,7 @@ h5py
 matplotlib
 pymongo
 pandas
+# Benchtop instrument control (daq.instruments). Needs a VISA runtime on the acquisition
+# machine -- NI-VISA on Windows -- and is imported lazily, so analysis-only installs can
+# leave it out.
+pyvisa

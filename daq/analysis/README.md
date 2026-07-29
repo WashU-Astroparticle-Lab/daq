@@ -8,6 +8,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Parity PSD fit (random-telegraph model)](#parity-psd-fit-random-telegraph-model)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
+- [Folding a periodically-driven time stream (QC trace)](#folding-a-periodically-driven-time-stream-qc-trace)
 - [I/Q Comparison Plot](#iq-comparison-plot)
 - [Correlated Noise Removal](#correlated-noise-removal)
   - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
@@ -345,6 +346,61 @@ fs = ts.df  # sampling rate (Hz)
 f, psd_rad = compute_psd(rad, fs)
 f, psd_arc = compute_psd(arc, fs)
 ```
+
+---
+
+## Folding a periodically-driven time stream (QC trace)
+
+When the gate bias is swept with a repeating sawtooth while the time stream records
+continuously, `fold_timestream` block-averages the record into a single ramp period. The
+uncorrelated noise falls by `sqrt(n_periods)` and what remains is the device's response to one
+sweep of the gate voltage — the "QC trace".
+
+The acquisition has to span a whole number of ramp periods. `Agilent33220A.samples_for_periods`
+computes that `pixel_counts` for you, including the samples `TimeStream` discards at the start:
+
+```python
+from daq import Agilent33220A, TimeStream
+from daq.analysis import fold_timestream, plot_qc_trace
+
+RAMP_HZ, FS, N_PERIODS = 500, 5e4, 200
+
+with Agilent33220A() as bias:
+    bias.sawtooth(vpp=2.0, freq_hz=RAMP_HZ)       # gated on the Presto trigger
+    qc = TimeStream(
+        lo_freq=fr, if_freqs=[0], df=FS,
+        pixel_counts=bias.samples_for_periods(N_PERIODS, FS),
+        amp=amp, output_port=1, input_port=1,
+        device="my_device", external_trigger=True,
+    )
+    qc.attach(bias=bias)
+    qc.run()
+
+time_ms, avg_iq = fold_timestream(qc, FS, n_periods=N_PERIODS)
+# avg_iq.shape == (2, FS / RAMP_HZ);  row 0 = I, row 1 = Q
+plot_qc_trace(time_ms, avg_iq, raw=qc, show=True)
+```
+
+`qc.signal` is already trimmed of start-up junk by `TimeStream` (`discard_start_ms`), so it can
+be passed straight in. Pass the same value as `discard_ms` to `samples_for_periods` if you
+changed it from the default.
+
+Give the period either way — these are equivalent:
+
+```python
+time_ms, avg_iq = fold_timestream(qc, FS, n_periods=200)
+time_ms, avg_iq = fold_timestream(qc, FS, period_s=1 / 500)
+```
+
+Samples left over after the last whole period are dropped. For a multi-tone stream, choose the
+tone with `tone=`. A raw complex array works in place of the `TimeStream`:
+
+```python
+time_ms, avg_iq = fold_timestream(qc.signal[:, 0], FS, n_periods=200)
+```
+
+Passing `raw=` to `plot_qc_trace` overlays one un-averaged period in grey behind the averaged
+curve, which shows directly how much the averaging bought.
 
 ---
 
