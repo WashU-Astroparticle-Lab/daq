@@ -182,6 +182,25 @@ with DC2200() as led:
 ts.analyze()                               # the pulse sits in the first 30 ms
 ```
 
+**When does the LED actually light?** Not on any of the first four lines — it lights inside
+`run()`:
+
+| Line | Hardware effect | LED |
+|---|---|---|
+| `led.configure_ttl(current_a=0.01)` | `SOURCE1:MODE TTL` + current; output left off | dark, guaranteed |
+| `ts = TimeStream(...)` | none — pure Python object construction | dark |
+| `led.output = True` | `OUTPUT1:STATE ON`, arming the output stage | dark *if the trigger idles low*; from here it tracks the trigger line |
+| `ts.attach(led=led)` | VISA queries only, reading state back | unchanged |
+| `ts.run()` | connect → configure mixer → tune → `set_trigger_out([1], width=0.03)` → **`apply_settings()`** → `get_pixels()` | **lights here**, for 30 ms |
+
+`set_trigger_out()` only *stages* the trigger; `apply_settings()` is what asserts the line, and
+it runs immediately before `get_pixels()` starts acquiring. The readout tone's amplitude is
+applied by that same call, so the LED and the RF drive come up together. With
+`discard_start_ms=0` the pulse therefore lands in the first 30 ms of the saved record.
+
+The one way to light the LED earlier is the idle-level caveat below: if the trigger line sits
+high between acquisitions, the LED comes on at `led.output = True` and stays on.
+
 **Configuring is not arming.** `configure_ttl()` only selects the mode and the current — it
 leaves the output disabled, so it cannot illuminate the LED as a side effect. Enabling the
 output (`led.output = True`) arms the output stage, and only from that point does the LED
