@@ -7,7 +7,7 @@ import time
 from typing import Any, Dict, Optional
 
 from ..config import get_led_resource
-from ._visa import VisaInstrument
+from ._visa import InstrumentError, VisaInstrument
 
 
 class DC2200(VisaInstrument):
@@ -39,6 +39,17 @@ class DC2200(VisaInstrument):
     RESOURCE_HINTS = ("0x1313::0x80C8",)
     ENV_VAR = "DAQ_LED_RESOURCE"
 
+    TTL_CURRENT_HEADERS = ("SOURCE1:TTL:CURRENT", "SOURCE1:CCURENT:CURRENT")
+    """Candidate headers for the TTL-mode drive current, tried in order.
+
+    Thorlabs documents TTL mode as having exactly one settable parameter -- the current
+    applied while the modulation input is high -- but does not publish the SCPI header for it.
+    :meth:`configure_ttl` tries these against the instrument and keeps whichever it accepts,
+    rather than hardcoding a guess. Rejected headers raise ``-113 Undefined header``, so this
+    resolves deterministically on the first call and cannot silently drive the wrong value.
+
+    """
+
     def __init__(
         self,
         resource: Optional[str] = None,
@@ -48,6 +59,7 @@ class DC2200(VisaInstrument):
         transcript_path: Optional[str] = None,
     ) -> None:
         self._current_limit: Optional[float] = None
+        self._ttl_current_header: Optional[str] = None
         super().__init__(
             resource,
             timeout_ms=timeout_ms,
@@ -142,6 +154,49 @@ class DC2200(VisaInstrument):
         self.write(f"SOURCE1:CCURENT:CURRENT {current_a}")
         self.output = output
 
+    def configure_ttl(self, current_a: float, *, output: bool = True) -> None:
+        """Configure TTL modulation: the LED follows the rear-panel modulation input.
+
+        In this mode the LED drives at *current_a* while the SMA modulation input on the rear
+        panel is high, and is off while it is low. Driving that input from the Presto's
+        trigger output is how an LED pulse is synchronised to an acquisition -- see
+        ``daq/instruments/README.md`` for the wiring and the timing.
+
+        The input accepts 0-5 V at up to 250 kHz.
+
+        :param current_a: Current applied while the modulation input is high, in amperes.
+        :param output: Whether to enable the output afterwards. Defaults to ``True``, since
+            in this mode the output being enabled is what arms the LED for the trigger.
+        :raises ValueError: If *current_a* exceeds the instrument's current limit.
+        :raises InstrumentError: If the instrument rejects every candidate current header,
+            in which case check the SCPI section of the DC2200 manual for your firmware.
+
+        """
+        self._check_current(current_a)
+        self.write("SOURCE1:MODE TTL")
+
+        if self._ttl_current_header is not None:
+            self.write(f"{self._ttl_current_header} {current_a}")
+        else:
+            rejected = []
+            for header in self.TTL_CURRENT_HEADERS:
+                try:
+                    self.write(f"{header} {current_a}")
+                except InstrumentError as exc:
+                    rejected.append(f"{header} ({exc})")
+                    continue
+                self._ttl_current_header = header
+                break
+            else:
+                raise InstrumentError(
+                    "Could not set the TTL-mode drive current: the DC2200 rejected every "
+                    f"candidate header. Tried: {'; '.join(rejected)}. Check the SCPI section "
+                    "of the DC2200 manual for this firmware and add the correct header to "
+                    "DC2200.TTL_CURRENT_HEADERS."
+                )
+
+        self.output = output
+
     def configure_pwm(
         self,
         current_a: float,
@@ -228,4 +283,6 @@ class DC2200(VisaInstrument):
             state["pwm_count"] = int(self.query_float("SOURCE1:PWM:COUNT?"))
         elif mode.startswith("CC"):
             state["cc_current_a"] = self.query_float("SOURCE1:CCURENT:CURRENT?")
+        elif mode.startswith("TTL") and self._ttl_current_header is not None:
+            state["ttl_current_a"] = self.query_float(f"{self._ttl_current_header}?")
         return state
