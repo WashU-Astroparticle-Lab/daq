@@ -267,7 +267,8 @@ class Base:
             if attribute in [
                 "freq_arr", "resp_arr", "pixel_i", "pixel_q",
                 "lsb", "usb", "freqs_usb", "freqs_lsb",
-                "signal", "signal_freqs"
+                "signal", "signal_freqs",
+                "time_ms", "avg_iq",
             ]:
                 continue
             

@@ -1,6 +1,7 @@
 from .calibrations import amp_to_power_dbm, amp_to_power_dbm_hz, power_dbm_to_amp
 from .instruments import Agilent33220A, DC2200, InstrumentError
 from .measurements import (
+    QCTrace,
     Sweep,
     SweepFreqAndDC,
     SweepPower,
@@ -15,6 +16,7 @@ __all__ = [
     "Agilent33220A",
     "DC2200",
     "InstrumentError",
+    "QCTrace",
     "Sweep",
     "SweepFreqAndDC",
     "SweepPower",
