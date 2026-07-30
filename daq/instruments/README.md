@@ -430,6 +430,67 @@ Hard-won, and all required verbatim.
 
 ## Debugging
 
+### An instrument will not connect
+
+**1. Get the resource string yourself, bypassing discovery entirely.** This is always the
+fastest way to unblock:
+
+```python
+from daq.instruments import probe_visa_resources
+
+for resource, idn in probe_visa_resources():
+    print(f"{resource}\n    -> {idn}")
+```
+
+```
+USB0::0x0957::0x0407::MY44000531::INSTR
+    -> Agilent Technologies,33220A,MY44000531,2.01
+GPIB0::30::INSTR
+    -> <error: TimeoutError: VI_ERROR_TMO: Timeout expired before operation completed>
+```
+
+That output splits the problem three ways:
+
+| What you see | What it means | What to do |
+|---|---|---|
+| The instrument is **not listed at all** | Driver, cabling or power — nothing to do with daq | Check Device Manager / NI MAX; not WSL |
+| Listed, but `<error: ...TMO...>` | Visible but not answering — held by another process, or slower than the probe allows | Close NI MAX / other kernels; or raise `Agilent33220A.PROBE_TIMEOUT_MS` |
+| Listed with an `*IDN?` that looks right | Discovery's keyword check is what is failing | Pass the resource explicitly (below) |
+
+**2. Pass it explicitly.** Autodiscovery is a convenience, not the only path:
+
+```python
+bias = Agilent33220A(resource="USB0::0x0957::0x0407::MY44000531::INSTR")
+```
+
+Once it works, put it in the environment so notebooks need not repeat it:
+
+```bash
+export DAQ_FGEN_RESOURCE="USB0::0x0957::0x0407::MY44000531::INSTR"
+```
+
+> **Setting the environment variable from inside a running kernel does not take effect on its
+> own.** Settings are cached on first access, so `os.environ[...] = ...` after `import daq` is
+> silently ignored. Either set it before starting the kernel, or call
+> `daq.config.reload_settings()` afterwards. Passing `resource=` sidesteps the cache entirely.
+
+**3. Read the error.** A failed autodiscovery reports every resource it saw and why each was
+rejected — a model mismatch and a timeout look nothing alike and need different fixes:
+
+```
+No connected instrument identified as Agilent33220A -- looked for ['33220A'] in the
+*IDN? response of each visible resource:
+  USB0::0x0957::0x0407::MY123::INSTR: Agilent Technologies,33210A,MY123,1.0
+  GPIB0::30::INSTR: no *IDN? response (TimeoutError: VI_ERROR_TMO: ...)
+```
+
+The first line there is the common real case: a **33210A**, not a 33220A. The driver refuses to
+adopt it, because a near-identical model is exactly the sort of thing that silently produces
+plausible-but-wrong data. If you know the model is compatible, pass `resource=` to skip the
+check, or add the keyword to `Agilent33220A.IDN_KEYWORDS`.
+
+### SCPI transcripts
+
 Pass `transcript_path=` to record every write, query and error response to a text file:
 
 ```python
@@ -437,14 +498,18 @@ with Agilent33220A(transcript_path="fgen_run.txt") as bias:
     ...
 ```
 
-Common failures:
+Useful when a command is accepted but does not do what you expect — the transcript shows the
+exact byte sequence and each `SYST:ERR?` response.
+
+### Other failures
 
 | Symptom | Likely fix |
 |---|---|
 | `Could not locate a VISA implementation` | Install NI-VISA, or set `DAQ_VISA_BACKEND=@py`. |
 | `No VISA resources are visible` | Cable/power; check Device Manager or NI MAX; not WSL. |
-| `Found N instruments identifying as ...` | Set `DAQ_FGEN_RESOURCE` / `DAQ_LED_RESOURCE`, or pass `resource=`. |
+| `Found N instruments identifying as ...` | Two of the same model. Set `DAQ_FGEN_RESOURCE` / `DAQ_LED_RESOURCE`, or pass `resource=`. |
 | Hang, or `VI_ERROR_RSRC_NFOUND` | Another process holds the instrument; shut down other kernels. Unplug/replug. |
+| `pyvisa is required ... not installed` | `pip install daq[instruments]`. |
 
 ## Adding an instrument
 

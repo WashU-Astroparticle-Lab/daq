@@ -70,6 +70,64 @@ def _get_resource_manager(backend: str):
         ) from exc
 
 
+def probe_visa_resources(
+    backend: Optional[str] = None,
+    *,
+    timeout_ms: int = 5000,
+    read_termination: str = "\n",
+    write_termination: str = "\n",
+) -> List[Tuple[str, str]]:
+    """Ask every visible VISA resource to identify itself.
+
+    The first thing to run when an instrument will not connect: it separates "the resource is
+    not visible at all" (a driver or cabling problem) from "it is visible but does not answer"
+    (held by another process, or slow) from "it answers but with an unexpected model" (the
+    ``IDN_KEYWORDS`` check is what is failing).
+
+    ::
+
+        >>> from daq.instruments import probe_visa_resources
+        >>> for resource, idn in probe_visa_resources():
+        ...     print(resource, "->", idn)
+        USB0::0x0957::0x0407::MY44000531::INSTR -> Agilent Technologies,33220A,MY44000531,2.01
+        USB0::0x1313::0x80C8::M01271962::INSTR -> Thorlabs,DC2200,M01271962,1.0
+
+    :param backend: PyVISA backend spec. Defaults to ``DAQ_VISA_BACKEND``.
+    :param timeout_ms: How long to wait for each ``*IDN?`` response.
+    :param read_termination: Read termination used while probing.
+    :param write_termination: Write termination used while probing.
+    :raises InstrumentError: If no VISA resource manager can be opened at all.
+    :returns: One ``(resource, description)`` pair per visible resource, in discovery order,
+        where *description* is the ``*IDN?`` response or an ``"<error: ...>"`` string
+        explaining why the resource did not answer.
+
+    """
+    rm = _get_resource_manager(get_visa_backend() if backend is None else backend)
+    try:
+        available = tuple(rm.list_resources())
+    except Exception as exc:
+        raise InstrumentError(f"Could not list VISA resources: {exc}") from exc
+
+    results: List[Tuple[str, str]] = []
+    for resource in available:
+        instr = None
+        try:
+            instr = rm.open_resource(resource)
+            instr.timeout = timeout_ms
+            instr.read_termination = read_termination
+            instr.write_termination = write_termination
+            results.append((resource, str(instr.query("*IDN?")).strip()))
+        except Exception as exc:
+            results.append((resource, f"<error: {type(exc).__name__}: {exc}>"))
+        finally:
+            if instr is not None:
+                try:
+                    instr.close()
+                except Exception:  # pragma: no cover - best-effort cleanup
+                    pass
+    return results
+
+
 class VisaInstrument:
     """Base class for SCPI instruments reached over VISA.
 
@@ -110,6 +168,14 @@ class VisaInstrument:
     """Query returning the oldest queued error. Set to ``""`` to disable error checking."""
     MAX_ERROR_READS: int = 50
     """Cap on the error-queue drain loop, so a permanently faulted instrument cannot hang."""
+    PROBE_TIMEOUT_MS: int = 5000
+    """I/O timeout when asking an unknown resource for ``*IDN?`` during autodiscovery.
+
+    Generous on purpose: an instrument that answers more slowly than this is silently skipped
+    and reported as "not found", which is a confusing way to fail. Raise it further if a slow
+    GPIB adapter is being missed.
+
+    """
 
     def __init__(
         self,
@@ -202,48 +268,62 @@ class VisaInstrument:
                 candidates = hinted
 
         matches: List[str] = []
+        # Keep why each candidate was rejected -- a bare "not found" leaves the user with no
+        # way to tell a timeout from a busy resource from a genuine model mismatch.
+        report: List[str] = []
         for candidate in candidates:
-            idn = self._probe_idn(candidate)
+            idn, error = self._probe_idn(candidate)
             if idn is None:
+                report.append(f"  {candidate}: no *IDN? response ({error})")
                 continue
             if not self.IDN_KEYWORDS or any(k.lower() in idn.lower() for k in self.IDN_KEYWORDS):
                 matches.append(candidate)
+                report.append(f"  {candidate}: {idn}  <-- matches")
+            else:
+                report.append(f"  {candidate}: {idn}")
 
         if len(matches) == 1:
             logger.info("%s autodiscovered at %s", name, matches[0])
             return matches[0]
 
         env_var = getattr(self, "ENV_VAR", "the resource environment variable")
+        listing = "\n".join(report)
         if not matches:
             raise InstrumentError(
-                f"No connected instrument identified as {name} "
-                f"(looking for {self.IDN_KEYWORDS!r} in *IDN?). "
-                f"Visible resources: {list(available)}. "
-                f"Pass resource=... explicitly or set {env_var}."
+                f"No connected instrument identified as {name} -- looked for "
+                f"{list(self.IDN_KEYWORDS)} in the *IDN? response of each visible resource:\n"
+                f"{listing}\n"
+                f"If the instrument is listed above but its *IDN? did not match, pass "
+                f"resource='...' explicitly (or set {env_var}) to skip the check. If it is "
+                f"listed but did not answer, close any other program holding it (NI MAX, "
+                f"another kernel) or raise {name}.PROBE_TIMEOUT_MS. If it is not listed at "
+                f"all, it is a driver or cabling problem, not a daq one."
             )
         raise InstrumentError(
-            f"Found {len(matches)} instruments identifying as {name}: {matches}. "
-            f"Pass resource=... explicitly or set {env_var} to choose one."
+            f"Found {len(matches)} instruments identifying as {name}:\n{listing}\n"
+            f"Pass resource='...' explicitly or set {env_var} to choose one."
         )
 
-    def _probe_idn(self, resource: str) -> Optional[str]:
-        """Open *resource* briefly and return its ``*IDN?`` response, or ``None`` on failure.
+    def _probe_idn(self, resource: str) -> Tuple[Optional[str], Optional[str]]:
+        """Open *resource* briefly and ask it to identify itself.
 
         :param resource: VISA resource string to probe.
-        :returns: The identification string, or ``None`` if the resource could not be opened
-            or did not answer (it belongs to another instrument, or is already in use).
+        :returns: ``(idn, None)`` on success, or ``(None, reason)`` when the resource could not
+            be opened or did not answer -- because it belongs to another instrument, is held by
+            another process, or is slower to respond than
+            :attr:`PROBE_TIMEOUT_MS` allows.
 
         """
         instr = None
         try:
             instr = self._rm.open_resource(resource)
-            instr.timeout = 1500
+            instr.timeout = self.PROBE_TIMEOUT_MS
             instr.read_termination = self.READ_TERMINATION
             instr.write_termination = self.WRITE_TERMINATION
-            return str(instr.query("*IDN?")).strip()
+            return str(instr.query("*IDN?")).strip(), None
         except Exception as exc:
             logger.debug("Probing %s failed: %s", resource, exc)
-            return None
+            return None, f"{type(exc).__name__}: {exc}"
         finally:
             if instr is not None:
                 try:
