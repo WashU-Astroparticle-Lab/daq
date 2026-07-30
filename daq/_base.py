@@ -48,11 +48,19 @@ class Base:
                 ts.attach(bias=bias)
                 ts.run()
 
+        The recorded values are read back from the hardware at the moment of the call, so
+        :meth:`attach` is a **snapshot, not a live link**: reconfigure an instrument afterwards
+        and you must call it again to record the change. Re-attaching the same prefix replaces
+        that prefix's attributes wholesale -- any key the instrument no longer reports is
+        dropped, so switching a generator from a ramp to a constant bias cannot leave stale
+        ramp parameters behind describing a waveform that is no longer running.
+
         :param instruments: Keyword arguments mapping a short prefix to either an instrument
             exposing a ``settings()`` method, or a plain dict of scalars.
         :raises TypeError: If a value is neither an instrument nor a mapping.
 
         """
+        attached: Dict[str, tuple] = self.__dict__.setdefault("_attached_keys", {})
         for name, instrument in instruments.items():
             if hasattr(instrument, "settings"):
                 settings = instrument.settings()
@@ -64,6 +72,13 @@ class Base:
                     f"dict, got {type(instrument).__name__}"
                 )
 
+            # Clear what a previous attach of this prefix wrote. A mode change makes
+            # settings() report a different set of keys, and leaving the old ones in place
+            # would describe hardware state that is no longer real.
+            for stale in attached.get(name, ()):
+                self.__dict__.pop(stale, None)
+
+            written = []
             for key, value in settings.items():
                 # None has no HDF5 representation and would only produce a save warning.
                 if value is None:
@@ -72,6 +87,8 @@ class Base:
                 if attribute in self.__dict__:
                     print(f"WARN: attach() is overwriting existing attribute {attribute}")
                 setattr(self, attribute, value)
+                written.append(attribute)
+            attached[name] = tuple(written)
 
     def _save(self, script_path: str, save_filename: Optional[str] = None) -> str:
         script_path = os.path.realpath(script_path)
