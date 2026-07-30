@@ -19,6 +19,7 @@ ad-hoc bench scripts routinely get wrong:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import get_visa_backend
@@ -191,6 +192,17 @@ class VisaInstrument:
     """Query returning the oldest queued error. Set to ``""`` to disable error checking."""
     MAX_ERROR_READS: int = 50
     """Cap on the error-queue drain loop, so a permanently faulted instrument cannot hang."""
+    OPEN_RETRIES: int = 3
+    """How many times to attempt ``open_resource`` before giving up.
+
+    A USB instrument can transiently report ``VI_ERROR_RSRC_NFOUND`` -- most often a port
+    Windows had put into selective suspend, which the open attempt itself tends to wake. One
+    such blip should not end an unattended multi-hour run, so the open is retried with a
+    linear backoff before raising; the error then lists every attempt.
+
+    """
+    OPEN_RETRY_DELAY_S: float = 0.5
+    """Base delay between open attempts; the *n*-th retry waits ``n *`` this."""
     PROBE_TIMEOUT_MS: int = 5000
     """I/O timeout when asking an unknown resource for ``*IDN?`` during autodiscovery.
 
@@ -215,14 +227,31 @@ class VisaInstrument:
         self._closed = False
 
         self.resource = self._resolve_resource(resource)
-        try:
-            self._instr = self._rm.open_resource(self.resource)
-            self._instr.timeout = timeout_ms
-            self._instr.read_termination = self.READ_TERMINATION
-            self._instr.write_termination = self.WRITE_TERMINATION
-        except Exception as exc:
-            self._close_transcript()
-            raise InstrumentError(f"Could not open VISA resource {self.resource!r}: {exc}") from exc
+        attempts = []
+        for attempt in range(1, self.OPEN_RETRIES + 1):
+            try:
+                self._instr = self._rm.open_resource(self.resource)
+                self._instr.timeout = timeout_ms
+                self._instr.read_termination = self.READ_TERMINATION
+                self._instr.write_termination = self.WRITE_TERMINATION
+                break
+            except Exception as exc:
+                attempts.append(f"attempt {attempt}: {type(exc).__name__}: {exc}")
+                if attempt == self.OPEN_RETRIES:
+                    self._close_transcript()
+                    raise InstrumentError(
+                        f"Could not open VISA resource {self.resource!r} after "
+                        f"{self.OPEN_RETRIES} attempts:\n  " + "\n  ".join(attempts)
+                    ) from exc
+                logger.warning(
+                    "Opening %s failed (%s); retrying in %.1f s",
+                    self.resource,
+                    exc,
+                    self.OPEN_RETRY_DELAY_S * attempt,
+                )
+                time.sleep(self.OPEN_RETRY_DELAY_S * attempt)
+        if attempts:
+            logger.info("Opened %s on attempt %d", self.resource, len(attempts) + 1)
 
         self._log(f"OPEN   {self.resource}")
         self._drain_errors()
