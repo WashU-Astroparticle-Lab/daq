@@ -70,6 +70,29 @@ def _get_resource_manager(backend: str):
         ) from exc
 
 
+def visa_backend_info(backend: Optional[str] = None) -> str:
+    """Describe the VISA implementation actually in use.
+
+    The single most useful fact when no instrument is visible. ``pyvisa-py`` cannot enumerate
+    USB instruments unless ``pyusb`` and ``libusb`` are installed, and silently lists only
+    serial and TCPIP resources when they are not -- which looks identical to an unplugged
+    instrument. Knowing which library is loaded distinguishes the two immediately.
+
+    :param backend: PyVISA backend spec. Defaults to ``DAQ_VISA_BACKEND``.
+    :returns: A one-line description of the loaded VISA library.
+
+    """
+    rm = _get_resource_manager(get_visa_backend() if backend is None else backend)
+    library = rm.visalib
+    detail = f"{type(library).__name__}: {library}"
+    if type(library).__name__ == "PyVisaLibrary":
+        detail += (
+            " -- pure-Python backend; USB instruments require pyusb and libusb, and are "
+            "invisible without them. On Windows prefer NI-VISA (DAQ_VISA_BACKEND='')."
+        )
+    return detail
+
+
 def probe_visa_resources(
     backend: Optional[str] = None,
     *,
@@ -234,6 +257,17 @@ class VisaInstrument:
             return configured
         return self._discover()
 
+    def _backend_note(self) -> str:
+        """Return a parenthetical describing the loaded VISA library, for error messages.
+
+        :returns: A short description, or an empty string if it cannot be determined.
+
+        """
+        try:
+            return f"\nVISA backend in use: {visa_backend_info(self._backend)}"
+        except Exception:  # pragma: no cover - diagnostics must never mask the real error
+            return ""
+
     def _discover(self) -> str:
         """Find the one connected resource whose ``*IDN?`` matches :attr:`IDN_KEYWORDS`.
 
@@ -254,9 +288,9 @@ class VisaInstrument:
 
         if not available:
             raise InstrumentError(
-                f"No VISA resources are visible, so {name} cannot be found. Check that the "
-                "instrument is powered on and connected, and that its USB/GPIB driver is "
-                "installed (on Windows, confirm it appears in NI MAX)."
+                f"No VISA resources are visible at all, so {name} cannot be found. Check that "
+                "the instrument is powered on and connected, and that its USB/GPIB driver is "
+                "installed (on Windows, confirm it appears in NI MAX)." + self._backend_note()
             )
 
         candidates = available
@@ -289,6 +323,23 @@ class VisaInstrument:
         env_var = getattr(self, "ENV_VAR", "the resource environment variable")
         listing = "\n".join(report)
         if not matches:
+            # No USB or GPIB resource visible at all is a strong signal that the VISA layer
+            # is not enumerating instrument buses, rather than that this model is absent.
+            buses = [r for r in available if r.upper().startswith(("USB", "GPIB"))]
+            if not buses:
+                bus_hint = (
+                    f"\nNOTE: no USB or GPIB instrument is visible at all -- only "
+                    f"{list(available)}, which is a serial/loopback port rather than an "
+                    "instrument. Check the obvious thing first: **is the instrument plugged "
+                    "in and powered on?** An unplugged USB cable looks exactly like this. If "
+                    "it is definitely connected, confirm it appears in NI MAX / Keysight "
+                    "Connection Expert, run `python -m pyvisa.info`, and note that VISA can "
+                    "fail to enumerate a USB instrument it will still open by explicit "
+                    f"address -- so passing resource='...' or setting {env_var} is worth "
+                    "trying before blaming the driver."
+                )
+            else:
+                bus_hint = ""
             raise InstrumentError(
                 f"No connected instrument identified as {name} -- looked for "
                 f"{list(self.IDN_KEYWORDS)} in the *IDN? response of each visible resource:\n"
@@ -297,7 +348,11 @@ class VisaInstrument:
                 f"resource='...' explicitly (or set {env_var}) to skip the check. If it is "
                 f"listed but did not answer, close any other program holding it (NI MAX, "
                 f"another kernel) or raise {name}.PROBE_TIMEOUT_MS. If it is not listed at "
-                f"all, it is a driver or cabling problem, not a daq one."
+                f"all, the likeliest cause is simply that it is not plugged in or not powered "
+                f"on -- check the cable and the front panel before anything else; failing "
+                f"that, it is a driver problem rather than a daq one."
+                + bus_hint
+                + self._backend_note()
             )
         raise InstrumentError(
             f"Found {len(matches)} instruments identifying as {name}:\n{listing}\n"
