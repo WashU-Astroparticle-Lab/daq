@@ -188,7 +188,7 @@ def plot_iq_comparison(
     qc: Optional[npt.NDArray[np.complexfloating]] = None,
     *,
     basis: Basis = "electronic",
-    freq_shift: float = 400e3,
+    freq_shift: Optional[float] = None,
     density: Density = "scatter",
     fcrop: Optional[Tuple[float, float]] = None,
     max_points: int = 50_000,
@@ -230,7 +230,8 @@ def plot_iq_comparison(
         ``"electronic"``, ``"fractional"``, ``"resonator"``. Defaults to
         ``"electronic"``.
     :param freq_shift: Detuning in Hz for the ``fr ± freq_shift`` marker
-        diamonds. Defaults to ``400e3``.
+        diamonds. Defaults to ``400e3``. When ``None``, these markers are not
+        drawn.
     :param density: How to render the time-stream cloud: ``"scatter"`` (points),
         ``"kde"`` (scatter plus Gaussian-KDE contours; accurate but slow),
         ``"contour"`` (scatter plus fast histogram-based 1-sigma / 2-sigma
@@ -352,23 +353,26 @@ def plot_iq_comparison(
         ax.scatter(
             qcz.real,
             qcz.imag,
-            color="red",
-            s=50,
+            facecolors="none",
+            edgecolors="tab:orange",
+            s=5,
             marker="o",
             zorder=10,
             label="QC trace",
         )
-    for sign in (+1, -1):
-        s_idx = int(np.argmin(np.abs(freq_arr - (fr + sign * freq_shift))))
-        ax.scatter(
-            swz.real[s_idx],
-            swz.imag[s_idx],
-            color="k",
-            s=50,
-            marker="d",
-            zorder=10,
-            label=f"$f_r$ {'+' if sign > 0 else '-'} {freq_shift / 1e6:.2f} MHz",
-        )
+   
+    if freq_shift is not None:
+        for sign in (+1, -1):
+            s_idx = int(np.argmin(np.abs(freq_arr - (fr + sign * freq_shift))))
+            ax.scatter(
+                swz.real[s_idx],
+                swz.imag[s_idx],
+                color="k",
+                s=50,
+                marker="d",
+                zorder=10,
+                label=f"$f_r$ {'+' if sign > 0 else '-'} {freq_shift / 1e6:.2f} MHz",
+            )
 
     # --- Sweep trace coloured by detuning ---
     trace = ax.scatter(
