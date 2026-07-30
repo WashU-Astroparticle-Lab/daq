@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import time
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from ..config import get_led_resource
 from ._visa import InstrumentError, VisaInstrument
@@ -16,7 +16,7 @@ class DC2200(VisaInstrument):
     Supports four modes, which differ in what generates the pulse timing:
 
     - :meth:`configure_cc` -- constant current, no timing structure.
-    - :meth:`configure_pwm` / :meth:`pulse_train` -- a burst of pulses defined by a *duty
+    - :meth:`configure_pwm` / :meth:`pwm_train` -- a burst of pulses defined by a *duty
       cycle*. The duty floor of 0.1 % couples width to rate: the narrowest pulse available is
       ``0.001 / freq_hz``, so 10 us is only reachable at 100 Hz.
     - :meth:`configure_pulse` -- a burst of pulses defined by an explicit *width*, decoupling
@@ -46,41 +46,24 @@ class DC2200(VisaInstrument):
     RESOURCE_HINTS = ("0x1313::0x80C8",)
     ENV_VAR = "DAQ_LED_RESOURCE"
 
-    TTL_CURRENT_HEADERS = ("SOURCE1:TTL:CURRENT", "SOURCE1:CCURENT:CURRENT")
-    """Candidate headers for the TTL-mode drive current, tried in order.
+    # --- SCPI headers, from the DC2200 Operation Manual v1.8 (29-Nov-2023), section 4.3.2.
+    # Optional (bracketed) tree nodes are omitted: SOURce1:PULSe[:BRIGhtness][:LEVel]
+    # [:AMPLitude] accepts the short form used here.
+    PULSE_MODE_COMMAND: str = "SOURCE1:MODE PULS"
+    PULSE_BRIGHTNESS_HEADER: str = "SOURCE1:PULSE:BRIGHTNESS:LEVEL:AMPLITUDE"
+    PULSE_ONTIME_HEADER: str = "SOURCE1:PULSE:ONTIME"
+    PULSE_OFFTIME_HEADER: str = "SOURCE1:PULSE:OFFTIME"
+    PULSE_COUNT_HEADER: str = "SOURCE1:PULSE:COUNT"
+    TTL_CURRENT_HEADER: str = "SOURCE1:TTL:CURRENT"
 
-    Thorlabs documents TTL mode as having exactly one settable parameter -- the current
-    applied while the modulation input is high -- but does not publish the SCPI header for it.
-    :meth:`configure_ttl` tries these against the instrument and keeps whichever it accepts,
-    rather than hardcoding a guess. Rejected headers raise ``-113 Undefined header``, so this
-    resolves deterministically on the first call and cannot silently drive the wrong value.
-
-    """
-
-    PULSE_MODE_COMMANDS: Tuple[str, ...] = ("SOURCE1:MODE PULS", "SOURCE1:MODE PULSE")
-    """Candidate commands selecting pulse mode."""
-    PULSE_CURRENT_HEADERS: Tuple[str, ...] = (
-        "SOURCE1:PULSE:CURRENT",
-        "SOURCE1:PULS:CURRENT",
-        "SOURCE1:PULSE:CURENT",
-    )
-    """Candidate headers for the pulse drive current."""
-    PULSE_WIDTH_HEADERS: Tuple[str, ...] = (
-        "SOURCE1:PULSE:WIDTH",
-        "SOURCE1:PULSE:WIDT",
-        "SOURCE1:PULS:WIDTH",
-    )
-    """Candidate headers for the pulse width, in seconds."""
-    PULSE_PERIOD_HEADERS: Tuple[str, ...] = (
-        "SOURCE1:PULSE:PERIOD",
-        "SOURCE1:PULSE:PER",
-        "SOURCE1:PULS:PERIOD",
-    )
-    """Candidate headers for the repetition period, in seconds. Tried before the frequency."""
-    PULSE_FREQ_HEADERS: Tuple[str, ...] = ("SOURCE1:PULSE:FREQ", "SOURCE1:PULS:FREQ")
-    """Candidate headers for the repetition frequency, in hertz."""
-    PULSE_COUNT_HEADERS: Tuple[str, ...] = ("SOURCE1:PULSE:COUNT", "SOURCE1:PULS:COUNT")
-    """Candidate headers for the pulse count."""
+    PULSE_TIME_RANGE_S: Tuple[float, float] = (1e-6, 10.0)
+    """Instrument limits on pulse ON and OFF time: 0.001 ms to 10 s."""
+    PWM_DUTY_RANGE_PCT: Tuple[float, float] = (0.1, 99.9)
+    """Instrument limits on PWM duty cycle. The 0.1 % floor is why pulse mode exists."""
+    PWM_FREQ_RANGE_HZ: Tuple[float, float] = (0.1, 20e3)
+    """Instrument limits on PWM modulation frequency."""
+    MAX_COUNT: int = 1000
+    """Maximum finite pulse count. ``0`` means infinite, in both PWM and pulse mode."""
 
     def __init__(
         self,
@@ -91,8 +74,6 @@ class DC2200(VisaInstrument):
         transcript_path: Optional[str] = None,
     ) -> None:
         self._current_limit: Optional[float] = None
-        # SCPI headers resolved against the instrument on first use, keyed by setting name.
-        self._resolved_headers: Dict[str, str] = {}
         super().__init__(
             resource,
             timeout_ms=timeout_ms,
@@ -152,60 +133,56 @@ class DC2200(VisaInstrument):
         """
         return self.query_float("SENSE3:CURRENT:DATA?")
 
+    @property
+    def terminal(self) -> int:
+        """Which output terminal is selected: ``1`` (10 A, 12-pin) or ``2`` (2 A, 4-pin).
+
+        The DC2200 has two LED connectors and every source setting applies to the selected
+        one. Left alone, the driver inherits whatever the front panel last selected, so read
+        this back rather than assuming.
+
+        :returns: The selected terminal number.
+
+        """
+        return int(self.query_float("OUTPUT1:TERMINAL?"))
+
+    @terminal.setter
+    def terminal(self, number: int) -> None:
+        """Select the output terminal.
+
+        :param number: ``1`` for the 10 A 12-pin connector, ``2`` for the 2 A 4-pin connector.
+        :raises ValueError: If *number* is not 1 or 2.
+
+        """
+        if number not in (1, 2):
+            raise ValueError(f"terminal must be 1 or 2, got {number}")
+        self.write(f"OUTPUT1:TERMINAL {int(number)}")
+
+    def protection_status(self) -> Dict[str, bool]:
+        """Return the instrument's protection flags.
+
+        Worth checking when the LED does not light or output is unexpectedly disabled: any of
+        these tripping shuts the output down independently of the settings.
+
+        :returns: Mapping of protection name to whether it has tripped.
+
+        """
+        return {
+            "current_limit": bool(self.query_float("SOURCE1:CURRENT:LIMIT:TRIPPED?")),
+            "interlock": bool(self.query_float("OUTPUT1:PROTECTION:INTLOCK:TRIPPED?")),
+            "driver_over_temp": bool(
+                self.query_float("OUTPUT1:PROTECTION:TEMPERATURE:DRIVER:TRIPPED?")
+            ),
+            "head_over_temp": bool(
+                self.query_float("OUTPUT1:PROTECTION:TEMPERATURE:HEAD:TRIPPED?")
+            ),
+        }
+
     def safe_state(self) -> None:
         """Turn the LED off."""
         self.output = False
 
     # ------------------------------------------------------------------ validation
-
-    def _write_first_accepted(self, key: str, candidates: Sequence[str], value: Any = None) -> str:
-        """Write ``"<header> <value>"`` using the first candidate header the DC2200 accepts.
-
-        Thorlabs does not publish SCPI headers for every mode, and the ones it does publish
-        are inconsistently spelled (``CCURENT``, ``FREQ`` but not ``FREQUENCY``). Rather than
-        hardcode a guess, each candidate is tried against the instrument: a wrong header
-        queues ``-113 Undefined header``, which :meth:`write` turns into an exception, so the
-        right one is identified on first use and cached for the rest of the session.
-
-        :param key: Cache key naming the setting, e.g. ``"pulse_width"``.
-        :param candidates: Candidate SCPI headers, most likely first.
-        :param value: Value to write after the header. When ``None`` each candidate is sent
-            verbatim as a complete command, so no trailing space is appended -- instruments
-            can reject ``"SOURCE1:MODE PULS "`` for the stray space alone.
-        :raises InstrumentError: If every candidate is rejected.
-        :returns: The header that was accepted.
-
-        """
-
-        def command(header: str) -> str:
-            return header if value is None else f"{header} {value}"
-
-        cached = self._resolved_headers.get(key)
-        if cached is not None:
-            self.write(command(cached))
-            return cached
-
-        rejected = []
-        for header in candidates:
-            try:
-                self.write(command(header))
-            except InstrumentError as exc:
-                rejected.append(f"{header} ({exc})")
-                continue
-            self._resolved_headers[key] = header
-            return header
-
-        # Name the exact attribute to edit, found by identity so it cannot drift out of date.
-        cls = type(self)
-        attribute = next(
-            (n for n in dir(cls) if n.isupper() and getattr(cls, n, None) is candidates),
-            "the relevant candidate list",
-        )
-        raise InstrumentError(
-            f"Could not set {key.replace('_', ' ')}: the DC2200 rejected every candidate. "
-            f"Tried: {'; '.join(rejected)}. Check the SCPI section of the DC2200 manual for "
-            f"this firmware and add the correct spelling to {cls.__name__}.{attribute}."
-        )
 
     def _check_current(self, current_a: float) -> None:
         """Validate a requested drive current against the instrument's current limit.
@@ -245,7 +222,9 @@ class DC2200(VisaInstrument):
         input from the Presto's trigger output is how illumination is synchronised to an
         acquisition -- see ``daq/instruments/README.md`` for the wiring and the timing.
 
-        The input accepts 0-5 V at up to 250 kHz.
+        The input takes TTL levels -- low 0-0.8 V, high 2.0-5.0 V -- into 10 kOhm. (The
+        "0-5 V, 250 kHz" figure sometimes quoted for this connector is External Modulation
+        mode's analog small-signal bandwidth, a different mode.)
 
         Note this yields an illumination **window** spanning the acquisition, not a pulse
         inside it: the Presto re-asserts its trigger every lock-in window, so the line is high
@@ -277,89 +256,93 @@ class DC2200(VisaInstrument):
         """
         self._check_current(current_a)
         self.write("SOURCE1:MODE TTL")
-        self._write_first_accepted("ttl_current", self.TTL_CURRENT_HEADERS, current_a)
+        self.write(f"{self.TTL_CURRENT_HEADER} {current_a}")
         self.output = output
 
     def configure_pulse(
         self,
-        current_a: float,
-        width_s: float,
+        on_time_s: float,
         *,
+        off_time_s: Optional[float] = None,
         freq_hz: Optional[float] = None,
         period_s: Optional[float] = None,
+        brightness_pct: Optional[float] = None,
+        current_a: Optional[float] = None,
         count: int = 1,
         output: bool = False,
     ) -> None:
-        """Configure the DC2200's pulse mode: an explicit pulse *width* and repetition rate.
+        """Configure pulse mode: an explicit ON time and OFF time.
 
-        Unlike :meth:`configure_pwm`, which takes a duty cycle and therefore couples width to
-        rate, pulse mode sets the width directly. That is what makes short pulses at a slow
-        repetition rate possible: the PWM duty floor of 0.1 % means a 10 us pulse is only
-        reachable at 100 Hz, whereas pulse mode can do 10 us at 2 Hz.
+        Unlike :meth:`configure_pwm`, which takes a duty cycle and so couples pulse width to
+        repetition rate, pulse mode sets the two times independently. That is what makes a
+        short pulse at a slow rate possible -- PWM's 0.1 % duty floor puts its narrowest pulse
+        at ``0.001 / freq_hz`` (10 us only at 100 Hz), whereas pulse mode reaches 1 us at any
+        rate. ON and OFF time each span 0.001 ms to 10 s, giving 0.05 Hz to 500 Hz overall.
 
-        Give the repetition rate as either *freq_hz* or *period_s*.
+        Give the OFF time directly, or as a repetition rate via *freq_hz* / *period_s*, in
+        which case ``off_time = period - on_time``.
 
-        The SCPI headers for this mode are not published by Thorlabs, so each is resolved
-        against the instrument on first use (see :meth:`_write_first_accepted`). If your
-        firmware spells them differently the error names exactly what was rejected.
+        **Pulse mode is brightness-based, not current-based.** The instrument takes a
+        percentage of the *currently configured current limit*, so 100 % means driving at the
+        limit. Pass *brightness_pct* directly, or pass *current_a* to have it converted using
+        the queried limit. Note the consequence: with a high limit, a small absolute current
+        is a very small percentage, and the instrument's brightness resolution may not reach
+        it -- lower the LED current limit to gain fine control near the bottom of the range.
 
-        :param current_a: Peak drive current in amperes, during the pulse.
-        :param width_s: Pulse width in seconds, e.g. ``10e-6``.
-        :param freq_hz: Repetition frequency in hertz.
-        :param period_s: Repetition period in seconds. Give this or *freq_hz*, not both.
-        :param count: Number of pulses to emit.
+        :param on_time_s: Pulse ON time in seconds, e.g. ``10e-6``.
+        :param off_time_s: Pulse OFF time in seconds.
+        :param freq_hz: Repetition frequency, used to derive the OFF time.
+        :param period_s: Repetition period, used to derive the OFF time.
+        :param brightness_pct: Pulse amplitude as a percentage of the current limit.
+        :param current_a: Pulse amplitude in amperes, converted to a percentage of the limit.
+        :param count: Number of pulses; ``0`` means run indefinitely until the output is
+            disabled, which is what you usually want spanning an acquisition.
         :param output: Whether to enable the output afterwards, which starts the train.
-        :raises ValueError: If arguments are missing, out of range, or inconsistent.
-        :raises InstrumentError: If the instrument rejects every candidate header for a
-            setting, or does not support pulse mode at all.
+        :raises ValueError: If arguments are missing, inconsistent, or outside the
+            instrument's documented ranges.
 
         """
-        if (freq_hz is None) == (period_s is None):
-            raise ValueError("Specify exactly one of freq_hz or period_s")
+        rate_given = [x is not None for x in (off_time_s, freq_hz, period_s)]
+        if sum(rate_given) != 1:
+            raise ValueError("Specify exactly one of off_time_s, freq_hz or period_s")
         if freq_hz is not None:
             if freq_hz <= 0:
                 raise ValueError(f"freq_hz must be positive, got {freq_hz}")
             period_s = 1.0 / freq_hz
-        elif period_s <= 0:
-            raise ValueError(f"period_s must be positive, got {period_s}")
+        if period_s is not None:
+            if period_s <= on_time_s:
+                raise ValueError(
+                    f"the repetition period {period_s} s must exceed on_time_s={on_time_s} s"
+                )
+            off_time_s = period_s - on_time_s
 
-        self._check_current(current_a)
-        if width_s <= 0:
-            raise ValueError(f"width_s must be positive, got {width_s}")
-        if width_s >= period_s:
+        if (brightness_pct is None) == (current_a is None):
+            raise ValueError("Specify exactly one of brightness_pct or current_a")
+        if current_a is not None:
+            self._check_current(current_a)
+            brightness_pct = current_a / self.current_limit * 100.0
+        if not 0.0 < brightness_pct <= 100.0:
+            raise ValueError(f"brightness_pct must satisfy 0 < B <= 100, got {brightness_pct}")
+
+        low, high = self.PULSE_TIME_RANGE_S
+        for name, value in (("on_time_s", on_time_s), ("off_time_s", off_time_s)):
+            if not low <= value <= high:
+                raise ValueError(
+                    f"{name}={value} s is outside the DC2200's pulse timing range "
+                    f"{low} s to {high} s"
+                )
+        if int(count) != count or count < 0 or count > self.MAX_COUNT:
             raise ValueError(
-                f"width_s={width_s} s must be shorter than the repetition period "
-                f"{period_s} s; the LED would never switch off"
+                f"count must be 0 (infinite) or a whole number from 1 to "
+                f"{self.MAX_COUNT}, got {count}"
             )
-        if int(count) != count or count <= 0:
-            raise ValueError(f"count must be a positive whole number, got {count}")
 
-        self._write_first_accepted("pulse_mode", self.PULSE_MODE_COMMANDS)
-        self._write_first_accepted("pulse_current", self.PULSE_CURRENT_HEADERS, current_a)
-        self._write_first_accepted("pulse_width", self.PULSE_WIDTH_HEADERS, width_s)
-        self._set_pulse_rate(period_s)
-        self._write_first_accepted("pulse_count", self.PULSE_COUNT_HEADERS, int(count))
+        self.write(self.PULSE_MODE_COMMAND)
+        self.write(f"{self.PULSE_BRIGHTNESS_HEADER} {brightness_pct}")
+        self.write(f"{self.PULSE_ONTIME_HEADER} {on_time_s}")
+        self.write(f"{self.PULSE_OFFTIME_HEADER} {off_time_s}")
+        self.write(f"{self.PULSE_COUNT_HEADER} {int(count)}")
         self.output = output
-
-    def _set_pulse_rate(self, period_s: float) -> None:
-        """Set the pulse repetition rate, as a period or a frequency.
-
-        Different firmwares expose one or the other, and the value differs between them, so
-        the period candidates are tried with seconds and the frequency candidates with hertz.
-
-        :param period_s: Repetition period in seconds.
-        :raises InstrumentError: If neither form is accepted.
-
-        """
-        cached = self._resolved_headers.get("pulse_rate")
-        if cached is not None:
-            in_hz = cached in self.PULSE_FREQ_HEADERS
-            self.write(f"{cached} {1.0 / period_s if in_hz else period_s}")
-            return
-        try:
-            self._write_first_accepted("pulse_rate", self.PULSE_PERIOD_HEADERS, period_s)
-        except InstrumentError:
-            self._write_first_accepted("pulse_rate", self.PULSE_FREQ_HEADERS, 1.0 / period_s)
 
     def configure_pwm(
         self,
@@ -381,12 +364,24 @@ class DC2200(VisaInstrument):
 
         """
         self._check_current(current_a)
-        if freq_hz <= 0:
-            raise ValueError(f"freq_hz must be positive, got {freq_hz}")
-        if not 0.0 < duty_pct < 100.0:
-            raise ValueError(f"duty_pct must satisfy 0 < D < 100, got {duty_pct}")
-        if int(count) != count or count <= 0:
-            raise ValueError(f"count must be a positive whole number, got {count}")
+        f_low, f_high = self.PWM_FREQ_RANGE_HZ
+        if not f_low <= freq_hz <= f_high:
+            raise ValueError(
+                f"freq_hz={freq_hz} is outside the DC2200's PWM range {f_low} Hz to {f_high} Hz"
+            )
+        d_low, d_high = self.PWM_DUTY_RANGE_PCT
+        if not d_low <= duty_pct <= d_high:
+            raise ValueError(
+                f"duty_pct={duty_pct} is outside the DC2200's range {d_low} % to {d_high} %. "
+                f"Note the {d_low} % floor caps the narrowest PWM pulse at "
+                f"{d_low / 100.0 / freq_hz * 1e6:.1f} us at {freq_hz} Hz; use configure_pulse() "
+                f"for a shorter pulse at this rate."
+            )
+        if int(count) != count or count < 0 or count > self.MAX_COUNT:
+            raise ValueError(
+                f"count must be 0 (infinite) or a whole number from 1 to "
+                f"{self.MAX_COUNT}, got {count}"
+            )
 
         self.write("SOURCE1:MODE PWM")
         self.write(f"SOURCE1:PWM:CURRENT {current_a}")
@@ -396,7 +391,7 @@ class DC2200(VisaInstrument):
         self.write(f"SOURCE1:PWM:COUNT {int(count)}")
         self.output = output
 
-    def pulse_train(
+    def pwm_train(
         self,
         current_a: float,
         freq_hz: float,
@@ -405,7 +400,11 @@ class DC2200(VisaInstrument):
         *,
         settle_s: float = 0.5,
     ) -> None:
-        """Configure and emit one PWM pulse train, blocking until it has finished.
+        """Configure and emit one **PWM** pulse train, blocking until it has finished.
+
+        Named for the mode it uses: this is :meth:`configure_pwm` plus the wait, so it
+        inherits PWM's 0.1 %% duty floor and *cannot* produce a short pulse at a slow
+        rate. For that, use :meth:`configure_pulse`.
 
         Loads the PWM settings, enables the output, sleeps for the train's own duration
         (``count / freq_hz``) plus *settle_s*, then disables the output again. The DC2200's
@@ -413,7 +412,7 @@ class DC2200(VisaInstrument):
         timing is instrument-accurate; only the moment the train *starts* is software-timed,
         set by a USB write, with millisecond-scale jitter.
 
-        For example ``pulse_train(current_a=0.01, freq_hz=100, duty_pct=50, count=10)`` emits
+        For example ``pwm_train(current_a=0.01, freq_hz=100, duty_pct=50, count=10)`` emits
         ten 10 ms periods -- 5 ms on at 10 mA, 5 ms off -- so a 100 ms train carrying 50 ms of
         total LED-on time, and the call blocks for 0.6 s (0.1 s of train plus the 0.5 s
         settle margin).
@@ -470,31 +469,17 @@ class DC2200(VisaInstrument):
         elif mode.startswith("CC"):
             state["cc_current_a"] = self.query_float("SOURCE1:CCURENT:CURRENT?")
         elif mode.startswith("TTL"):
-            header = self._resolved_headers.get("ttl_current")
-            if header is not None:
-                state["ttl_current_a"] = self.query_float(f"{header}?")
+            state["ttl_current_a"] = self.query_float(f"{self.TTL_CURRENT_HEADER}?")
         elif mode.startswith("PULS"):
-            # Read back through whichever headers this firmware accepted.
-            for name, key in (
-                ("pulse_current", "pulse_current_a"),
-                ("pulse_width", "pulse_width_s"),
-                ("pulse_count", "pulse_count"),
-                ("pulse_rate", "pulse_rate"),
-            ):
-                header = self._resolved_headers.get(name)
-                if header is None:
-                    continue
-                value = self.query_float(f"{header}?")
-                if key == "pulse_count":
-                    state[key] = int(value)
-                elif key == "pulse_rate":
-                    # Normalise to both, whichever the instrument reports.
-                    if header in self.PULSE_FREQ_HEADERS:
-                        state["pulse_freq_hz"] = value
-                        state["pulse_period_s"] = 1.0 / value if value else float("nan")
-                    else:
-                        state["pulse_period_s"] = value
-                        state["pulse_freq_hz"] = 1.0 / value if value else float("nan")
-                else:
-                    state[key] = value
+            state["pulse_brightness_pct"] = self.query_float(f"{self.PULSE_BRIGHTNESS_HEADER}?")
+            on_s = self.query_float(f"{self.PULSE_ONTIME_HEADER}?")
+            off_s = self.query_float(f"{self.PULSE_OFFTIME_HEADER}?")
+            state["pulse_on_time_s"] = on_s
+            state["pulse_off_time_s"] = off_s
+            state["pulse_count"] = int(self.query_float(f"{self.PULSE_COUNT_HEADER}?"))
+            period = on_s + off_s
+            if period > 0:
+                state["pulse_freq_hz"] = 1.0 / period
+            # Absolute amplitude is only meaningful against the limit the percentage refers to.
+            state["pulse_current_a"] = state["pulse_brightness_pct"] / 100.0 * self.current_limit
         return state
