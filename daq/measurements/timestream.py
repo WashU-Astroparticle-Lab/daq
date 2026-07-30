@@ -42,9 +42,12 @@ class TimeStream(Base):
 
     **Inferred, not scope-verified.** The continuous-high behaviour follows from the presto
     Python layer -- the per-window ``(start, stop)`` clock pair sent with ``df``, and the
-    ``set_trigger_out`` docstring's "at the start of every demodulation window" -- and from
-    ``QCTrace``'s gated ramp spanning whole records. How the FPGA actually responds to a width
-    exceeding the window period has not been checked on an oscilloscope.
+    ``set_trigger_out`` docstring's "at the start of every demodulation window" -- and is
+    consistent with the archived bench routine ``QCTrace`` packages having taken usable QC
+    traces under this exact gated-ramp, 30 ms-width configuration over whole records.
+    (``QCTrace`` itself has not yet been run on hardware, so it is not independent evidence.)
+    How the FPGA actually responds to a width exceeding the window period has not been checked
+    on an oscilloscope.
     """
 
     def __init__(

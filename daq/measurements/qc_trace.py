@@ -55,6 +55,15 @@ class QCTrace(Base):
 
     Requires the Presto **and** the 33220A over VISA; it cannot run without hardware.
 
+    **Wiring assumption.** The gated QC-trace step drives the ramp with ``external_trigger=
+    True``, which asserts **Presto digital output port 1 only**. This class assumes the
+    33220A's external trigger input is wired to that port; if your gate generator is on a
+    different port, the ramp will never be gated and the QC-trace step records a static bias
+    instead of a swept one. Routing the trigger to another port is not exposed here (see
+    :meth:`~daq.measurements.timestream.TimeStream.resolve_trigger_states` for the per-port
+    states a bare ``TimeStream`` accepts) -- rewire to port 1, or drive the sequence by hand
+    with ``TimeStream`` if your setup differs.
+
     :param freq_center: Centre frequency of the locating sweep in hertz.
     :param amp: Drive amplitude in DAC full scale, shared by the sweep and every time stream.
         Convert from dBm with :func:`~daq.calibrations.power_dbm_to_amp`.
@@ -355,6 +364,7 @@ class QCTrace(Base):
     def run(
         self,
         bias: Optional[Agilent33220A] = None,
+        *,
         presto_address: Optional[str] = None,
         presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
@@ -367,6 +377,11 @@ class QCTrace(Base):
         device. When *bias* is omitted the generator is opened and closed here; when it is
         passed in the caller keeps ownership of the VISA session and only the output is
         de-energised.
+
+        Unlike the other measurement classes, this ``run`` takes the *bias generator* as its
+        first (and only) positional argument, not ``presto_address`` -- the Presto connection
+        parameters are keyword-only, so ``run("172.23.20.29")`` cannot silently bind an
+        address string to *bias*. Pass the address as ``run(presto_address=...)``.
 
         :param bias: An open :class:`~daq.instruments.function_generator.Agilent33220A`. When
             ``None``, one is discovered and opened for the duration of the run.
