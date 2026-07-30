@@ -86,6 +86,10 @@ results.
 - `discard_start_ms`: Milliseconds of startup junk dropped from the in-memory
   time-axis arrays after `run()`/`load()` (default `25.0`; set `0` to keep
   everything). The saved HDF5 keeps the full, untrimmed acquisition.
+- `external_trigger`: Which Presto digital output ports assert a trigger during the
+  acquisition, used to gate external instruments. `False` (default) triggers nothing;
+  `True` is shorthand for `[1]` (port 1 only). Pass a per-port states list to route
+  the trigger elsewhere — see **Gating external instruments** below.
 - `device`: Device name (required for DB)
 - `filter`: Filter name (optional)
 - `notes`: Measurement notes (optional)
@@ -112,6 +116,43 @@ ts = TimeStream(
 filepath = ts.run()
 ts.analyze()
 ```
+
+**Gating external instruments** — `external_trigger` maps directly onto presto's
+`set_trigger_out`, which takes one state **per digital output port**: element *i*
+configures port *i+1*, with `0` = off, `1` = trigger on every lock-in window, `2` = on
+every sum window. Which instrument you gate is therefore decided by what is wired where:
+
+| `external_trigger` | ports triggered |
+|---|---|
+| `False` | none |
+| `True`, `[1]`, `[1, 0]` | port 1 |
+| `[0, 1]` | port 2 |
+| `[1, 1]` | ports 1 and 2, fired together |
+
+The Presto has four digital output ports, so at most four states; a longer list raises, as do
+non-integral states (a state computed as `0.999…` would otherwise silently disable the port).
+
+> **`ts.external_trigger` is an array, not a bool.** The constructor argument still accepts
+> `True`/`False` and means exactly what it always did, but the attribute now stores the
+> resolved per-port states. Test it with `.any()` or `.size` — a bare
+> `if ts.external_trigger:` raises `ValueError` on an empty or multi-element array. This also
+> applies to objects returned by `TimeStream.load()` on pre-existing files.
+
+Two constraints worth knowing before you plan a measurement around this:
+
+- **The trigger is high for the whole acquisition, not a pulse.** presto re-asserts it at
+  the start of every lock-in window (every `1 / df`), and `TimeStream.TRIGGER_WIDTH_S`
+  (30 ms) is far longer than any window used here, so the line goes high when acquisition
+  starts and stays high until it ends. That is what a gated bias ramp or a TTL-driven LED
+  wants; it is *not* a timed one-shot. This is **inferred from the presto implementation and
+  not yet scope-verified** — see the call-out under *Routing the trigger* in
+  `daq/instruments/README.md`.
+- **Timing is shared across ports.** presto sends a single global `delay`/`width` pair
+  alongside `df`, so ports enabled in the same acquisition are gated identically. Only the
+  on/off state is per port. Independent timing needs separate acquisitions.
+
+See `daq/instruments/README.md` for the wiring, the arming order, and the worked
+Agilent-33220A and DC2200 recipes.
 
 **Outputs**: after `run()`, use the ready-made per-tone fields rather than the raw
 sidebands:

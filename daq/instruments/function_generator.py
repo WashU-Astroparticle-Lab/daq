@@ -17,7 +17,8 @@ class Agilent33220A(VisaInstrument):
 
     - :meth:`constant` -- a fixed DC bias.
     - :meth:`sawtooth` -- a repeating voltage ramp, normally *gated* so that it runs only
-      while the Presto asserts its trigger output (``TimeStream(external_trigger=True)``).
+      while the Presto asserts its trigger output (``TimeStream(external_trigger=True)``,
+      i.e. digital output port 1, where this generator's gate input is wired).
 
     Both setters are **hermetic**: each writes the full state its mode depends on, including
     explicitly disabling burst mode. This matters because the 33220A does not support burst
@@ -177,7 +178,9 @@ class Agilent33220A(VisaInstrument):
         With ``gated=True`` (the default) the generator runs in gated-burst mode and emits the
         ramp only while its external trigger input is asserted, which is how the Presto
         synchronises the bias to an acquisition -- pair it with
-        ``TimeStream(external_trigger=True)``. With ``gated=False`` the ramp free-runs.
+        ``TimeStream(external_trigger=True)``, which asserts digital output port 1 for the
+        duration of the acquisition. Pass a per-port states list instead if the gate input is
+        on another port. With ``gated=False`` the ramp free-runs.
 
         :param vpp: Peak-to-peak amplitude in volts.
         :param freq_hz: Ramp repetition frequency in hertz.
