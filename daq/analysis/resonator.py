@@ -27,18 +27,19 @@ Two facts from the upstream implementation make this exact rather than approxima
   ``ignoreslope`` test, so the baseline ``A2·(f - frcal)`` is identically zero.
 - ``do_normalization()`` is then just ``z_norm = z_raw / environmental_term``.
 
-:func:`fit_notch` verifies that identity on every call, so if a future upstream
-release changes the calibration convention this fails loudly instead of returning a
-subtly wrong basis transformation.
+:func:`fit_notch` checks both on every call -- it raises if ``A2`` is ever non-zero,
+and if the recovered term fails to reproduce upstream's own normalization -- so a
+future release that changes the calibration convention fails loudly instead of
+returning a subtly wrong basis transformation. The ``A2`` check matters because the
+consumers divide by ``environmental_term`` alone and ignore ``environmental_baseline``:
+validating only the normalization identity would let a non-zero baseline through.
 """
 
-from typing import TYPE_CHECKING, Any, Dict, Optional, Tuple
+from types import ModuleType
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from resonator_tools import circuit
 
 __all__ = [
     "ResonatorFitError",
@@ -67,17 +68,21 @@ class ResonatorFitError(RuntimeError):
 def resonator_tools_available() -> bool:
     """Report whether the optional ``resonator_tools`` dependency can be imported.
 
-    :return: ``True`` when :mod:`resonator_tools` is importable.
+    Probes ``resonator_tools.circuit`` rather than the top-level package:
+    ``resonator_tools/__init__.py`` is empty, so ``import resonator_tools`` succeeds
+    even on an install whose ``circuit`` submodule is broken.
+
+    :return: ``True`` when :mod:`resonator_tools.circuit` is importable.
     :rtype: bool
     """
     try:
-        import resonator_tools  # noqa: F401
+        import resonator_tools.circuit  # noqa: F401
     except ImportError:
         return False
     return True
 
 
-def _import_circuit() -> "circuit":
+def _import_circuit() -> ModuleType:
     """Import ``resonator_tools.circuit`` with an actionable error message.
 
     :return: The ``resonator_tools.circuit`` module.
@@ -166,6 +171,21 @@ def _calibration_results(
         **guesses,
     )
 
+    # Every consumer (plot_iq_comparison, from_elec_to_reson) divides by
+    # environmental_term alone and ignores environmental_baseline, which is only
+    # correct while the baseline is zero. Upstream's get_delay() pins A2 = 0.0 in both
+    # branches of its ignoreslope test, so this holds today -- but it is an assumption
+    # about someone else's code, so assert it rather than trust it. A non-zero A2 would
+    # otherwise silently bias every basis transformation.
+    if a2 != 0.0:
+        raise ResonatorFitError(
+            f"resonator_tools returned a non-zero baseline slope A2={a2!r}. DAQ's "
+            "basis transformations divide by environmental_term alone and assume the "
+            "baseline is zero, so they would be silently wrong. Either subtract "
+            "environmental_baseline in the consumers or pin an older resonator_tools; "
+            "daq/analysis/resonator.py needs updating to match."
+        )
+
     env = environmental_term(freq_arr, amp_norm, alpha, delay)
     baseline = a2 * (freq_arr - frcal)
 
@@ -193,19 +213,43 @@ def _check_consistency(
     well conditioned even where the normalized response dips toward zero on
     resonance.
 
+    Every branch that cannot complete the comparison raises: a check that silently
+    skips itself is worse than no check, because callers read "no exception" as
+    "validated".
+
     :param port: A fitted ``notch_port``.
     :param resp_arr: Raw complex sweep response.
     :param env: Reconstructed environmental term.
     :param baseline: Reconstructed baseline term.
-    :raises ResonatorFitError: If the reconstruction disagrees with upstream.
+    :raises ResonatorFitError: If the reconstruction disagrees with upstream, or if
+        the comparison cannot be carried out at all.
     """
+    # The consumers divide by env, so a non-finite entry would silently poison every
+    # downstream array with NaN rather than raising anywhere.
+    if not np.all(np.isfinite(env)):
+        raise ResonatorFitError(
+            f"Recovered environmental term contains {int(np.sum(~np.isfinite(env)))} "
+            "non-finite entries; the resonator fit did not converge to a usable "
+            "calibration."
+        )
+
     z_norm = np.asarray(port.z_data)
     residual = np.abs(z_norm * env - (resp_arr - baseline))
-    scale = float(np.median(np.abs(resp_arr)))
-    if scale == 0.0 or not np.isfinite(scale):
-        return
+
+    # Normalize by the largest response, not the median: the residual is round-off on
+    # the largest term, so scaling it by a much smaller median would flag a correct
+    # fit on high-dynamic-range data.
+    scale = float(np.max(np.abs(resp_arr)))
+    if not np.isfinite(scale) or scale == 0.0:
+        raise ResonatorFitError(
+            "Cannot validate the environmental term: the sweep response has "
+            f"max |resp_arr| = {scale!r}, so there is no scale to compare against."
+        )
+
     worst = float(np.max(residual)) / scale
-    if worst > _CONSISTENCY_RTOL:
+    # `not (worst <= rtol)` rather than `worst > rtol`, so a NaN residual fails the
+    # check instead of slipping through (every comparison with NaN is False).
+    if not (worst <= _CONSISTENCY_RTOL):
         raise ResonatorFitError(
             "Recovered environmental term does not reproduce the normalization "
             f"performed by resonator_tools (relative residual {worst:.3e} > "

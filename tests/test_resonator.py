@@ -94,11 +94,6 @@ print(
     f"INFO  installed resonator_tools {'is the WashU fork' if IS_FORK else 'is stock upstream'}"
     f" (autofit {'does' if IS_FORK else 'does not'} provide environmental_term)"
 )
-check(
-    "fit_notch works regardless of which flavour is installed",
-    True,
-    "fork" if IS_FORK else "upstream",
-)
 
 # ------------------------------------------------- fit_notch supplies it
 
@@ -134,8 +129,13 @@ check(
     f"max rel err {rel_err:.2e}",
 )
 check(
+    # Loose on purpose: the fitted delay is the noisiest of the recovered scalars, and
+    # across seeds at this noise level it lands anywhere in ~[4e-5, 6e-3] relative. A
+    # 1e-3 bound passes on seed 0 but fails on most others -- it would be a flaky check
+    # measuring the noise realization, not the code. The quantity that actually matters
+    # is the assembled environmental term, bounded tightly above.
     "recovered delay matches the injected delay",
-    abs(port.fitresults["environmental_delay"] - DELAY_TRUE) / DELAY_TRUE < 1e-3,
+    abs(port.fitresults["environmental_delay"] - DELAY_TRUE) / DELAY_TRUE < 1e-2,
     f"{port.fitresults['environmental_delay']:.6e} vs {DELAY_TRUE:.6e}",
 )
 check(
@@ -196,6 +196,40 @@ check(
     abs(port.fitresults["phi0"] - PHI_TRUE) < 1e-2,
     f"{port.fitresults['phi0']:.4f} vs {PHI_TRUE:.4f}",
 )
+
+# ------------------------------------------------- independence from the fork
+
+# The whole point of the adapter is that it never reads the fork's extra fitresults
+# keys. Asserting that only via IS_FORK would leave the blind spot that caused the
+# original bug: on the lab machine, where the fork IS installed, a revert to reading
+# fitresults["environmental_term"] directly would still pass every check above.
+# So simulate a stock install regardless of what is installed -- strip the fork's keys
+# right after autofit, and require fit_notch to derive them anyway.
+_real_autofit = circuit.notch_port.autofit
+
+
+def _stock_autofit(self, *args, **kwargs):
+    _real_autofit(self, *args, **kwargs)
+    for key in [k for k in self.fitresults if k.startswith("environmental_")]:
+        del self.fitresults[key]
+
+
+circuit.notch_port.autofit = _stock_autofit
+try:
+    stripped = fit_notch(freq_arr, resp_arr)
+    check(
+        "fit_notch derives environmental_term without the fork's keys",
+        "environmental_term" in stripped.fitresults,
+    )
+    check(
+        "derived term is identical with the fork's keys stripped",
+        np.array_equal(np.asarray(stripped.fitresults["environmental_term"]), env_fit),
+    )
+except Exception as exc:  # noqa: BLE001 - report, do not mask
+    check("fit_notch derives environmental_term without the fork's keys", False, repr(exc))
+    check("derived term is identical with the fork's keys stripped", False, repr(exc))
+finally:
+    circuit.notch_port.autofit = _real_autofit
 
 # ------------------------------------------------- fcrop path
 
@@ -279,6 +313,39 @@ try:
     check("consistency check accepts the correct environmental term", True)
 except ResonatorFitError as exc:
     check("consistency check accepts the correct environmental term", False, str(exc))
+
+# A check that silently skips itself is worse than no check, so every branch that
+# cannot complete the comparison must raise.
+try:
+    resonator._check_consistency(port, resp_arr, env_fit * np.nan, baseline)
+    check("consistency check rejects a non-finite environmental term", False, "did not raise")
+except ResonatorFitError:
+    check("consistency check rejects a non-finite environmental term", True)
+
+try:
+    resonator._check_consistency(port, np.zeros_like(resp_arr), env_fit, baseline)
+    check("consistency check rejects an all-zero response", False, "did not raise")
+except ResonatorFitError:
+    check("consistency check rejects an all-zero response", True)
+
+# The consumers divide by environmental_term alone, so a non-zero baseline slope would
+# bias every basis transformation without tripping the normalization identity.
+_real_do_calibration = circuit.notch_port.do_calibration
+
+
+def _nonzero_a2(self, *args, **kwargs):
+    delay, amp_norm, alpha, fr, ql, _a2, frcal = _real_do_calibration(self, *args, **kwargs)
+    return delay, amp_norm, alpha, fr, ql, 5e-9, frcal
+
+
+circuit.notch_port.do_calibration = _nonzero_a2
+try:
+    fit_notch(freq_arr, resp_arr)
+    check("fit_notch rejects a non-zero baseline slope (A2)", False, "did not raise")
+except ResonatorFitError:
+    check("fit_notch rejects a non-zero baseline slope (A2)", True)
+finally:
+    circuit.notch_port.do_calibration = _real_do_calibration
 
 # A degenerate input must not yield a silently wrong basis: either it raises, or the
 # environmental term it returns still explains the normalization exactly.
