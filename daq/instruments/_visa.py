@@ -19,6 +19,7 @@ ad-hoc bench scripts routinely get wrong:
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import get_visa_backend
@@ -151,6 +152,34 @@ def probe_visa_resources(
     return results
 
 
+def _summarize_attempts(attempts: List[str]) -> str:
+    """Render one line per *distinct* construction failure, with a repeat count.
+
+    Retried failures are usually identical -- an unplugged instrument produces the same
+    multi-line discovery report every time -- and printing it three times buries the
+    information rather than adding any. Consecutive duplicates collapse to ``(x3)``, so a
+    genuine absence still reads as one failure while a changing error still shows each
+    distinct stage.
+
+    :param attempts: Per-attempt failure descriptions, in order.
+    :returns: An indented, newline-joined summary.
+
+    """
+    collapsed: List[Tuple[str, int]] = []
+    for text in attempts:
+        if collapsed and collapsed[-1][0] == text:
+            collapsed[-1] = (text, collapsed[-1][1] + 1)
+        else:
+            collapsed.append((text, 1))
+    lines = []
+    for text, count in collapsed:
+        suffix = f"  (x{count})" if count > 1 else ""
+        # Indent continuation lines so a multi-line discovery report stays visibly nested.
+        body = text.replace("\n", "\n    ")
+        lines.append(f"  {body}{suffix}")
+    return "\n".join(lines)
+
+
 class VisaInstrument:
     """Base class for SCPI instruments reached over VISA.
 
@@ -191,6 +220,21 @@ class VisaInstrument:
     """Query returning the oldest queued error. Set to ``""`` to disable error checking."""
     MAX_ERROR_READS: int = 50
     """Cap on the error-queue drain loop, so a permanently faulted instrument cannot hang."""
+    OPEN_RETRIES: int = 3
+    """How many times to attempt construction before giving up. Set to ``1`` to disable.
+
+    A USB instrument can transiently report ``VI_ERROR_RSRC_NFOUND`` -- most often a port
+    Windows had put into selective suspend, which the open attempt itself tends to wake. One
+    such blip should not end an unattended multi-hour run, so it is retried with a linear
+    backoff before raising, and the error then lists each distinct failure.
+
+    Note this retries resolution *and* the open, so on an instrument that is genuinely absent
+    the autodiscovery sweep (see :attr:`PROBE_TIMEOUT_MS`) runs once per attempt. That makes
+    the common unplugged case slower to fail, which is the price of surviving the transient.
+
+    """
+    OPEN_RETRY_DELAY_S: float = 0.5
+    """Base delay between open attempts; the *n*-th retry waits ``n *`` this."""
     PROBE_TIMEOUT_MS: int = 5000
     """I/O timeout when asking an unknown resource for ``*IDN?`` during autodiscovery.
 
@@ -199,6 +243,21 @@ class VisaInstrument:
     GPIB adapter is being missed.
 
     """
+
+    def _release_instr(self) -> None:
+        """Drop any VISA session held by a failed construction attempt.
+
+        Best-effort and silent: this runs while another exception is already in flight, so
+        a failure to close cannot be allowed to replace it.
+
+        """
+        instr, self._instr = self._instr, None
+        if instr is None:
+            return
+        try:
+            instr.close()
+        except Exception as exc:  # pragma: no cover - best-effort cleanup
+            logger.debug("Releasing a failed VISA session raised: %s", exc)
 
     def __init__(
         self,
@@ -214,19 +273,57 @@ class VisaInstrument:
         self._instr = None
         self._closed = False
 
-        self.resource = self._resolve_resource(resource)
-        try:
-            self._instr = self._rm.open_resource(self.resource)
-            self._instr.timeout = timeout_ms
-            self._instr.read_termination = self.READ_TERMINATION
-            self._instr.write_termination = self.WRITE_TERMINATION
-        except Exception as exc:
-            self._close_transcript()
-            raise InstrumentError(f"Could not open VISA resource {self.resource!r}: {exc}") from exc
+        # Resolution and open are retried together. Both stages fail transiently on the
+        # same underlying blip: bench data shows a ~4% rate where discovery cannot find the
+        # instrument, or the open cannot complete, while a probe microseconds later opens it
+        # and reads a clean *IDN? -- so the device never left the bus.
+        self.resource = resource if resource else "<unresolved>"
+        attempts: List[str] = []
+        # A value below 1 would skip the loop entirely and fall through with no session and
+        # no error, so "no retries" is spelled 1, and 0 is treated as 1 rather than trusted.
+        max_attempts = max(1, self.OPEN_RETRIES)
+        for attempt in range(1, max_attempts + 1):
+            try:
+                self.resource = self._resolve_resource(resource)
+                self._instr = self._rm.open_resource(self.resource)
+                self._instr.timeout = timeout_ms
+                self._instr.read_termination = self.READ_TERMINATION
+                self._instr.write_termination = self.WRITE_TERMINATION
+                break
+            except Exception as exc:
+                # The open may well have succeeded and a later line failed, leaving a live
+                # session with nothing left to reference it. Release it before trying again:
+                # on an exclusive-access USB resource a session we are still holding is
+                # exactly what makes the next attempt fail, so retrying without this turns a
+                # recoverable transient into a guaranteed failure that blames the instrument.
+                self._release_instr()
+                attempts.append(f"{type(exc).__name__}: {exc}")
+                if attempt == max_attempts:
+                    self._close_transcript()
+                    raise InstrumentError(
+                        f"Could not reach {type(self).__name__} at {self.resource!r} after "
+                        f"{max_attempts} attempts:\n" + _summarize_attempts(attempts)
+                    ) from exc
+                logger.warning(
+                    "Reaching %s failed (%s); retrying in %.1f s",
+                    type(self).__name__,
+                    exc,
+                    self.OPEN_RETRY_DELAY_S * attempt,
+                )
+                time.sleep(self.OPEN_RETRY_DELAY_S * attempt)
+        if attempts:
+            logger.info("Reached %s on attempt %d", self.resource, len(attempts) + 1)
 
         self._log(f"OPEN   {self.resource}")
-        self._drain_errors()
-        self.idn = self.query("*IDN?")
+        try:
+            self._drain_errors()
+            self.idn = self.query("*IDN?")
+        except Exception:
+            # The caller never gets this half-built object, so nothing else can close the
+            # session it already holds. Release it before propagating, or an exclusive-access
+            # USB resource stays claimed until the interpreter exits.
+            self.close()
+            raise
         self._log(f"IDN    {self.idn}")
 
     # ------------------------------------------------------------------ discovery
