@@ -39,6 +39,12 @@ class TimeStream(Base):
     ``1 / df`` would instead chop the line into a pulse train at the sample rate; see
     ``daq/instruments/README.md`` for why that is almost never what you want. The value also
     sits just under presto's 24-bit ceiling, ``(2**24 - 1) * CLK_T`` (33.5 ms at 2 ns).
+
+    **Inferred, not scope-verified.** The continuous-high behaviour follows from the presto
+    Python layer -- the per-window ``(start, stop)`` clock pair sent with ``df``, and the
+    ``set_trigger_out`` docstring's "at the start of every demodulation window" -- and from
+    ``QCTrace``'s gated ramp spanning whole records. How the FPGA actually responds to a width
+    exceeding the window period has not been checked on an oscilloscope.
     """
 
     def __init__(
@@ -156,16 +162,34 @@ class TimeStream(Base):
         a single pair alongside ``df`` -- so ports enabled in the same acquisition necessarily
         share their timing. Independent timing needs separate acquisitions.
 
+        Because the resolved value is what :attr:`external_trigger` stores, that attribute is
+        an array rather than the bool it was before per-port routing existed. Test it with
+        ``.any()`` or ``.size``; plain ``if ts.external_trigger:`` raises on an empty or
+        multi-element array.
+
         :param external_trigger: ``True``/``False``, or a sequence of per-port states.
         :return: The resolved states as an integer array; empty when no port is triggered.
-        :raises ValueError: If a state is outside ``{0, 1, 2}`` or more than
+        :raises ValueError: If a state is outside ``{0, 1, 2}``, is non-integral, or more than
             :data:`MAX_TRIGGER_PORTS` ports are addressed.
 
         """
         if isinstance(external_trigger, (bool, np.bool_)):
-            states = np.array([1], dtype=np.int64) if external_trigger else np.zeros(0, np.int64)
-        else:
-            states = np.atleast_1d(np.asarray(external_trigger, dtype=np.int64))
+            return np.array([1], dtype=np.int64) if external_trigger else np.zeros(0, np.int64)
+        raw = np.atleast_1d(np.asarray(external_trigger))
+        # Reject non-integral input rather than truncating it. A state computed as
+        # 0.999... would otherwise silently become 0 -- the trigger never fires and
+        # the acquisition looks like a dead detector rather than a misconfiguration.
+        if np.issubdtype(raw.dtype, np.floating):
+            if not np.all(raw == np.round(raw)):
+                raise ValueError(
+                    f"external_trigger states must be whole numbers, got {raw.tolist()}"
+                )
+        elif not np.issubdtype(raw.dtype, np.integer) and not np.issubdtype(raw.dtype, np.bool_):
+            raise ValueError(
+                "external_trigger must be a bool or a sequence of integer per-port states, "
+                f"got dtype {raw.dtype}"
+            )
+        states = raw.astype(np.int64)
         if states.ndim != 1:
             raise ValueError(f"external_trigger must be one-dimensional, got shape {states.shape}")
         if states.size > MAX_TRIGGER_PORTS:

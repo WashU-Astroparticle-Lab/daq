@@ -23,7 +23,8 @@ class DC2200(VisaInstrument):
       width from repetition rate. This is the mode for a short pulse at a slow rate, e.g.
       10 us at 2 Hz.
     - :meth:`configure_ttl` -- the LED follows an external logic signal, the only mode whose
-      timing can be synchronised to an acquisition.
+      timing can be synchronised to an acquisition. Driven from a ``TimeStream`` that means a
+      steady illumination window spanning the record, not pulses within it.
 
     Requested currents are validated against the instrument's own configured current limit,
     queried at first use, so a typo cannot drive the LED past what the head is set up for.
@@ -238,12 +239,25 @@ class DC2200(VisaInstrument):
     def configure_ttl(self, current_a: float, *, output: bool = False) -> None:
         """Configure TTL modulation: the LED follows the rear-panel modulation input.
 
-        In this mode the LED drives at *current_a* while the SMA modulation input on the rear
-        panel is high, and is off while it is low. Driving that input from the Presto's
-        trigger output is how an LED pulse is synchronised to an acquisition -- see
-        ``daq/instruments/README.md`` for the wiring and the timing.
+        "TTL" is the ordinary digital-logic sense -- transistor-transistor logic, a 0 V-low /
+        ~5 V-high on/off signal. In this mode the LED drives at *current_a* while the SMA
+        modulation input on the rear panel is high, and is off while it is low. Driving that
+        input from the Presto's trigger output is how illumination is synchronised to an
+        acquisition -- see ``daq/instruments/README.md`` for the wiring and the timing.
 
         The input accepts 0-5 V at up to 250 kHz.
+
+        Note this yields an illumination **window** spanning the acquisition, not a pulse
+        inside it: the Presto re-asserts its trigger every lock-in window, so the line is high
+        from the first sample to the last. For a short flash see
+        :meth:`configure_pulse` (instrument-timed, but not synchronised) or presto's
+        ``Pulsed.output_digital_marker`` (synchronised, but a different measurement mode that
+        this library does not wrap).
+
+        In the lab's default wiring the modulation input is on Presto **digital output port
+        2**, so pair this with ``TimeStream(external_trigger=[0, 1])``; plain
+        ``external_trigger=True`` gates port 1 (the function generator) and leaves the LED
+        dark.
 
         Configuring the mode does **not** arm the LED. Enabling the output (``output=True``
         here, or ``led.output = True`` later) arms the output stage, after which the LED
@@ -406,8 +420,10 @@ class DC2200(VisaInstrument):
 
         **This is not synchronised with anything.** Because the start is software-timed, it
         cannot be placed reliably within a :class:`~daq.measurements.timestream.TimeStream`
-        acquisition. To pulse the LED at a known point in a time stream, use
-        :meth:`configure_ttl` and gate it from the Presto trigger output instead.
+        acquisition. :meth:`configure_ttl` is what locks the LED to a time stream, but note it
+        gives a steady illumination window spanning the acquisition rather than pulses within
+        it -- the two modes are not interchangeable. Choose PWM when you need real pulses and
+        can tolerate an unknown offset, TTL when you need the light to line up with the data.
 
         The output is turned off in a ``finally``, so it is disabled even if the wait is
         interrupted. The instrument is left in PWM mode with these settings, so a subsequent

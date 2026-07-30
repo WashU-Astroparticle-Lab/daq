@@ -129,7 +129,14 @@ every sum window. Which instrument you gate is therefore decided by what is wire
 | `[0, 1]` | port 2 |
 | `[1, 1]` | ports 1 and 2, fired together |
 
-The Presto has four digital output ports, so at most four states; a longer list raises.
+The Presto has four digital output ports, so at most four states; a longer list raises, as do
+non-integral states (a state computed as `0.999…` would otherwise silently disable the port).
+
+> **`ts.external_trigger` is an array, not a bool.** The constructor argument still accepts
+> `True`/`False` and means exactly what it always did, but the attribute now stores the
+> resolved per-port states. Test it with `.any()` or `.size` — a bare
+> `if ts.external_trigger:` raises `ValueError` on an empty or multi-element array. This also
+> applies to objects returned by `TimeStream.load()` on pre-existing files.
 
 Two constraints worth knowing before you plan a measurement around this:
 
@@ -137,7 +144,9 @@ Two constraints worth knowing before you plan a measurement around this:
   the start of every lock-in window (every `1 / df`), and `TimeStream.TRIGGER_WIDTH_S`
   (30 ms) is far longer than any window used here, so the line goes high when acquisition
   starts and stays high until it ends. That is what a gated bias ramp or a TTL-driven LED
-  wants; it is *not* a timed one-shot.
+  wants; it is *not* a timed one-shot. This is **inferred from the presto implementation and
+  not yet scope-verified** — see the call-out under *Routing the trigger* in
+  `daq/instruments/README.md`.
 - **Timing is shared across ports.** presto sends a single global `delay`/`width` pair
   alongside `df`, so ports enabled in the same acquisition are gated identically. Only the
   on/off state is per port. Independent timing needs separate acquisitions.
