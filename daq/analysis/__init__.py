@@ -24,15 +24,25 @@ from .mattis_bardeen import (
 )
 from .folding import fold_timestream
 from .plotting import plot_iq_comparison, plot_qc_trace
+from .resonator import (
+    ResonatorFitError,
+    environmental_term,
+    fit_notch,
+    resonator_tools_available,
+)
 
 __all__ = [
+    "ResonatorFitError",
     "averaged_psd_cleaned",
     "averaged_psd_timestream",
     "clean_correlated_streams",
     "compute_psd",
+    "environmental_term",
+    "fit_notch",
     "fit_parity_psd",
     "fold_timestream",
     "from_elec_to_reson",
+    "resonator_tools_available",
     "parity_psd_model",
     "remove_correlated_noise",
     "plot_iq_comparison",

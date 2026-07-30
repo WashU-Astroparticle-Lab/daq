@@ -25,9 +25,16 @@ scipy = "*"
 # Only needed to talk to VISA benchtop instruments (daq.instruments); the analysis-side
 # installs have no VISA runtime, so daq.instruments imports it lazily.
 pyvisa = {version = "*", optional = true}
+# Resonator circle fitting (daq.analysis.resonator, used by Sweep/SweepPower and
+# plot_iq_comparison). Imported lazily so DAQ runs without it; fits are skipped when
+# absent. Use the UPSTREAM package -- the WashU fork is no longer required, since
+# daq.analysis.resonator recovers the environmental term via the public
+# do_calibration() API.
+resonator_tools = {version = ">=2.1.0", optional = true}
 
 [tool.poetry.extras]
 instruments = ["pyvisa"]
+analysis = ["resonator_tools"]
 
 [build-system]
 requires = ["poetry-core>=1.0.8", "setuptools>=61.0"]

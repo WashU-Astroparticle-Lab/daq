@@ -4,6 +4,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 
 ## Contents
 
+- [Resonator fitting](#resonator-fitting)
 - [Noise PSD](#noise-psd)
 - [Parity PSD fit (random-telegraph model)](#parity-psd-fit-random-telegraph-model)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
@@ -15,6 +16,49 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
   - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
 - [Mattis-Bardeen Fitting](#mattis-bardeen-fitting)
 - [Helper Functions](#helper-functions)
+
+---
+
+## Resonator fitting
+
+`fit_notch` is the single entry point for resonator circle fitting. `Sweep`, `SweepPower` and `plot_iq_comparison` all go through it, so you rarely call it directly — but you do need to know what it adds.
+
+It runs the **stock upstream** `resonator_tools` `notch_port.autofit()` and returns that same `notch_port`, so everything you expect is there (`fr`, `Ql`, `absQc`, `Qi_dia_corr`, `phi0`, the `*_err` keys, `z_data_sim`, `f_data`). On top of that it adds the *environmental term* of Eqn. 1 — the readout chain's gain, phase offset and cable delay, `a·e^{iα}·e^{-2πifτ}` — which upstream computes internally and then throws away:
+
+```python
+from daq.analysis import fit_notch
+
+port = fit_notch(sw.freq_arr, sw.resp_arr, fcrop=(f_min, f_max))
+
+env = port.fitresults["environmental_term"]      # complex array over freq_arr
+tau = port.fitresults["environmental_delay"]     # cable delay, seconds
+a   = port.fitresults["environmental_amp_norm"]  # gain prefactor
+al  = port.fitresults["environmental_alpha"]     # phase offset, radians
+
+# Dividing it out is what moves you into the fractional basis:
+normalized = sw.resp_arr / env
+```
+
+That term is what `from_elec_to_reson` and `plot_iq_comparison` divide out to reach the fractional and resonator bases, which is why it has to be available.
+
+### Why this module exists
+
+`environmental_term` is **not** an upstream `resonator_tools` key. DAQ used to depend on a private fork (`FaroutYLq/resonator_tools`) that patched it into `fitresults`; on a stock `pip install resonator_tools` the analysis functions above died with `KeyError: 'environmental_term'`, and nothing in the repository declared or checked that dependency. The fork was also 50 commits behind upstream, missing its numerical-stability work.
+
+The fork turned out to be unnecessary. `notch_port.do_calibration()` is public API and returns exactly the values the fork saved, so `fit_notch` lets upstream own the entire fitting algorithm and simply re-runs that deterministic calibration to recover them. The reconstruction is verified on **every call** — both that the baseline slope `A2` is still zero (the consumers divide by `environmental_term` alone, so a non-zero baseline would quietly bias every basis transformation) and that the recovered term reproduces upstream's own normalization. Either failure raises `ResonatorFitError` naming the problem, instead of returning a silently wrong basis.
+
+Values are bit-for-bit identical to the old fork's, so migrating changes no previously published number.
+
+### Optional dependency
+
+Fitting needs `resonator_tools` (`pip install resonator_tools`, or `pip install daq[analysis]`). It is imported lazily, so DAQ works without it — fits are skipped rather than fatal. To branch on it explicitly:
+
+```python
+from daq.analysis import resonator_tools_available
+
+if resonator_tools_available():
+    port = fit_notch(freq_arr, resp_arr)
+```
 
 ---
 
