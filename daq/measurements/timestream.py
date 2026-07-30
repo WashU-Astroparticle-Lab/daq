@@ -4,7 +4,7 @@ TimeStream measurement class for acquiring time-domain data with multiple freque
 """
 
 import warnings
-from typing import List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Sequence, Union
 
 import h5py
 import numpy as np
@@ -251,7 +251,28 @@ class TimeStream(Base):
         presto_port: Optional[int] = None,
         ext_ref_clk: bool = False,
         save_filename: Optional[str] = None,
+        on_acquire: Optional[Callable[[], None]] = None,
     ) -> str:
+        """Run the acquisition, save it, and return the saved file's path.
+
+        :param presto_address: Presto IP address. Defaults to ``DAQ_PRESTO_ADDRESS``.
+        :param presto_port: Presto port. Defaults to ``DAQ_PRESTO_PORT``.
+        :param ext_ref_clk: Lock the Presto to its external reference clock input.
+        :param save_filename: Explicit output path; auto-generated when ``None``.
+        :param on_acquire: Optional callable invoked **once, immediately before acquisition
+            starts** -- after the seconds of connect/configure/tune work and after
+            ``apply_settings()`` (so any trigger output is already asserted), just before
+            ``get_pixels()``. This is the few-millisecond-accurate place to software-start
+            side hardware whose timing should line up with sample zero, e.g. a DC2200 pulse
+            train (``on_acquire=lambda: led arm``): started *before* ``run()`` it would lead
+            the data by an unknown seconds-scale offset, started here it leads by roughly one
+            USB write. Keep it fast and side-effect-only; its return value is ignored. If it
+            raises, the acquisition is abandoned and the exception propagates (the Presto
+            connection closes; any instrument armed by earlier code is the caller's to
+            disarm, e.g. via its ``with`` block).
+        :returns: Path of the saved HDF5 file.
+
+        """
         if presto_address is None:
             presto_address = get_presto_address()
         if presto_port is None:
@@ -295,6 +316,12 @@ class TimeStream(Base):
                 lck.set_trigger_out(trigger_states.tolist(), width=self.TRIGGER_WIDTH_S)
 
             lck.apply_settings()
+
+            if on_acquire is not None:
+                # Last stop before data: everything slow (connect, configure, tune) is done
+                # and the trigger is asserted, so side hardware started here lands within a
+                # few ms of sample zero instead of an unknown seconds-scale offset.
+                on_acquire()
 
             # Acquire data
             pixel_dict = lck.get_pixels(self.pixel_counts)
