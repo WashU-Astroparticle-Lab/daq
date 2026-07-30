@@ -11,7 +11,7 @@ import numpy.typing as npt
 
 if TYPE_CHECKING:
     from daq.measurements.sweep import Sweep
-    from daq.measurements.timestream import TimeStream
+    from daq.measurements.timestream import TimeStream, TriggerAny
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
@@ -750,7 +750,7 @@ def averaged_psd_timestream(
     device: Optional[str] = None,
     filter: Optional[str] = None,
     notes: Optional[str] = None,
-    external_trigger: bool = False,
+    external_trigger: TriggerAny = False,
     presto_address: Optional[str] = None,
     presto_port: Optional[int] = None,
     ext_ref_clk: bool = False,
@@ -810,7 +810,8 @@ def averaged_psd_timestream(
     :param device: Forwarded to :class:`TimeStream` (used in the saved metadata).
     :param filter: Forwarded to :class:`TimeStream`.
     :param notes: Forwarded to :class:`TimeStream`.
-    :param external_trigger: Forwarded to :class:`TimeStream`.
+    :param external_trigger: Forwarded to :class:`TimeStream`. ``True`` gates digital output
+        port 1; pass a per-port states list (e.g. ``[0, 1]``) to gate a different port.
     :param presto_address: Forwarded to :meth:`TimeStream.run`.
     :param presto_port: Forwarded to :meth:`TimeStream.run`.
     :param ext_ref_clk: Forwarded to :meth:`TimeStream.run`.

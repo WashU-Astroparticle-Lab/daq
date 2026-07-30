@@ -4,7 +4,7 @@ TimeStream measurement class for acquiring time-domain data with multiple freque
 """
 
 import warnings
-from typing import List, Optional, Union
+from typing import List, Optional, Sequence, Union
 
 import h5py
 import numpy as np
@@ -18,9 +18,29 @@ from ..config import get_presto_address, get_presto_port
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
+TriggerAny = Union[bool, Sequence[int], npt.NDArray[np.integer]]
+
+#: Presto exposes four digital output ports. presto packs the per-port trigger
+#: states two bits at a time into a single uint8 (``Msg__LckSetDf``), and
+#: ``Pulsed.output_digital_marker`` bounds its ports to 1-4, so a longer states
+#: list would silently overflow the wire format rather than address a 5th port.
+MAX_TRIGGER_PORTS = 4
 
 
 class TimeStream(Base):
+    TRIGGER_WIDTH_S: float = 0.03
+    """s -- trigger-high duration handed to presto's ``set_trigger_out``.
+
+    presto re-asserts the trigger at the start of **every** lock-in window, i.e. every
+    ``1 / df``. This width is far longer than any lock-in window used here (20 μs at
+    ``df = 50 kHz``), so the next rising edge always arrives before the falling edge is due
+    and the line stays **high for the whole acquisition** -- which is what a gated bias ramp
+    or a TTL-driven LED needs. It is not a one-shot pulse of this length. A width *below*
+    ``1 / df`` would instead chop the line into a pulse train at the sample rate; see
+    ``daq/instruments/README.md`` for why that is almost never what you want. The value also
+    sits just under presto's 24-bit ceiling, ``(2**24 - 1) * CLK_T`` (33.5 ms at 2 ns).
+    """
+
     def __init__(
         self,
         lo_freq: float,
@@ -35,7 +55,7 @@ class TimeStream(Base):
         device: Optional[str] = None,
         filter: Optional[str] = None,
         notes: Optional[str] = None,
-        external_trigger: bool = False,
+        external_trigger: TriggerAny = False,
         discard_start_ms: float = 25.0,
     ) -> None:
         self.lo_freq = lo_freq
@@ -74,7 +94,11 @@ class TimeStream(Base):
         self.device = device
         self.filter = filter
         self.notes = notes
-        self.external_trigger = external_trigger
+        # Per-digital-output-port trigger states, resolved to the list presto's
+        # set_trigger_out expects. Element i configures port i+1, so which
+        # instrument is gated depends on what is wired where: [1] drives port 1
+        # only, [0, 1] port 2 only, [1, 1] both. See resolve_trigger_states.
+        self.external_trigger = self.resolve_trigger_states(external_trigger)
         # The first tens of milliseconds of an acquisition are typically startup
         # junk. discard_start_ms leading milliseconds are dropped from the
         # in-memory time-axis arrays after run()/load() (the saved HDF5 keeps the
@@ -111,6 +135,51 @@ class TimeStream(Base):
             "is_usb must have the same length as if_freqs "
             f"({self.is_usb.shape} != {self.if_freqs.shape})"
         )
+
+    @staticmethod
+    def resolve_trigger_states(external_trigger: TriggerAny) -> npt.NDArray[np.int64]:
+        """Normalise an ``external_trigger`` argument to presto's per-port states list.
+
+        presto's :meth:`presto.lockin.Lockin.set_trigger_out` takes one state **per digital
+        output port**: element *i* configures port *i+1*, where ``0`` means no trigger, ``1``
+        triggers on every lock-in window and ``2`` on every sum window. Which instrument is
+        gated is therefore purely a question of what is wired to which port::
+
+            [1]     or [1, 0]  -- port 1 only  (e.g. a gated Agilent 33220A ramp)
+            [0, 1]             -- port 2 only  (e.g. a DC2200 in TTL mode)
+            [1, 1]             -- both ports, fired together
+
+        ``True`` is accepted as a shorthand for ``[1]``, which is what every caller written
+        before per-port routing existed meant, and ``False`` for "no trigger at all".
+
+        Note that ``delay`` and ``width`` are **global**, not per port -- presto sends them as
+        a single pair alongside ``df`` -- so ports enabled in the same acquisition necessarily
+        share their timing. Independent timing needs separate acquisitions.
+
+        :param external_trigger: ``True``/``False``, or a sequence of per-port states.
+        :return: The resolved states as an integer array; empty when no port is triggered.
+        :raises ValueError: If a state is outside ``{0, 1, 2}`` or more than
+            :data:`MAX_TRIGGER_PORTS` ports are addressed.
+
+        """
+        if isinstance(external_trigger, (bool, np.bool_)):
+            states = np.array([1], dtype=np.int64) if external_trigger else np.zeros(0, np.int64)
+        else:
+            states = np.atleast_1d(np.asarray(external_trigger, dtype=np.int64))
+        if states.ndim != 1:
+            raise ValueError(f"external_trigger must be one-dimensional, got shape {states.shape}")
+        if states.size > MAX_TRIGGER_PORTS:
+            raise ValueError(
+                f"external_trigger addresses {states.size} ports, but presto has only "
+                f"{MAX_TRIGGER_PORTS} digital output ports; a longer list overflows the "
+                "uint8 that carries the packed states"
+            )
+        if np.any((states < 0) | (states > 2)):
+            raise ValueError(
+                "external_trigger states must be 0 (off), 1 (every lock-in window) or "
+                f"2 (every sum window), got {states.tolist()}"
+            )
+        return states
 
     def check_discard(self) -> None:
         if self.discard_start_ms < 0:
@@ -189,10 +258,14 @@ class TimeStream(Base):
             ig = lck.add_input_group(self.input_port, len(self.if_freqs))
             ig.set_frequencies(self.if_freqs)
 
-            if self.external_trigger:
-                lck.set_trigger_out(
-                    [1], width=0.03
-                )  # Trigger signal as soon as "lck.apply_settings" is called
+            # Re-resolve rather than trusting the stored array, so assigning
+            # `ts.external_trigger = True` (or a states list) after construction
+            # still does what it says.
+            trigger_states = self.resolve_trigger_states(self.external_trigger)
+            if trigger_states.any():
+                # The trigger goes high as soon as "lck.apply_settings" is called,
+                # and stays high for the acquisition -- see TRIGGER_WIDTH_S.
+                lck.set_trigger_out(trigger_states.tolist(), width=self.TRIGGER_WIDTH_S)
 
             lck.apply_settings()
 
@@ -212,7 +285,9 @@ class TimeStream(Base):
             self.signal_freqs = np.where(self.is_usb, self.freqs_usb, self.freqs_lsb)
 
             # Mute outputs at the end
-            if self.external_trigger:
+            if trigger_states.any():
+                # set_trigger_out rebuilds its control word from zero, so a single
+                # 0 clears every port, not just port 1.
                 lck.set_trigger_out([0])  # Turns off trigger signal
             og.set_amplitudes(0.0)
             lck.apply_settings()
@@ -240,6 +315,16 @@ class TimeStream(Base):
             discard_start_ms = (
                 float(h5f.attrs["discard_start_ms"]) if "discard_start_ms" in h5f.attrs else 25.0
             )
+            # external_trigger has three vintages: absent (oldest files), a scalar
+            # bool attribute (before per-port routing), and a per-port states
+            # dataset (current). resolve_trigger_states maps the bool onto [1],
+            # which is the port the bool always meant.
+            if "external_trigger" in h5f:
+                external_trigger = h5f["external_trigger"][()]  # type: ignore
+            elif "external_trigger" in h5f.attrs:
+                external_trigger = bool(h5f.attrs["external_trigger"])
+            else:
+                external_trigger = False
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
@@ -286,6 +371,7 @@ class TimeStream(Base):
             input_port=input_port,
             is_usb=is_usb,
             dither=dither,
+            external_trigger=external_trigger,
             discard_start_ms=discard_start_ms,
         )
 

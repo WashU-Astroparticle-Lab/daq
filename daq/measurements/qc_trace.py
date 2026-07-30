@@ -20,7 +20,7 @@ from .._base import Base
 from ..analysis.folding import fold_timestream
 from ..instruments import Agilent33220A
 from .sweep import Sweep
-from .timestream import TimeStream
+from .timestream import TimeStream, TriggerAny
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -295,14 +295,17 @@ class QCTrace(Base):
         self,
         pixel_counts: int,
         *,
-        external_trigger: bool,
+        external_trigger: TriggerAny,
         notes: str,
     ) -> TimeStream:
         """Build a single-tone time stream on resonance, shared by every acquisition step.
 
         :param pixel_counts: Number of samples to acquire, including the discarded start.
         :param external_trigger: Whether the Presto asserts its trigger output, which gates
-            the ramp when the generator is in gated-burst mode.
+            the ramp when the generator is in gated-burst mode. ``True`` means digital output
+            port 1, which is where the gate ramp generator is expected to be wired; pass a
+            per-port states list to gate a different port (see
+            :meth:`~daq.measurements.timestream.TimeStream.resolve_trigger_states`).
         :param notes: Step description for the sub-measurement's note.
         :returns: The configured time stream.
 

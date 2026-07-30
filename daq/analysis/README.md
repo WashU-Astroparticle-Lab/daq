@@ -372,7 +372,7 @@ with Agilent33220A() as bias:
         lo_freq=fr, if_freqs=[0], df=FS,
         pixel_counts=bias.samples_for_periods(N_PERIODS, FS),
         amp=amp, output_port=1, input_port=1,
-        device="my_device", external_trigger=True,
+        device="my_device", external_trigger=True,    # port 1 gates the ramp
     )
     qc.attach(bias=bias)
     qc.run()

@@ -89,7 +89,7 @@ with Agilent33220A() as bias:
         lo_freq=fr, if_freqs=[0], df=5e4,
         pixel_counts=bias.samples_for_periods(200, 5e4),
         amp=amp, output_port=1, input_port=1,
-        device="my_device", external_trigger=True,
+        device="my_device", external_trigger=True,    # port 1 gates the ramp
     )
     ts.attach(bias=bias)                          # settings -> HDF5 attrs + MongoDB
     ts.run()
@@ -135,9 +135,13 @@ record reflects what the instrument actually did.
 
 ### Synchronising the bias to an acquisition
 
-`TimeStream(external_trigger=True)` makes the Presto assert its trigger output when the
-acquisition starts. `sawtooth(gated=True)` (the default) puts the 33220A in gated-burst mode,
-so the ramp runs only while that trigger is asserted. Pair them.
+`TimeStream(external_trigger=True)` makes the Presto assert **digital output port 1** for the
+duration of the acquisition. `sawtooth(gated=True)` (the default) puts the 33220A in
+gated-burst mode, so the ramp runs only while that trigger is asserted. Pair them, with the
+generator's external-gate input wired to port 1.
+
+If the generator is on a different port, pass the per-port states list instead of `True` —
+`[0, 1]` for port 2, and so on. See [Routing the trigger](#routing-the-trigger).
 
 `samples_for_periods(n_periods, sample_rate)` returns the `pixel_counts` spanning a whole
 number of ramp periods **plus** the samples `TimeStream` discards at the start — pass the
@@ -172,7 +176,7 @@ The DC2200 has four modes, selected by the `configure_*` method you call. They d
 | Constant current | `configure_cc()` | nothing — steady output | continuous illumination, checking the LED is alive |
 | PWM | `configure_pwm()` / `pulse_train()` | the DC2200's PWM engine, from a **duty cycle** | pulse trains where width and rate can be coupled |
 | Pulse | `configure_pulse()` | the DC2200's pulse engine, from an explicit **width** | short pulses at a slow rate, e.g. 10 µs at 2 Hz |
-| TTL | `configure_ttl()` | an external signal on the modulation input | pulses synchronised to a `TimeStream` |
+| TTL | `configure_ttl()` | an external signal on the modulation input | illumination synchronised to a `TimeStream` |
 
 **Choosing between PWM and Pulse.** PWM takes a *duty cycle*, and the instrument's duty floor
 is **0.1 %** (bench-confirmed), so the narrowest pulse PWM can produce is
@@ -225,7 +229,9 @@ Pass `configure_cc(..., output=True)` to configure and illuminate in one call.
 
 The DC2200 generates a burst of `count` pulses at a set frequency and duty cycle, then stops
 by itself. Pulse timing is instrument-accurate; only the moment the train *starts* is
-software-timed, so this is **not** synchronised with an acquisition — use TTL mode for that.
+software-timed, so this is **not** synchronised with an acquisition. TTL mode is what
+synchronises to a `TimeStream`, but note it yields a steady illumination window rather than
+pulses — see [Getting a genuinely short pulse](#getting-a-genuinely-short-pulse).
 
 `pulse_train()` is the blocking convenience form: configure, fire, wait for the train to
 finish, switch off.
@@ -348,10 +354,11 @@ precisely to get that wait right.
 
 ### TTL modulation
 
-The LED follows an external logic signal on the rear-panel SMA modulation input: on at the
-configured current while the input is high, off while it is low. This is the mode to use when
-the pulse must land at a known point in an acquisition, because the timing comes from the
-Presto rather than from Python.
+"TTL" here is the ordinary digital-logic sense — *transistor–transistor logic*, i.e. a 0 V-low
+/ ~5 V-high on/off signal. In this mode the LED follows such a signal on the rear-panel SMA
+modulation input: on at the configured current while the input is high, off while it is low.
+This is the mode to use when the illumination must line up with an acquisition, because the
+timing comes from the Presto rather than from Python.
 
 ```python
 with DC2200() as led:
@@ -363,8 +370,10 @@ with DC2200() as led:
 |---|---|---|
 | `current_a` | 0.01 | Drive the LED at **10 mA** whenever the modulation input is high |
 
-That single current is the only parameter the mode has — pulse length and repetition are
-whatever the driving signal does. The input accepts 0–5 V at up to 250 kHz.
+That single current is the only parameter the mode has — on-time and repetition are whatever
+the driving signal does. The input accepts 0–5 V at up to 250 kHz. Driven from a `TimeStream`,
+that signal is high for the whole acquisition, so plan for an illumination window rather than
+a pulse.
 
 `configure_ttl()` writes `SOURCE1:MODE TTL` and the drive current, leaving the output off.
 Enabling the output arms the stage; the LED then lights whenever the input goes high.
@@ -376,46 +385,76 @@ Enabling the output arms the stage; the LED then lights whenever the input goes 
 
 `settings()` reports `mode` and `ttl_current_a`.
 
-See [Time stream synchronised with an LED pulse](#time-stream-synchronised-with-an-led-pulse)
+See [Time stream synchronised with the LED](#time-stream-synchronised-with-the-led)
 below for the wiring, the timing, and when exactly the LED lights.
 
-## Time stream synchronised with an LED pulse
+## Routing the trigger
 
-The LED is fired by the **Presto's trigger output**, not by a software call. Software timing
-is useless here: `TimeStream.run()` spends an indeterminate time connecting, configuring the
-mixer and tuning before acquisition actually starts, so an LED switched on from Python lands
+`TimeStream`'s `external_trigger` maps straight onto presto's `Lockin.set_trigger_out`, which
+takes one state **per digital output port**: element *i* configures port *i+1*, where `0` is
+off, `1` triggers on every lock-in window and `2` on every sum window (inert here — plain
+`get_pixels()` does no summing). So the parameter is really "which ports go high", and what it
+gates depends entirely on your wiring.
+
+| `external_trigger` | ports asserted | the lab's default wiring |
+|---|---|---|
+| `False` | none | — |
+| `True` (= `[1]`) | 1 | Agilent 33220A gate |
+| `[0, 1]` | 2 | DC2200 modulation input |
+| `[1, 1]` | 1 and 2 | both, fired together |
+
+The Presto has four digital output ports (presto packs the states two bits at a time into a
+single byte, and `Pulsed.output_digital_marker` bounds ports to 1–4), so a list longer than
+four raises rather than silently overflowing the wire format.
+
+**Timing is global, not per port.** presto sends one `delay`/`width` pair alongside `df`, so
+every port enabled in the same acquisition is gated identically. You cannot hold one port high
+across the record while pulsing another; that needs separate acquisitions.
+
+**What the line actually does.** `TimeStream.TRIGGER_WIDTH_S` is 30 ms, but this is *not* a
+30 ms one-shot. presto re-asserts the trigger at the start of **every lock-in window**, i.e.
+every `1 / df` — 20 µs at `df = 50 kHz`. Since the configured width is ~1500 windows long, the
+next rising edge always arrives before the falling edge is due, so:
+
+```
+acquisition starts  ->  trigger HIGH
+   ... entire record, line stays high ...
+acquisition ends    ->  set_trigger_out([0]) + apply_settings  ->  LOW
+```
+
+A width *shorter* than `1 / df` would instead chop the line into a pulse train at the sample
+rate — a 50 kHz chopper, essentially never what you want. There is no width that yields a
+single short pulse inside a long record; see [Getting a genuinely short
+pulse](#getting-a-genuinely-short-pulse).
+
+> **Inferred, not yet measured.** The continuous-high behaviour follows from the presto
+> Python layer (the docstring's "at the start of every demodulation window", and the
+> window-relative `(start, stop)` clock pair sent with `df`) and from the fact that `QCTrace`'s
+> gated ramp spans the whole record. The FPGA's exact response to `width` exceeding the window
+> period has not been checked on a scope. If you have one on the bench, probing the trigger
+> line during an `external_trigger` run settles this and the idle-level question below in one
+> trace — and is worth doing before designing a measurement around the timing.
+
+## Time stream synchronised with the LED
+
+The LED is gated by the **Presto's trigger output**, not by a software call. Software timing is
+useless here: `TimeStream.run()` spends an indeterminate time connecting, configuring the mixer
+and tuning before acquisition actually starts, so an LED switched on from Python lands
 somewhere unknown relative to the data. The trigger line is asserted immediately before
 acquisition begins, which is the only reliable reference.
 
 ### Wiring
 
 ```
-Presto trigger output  ──►  DC2200 rear-panel SMA modulation input
+Presto digital output port 2  ──►  DC2200 rear-panel SMA modulation input
 ```
+
+Port 2 is the lab's default; port 1 carries the 33220A gate. Whichever you use, say so with
+`external_trigger` — `[0, 1]` for port 2 — or the LED simply never fires.
 
 The DC2200 modulation input accepts 0–5 V at up to 250 kHz. In TTL mode the LED drives at the
-configured current while that input is high and is off while it is low, so the LED is on for
-exactly as long as the Presto asserts its trigger.
-
-### Timing
-
-`TimeStream(external_trigger=True)` asserts the trigger for **30 ms** starting at the instant
-acquisition begins:
-
-```
-t = 0 ms     trigger HIGH  ->  LED on;  acquisition starts
-t = 30 ms    trigger LOW   ->  LED off
-t > 30 ms    acquisition continues, recording the decay
-```
-
-So a single acquisition captures the LED-on window, the turn-off, and the detector's recovery
-afterwards. The 30 ms width is currently hardcoded in `TimeStream.run()`, so it is the same
-for every acquisition.
-
-> **Set `discard_start_ms=0`.** `TimeStream` discards the first 25 ms of every acquisition by
-> default, which would throw away all but the last 5 ms of a 30 ms LED pulse. For LED-pulse
-> measurements you almost always want the start of the record, so disable the trim. This is
-> the easiest way to get a time stream that appears to show no LED response at all.
+configured current while that input is high and is off while it is low, so the LED is lit for
+exactly as long as the Presto asserts that port: the whole acquisition.
 
 ### Recipe
 
@@ -432,17 +471,22 @@ with DC2200() as led:
         pixel_counts=int(FS * TIME_TOTAL_S),
         amp=amp, output_port=1, input_port=1,
         device="my_device",
-        notes="LED pulse response",
-        external_trigger=True,             # Presto gates the LED
-        discard_start_ms=0,                # keep the pulse -- see the warning above
+        notes="LED response",
+        external_trigger=[0, 1],           # port 2 -> the DC2200 modulation input
+        discard_start_ms=0,                # keep the turn-on edge -- see below
     )
 
     led.output = True                      # arm: from here the LED follows the trigger
     ts.attach(led=led)                     # led_mode, led_ttl_current_a, ... -> HDF5 + MongoDB
     ts.run()
 
-ts.analyze()                               # the pulse sits in the first 30 ms
+ts.analyze()                               # LED turn-on at t = 0, lit for the whole record
 ```
+
+> **`discard_start_ms=0` keeps the turn-on edge.** `TimeStream` drops the first 25 ms of every
+> acquisition by default. The LED comes up with the RF drive at `t = 0`, so the default trim
+> throws away the turn-on transient and the detector's approach to steady state — usually the
+> most interesting part. It does not hide the illumination itself, since the LED stays on.
 
 **When does the LED actually light?** Not on any of the first four lines — it lights inside
 `run()`:
@@ -451,14 +495,13 @@ ts.analyze()                               # the pulse sits in the first 30 ms
 |---|---|---|
 | `led.configure_ttl(current_a=0.01)` | `SOURCE1:MODE TTL` + current; output left off | dark, guaranteed |
 | `ts = TimeStream(...)` | none — pure Python object construction | dark |
-| `led.output = True` | `OUTPUT1:STATE ON`, arming the output stage | dark *if the trigger idles low*; from here it tracks the trigger line |
+| `led.output = True` | `OUTPUT1:STATE ON`, arming the output stage | dark *if the trigger idles low*; from here it tracks the modulation input |
 | `ts.attach(led=led)` | VISA queries only, reading state back | unchanged |
-| `ts.run()` | connect → configure mixer → tune → `set_trigger_out([1], width=0.03)` → **`apply_settings()`** → `get_pixels()` | **lights here**, for 30 ms |
+| `ts.run()` | connect → configure mixer → tune → `set_trigger_out([0, 1], width=…)` → **`apply_settings()`** → `get_pixels()` | **lights here**, for the acquisition |
 
 `set_trigger_out()` only *stages* the trigger; `apply_settings()` is what asserts the line, and
 it runs immediately before `get_pixels()` starts acquiring. The readout tone's amplitude is
-applied by that same call, so the LED and the RF drive come up together. With
-`discard_start_ms=0` the pulse therefore lands in the first 30 ms of the saved record.
+applied by that same call, so the LED and the RF drive come up together.
 
 The one way to light the LED earlier is the idle-level caveat below: if the trigger line sits
 high between acquisitions, the LED comes on at `led.output = True` and stays on.
@@ -470,10 +513,10 @@ follow the modulation input. Pass `configure_ttl(..., output=True)` to do both a
 want, but the two-step form above is what the recipe uses deliberately:
 
 > **Arm as late as possible.** `TimeStream.run()` connects to the Presto, configures the mixer
-> and tunes before it acquires anything, which takes appreciably longer than the 30 ms pulse
-> you are trying to record. If the trigger line idles high, everything armed before that point
-> sits illuminated for the whole setup — shining on the detector with no data being taken.
-> Arming immediately before `run()` keeps that window as short as the API allows.
+> and tunes before it acquires anything, which takes appreciably longer than the acquisition
+> itself. If the trigger line idles high, everything armed before that point sits illuminated
+> for the whole setup — shining on the detector with no data being taken. Arming immediately
+> before `run()` keeps that window as short as the API allows.
 >
 > The idle level of the Presto trigger output between acquisitions is **not something this
 > library controls, and we have not measured it.** `run()` drives it low at the end of a
@@ -483,54 +526,63 @@ want, but the two-step form above is what the recipe uses deliberately:
 
 On exit the LED is switched off even if the acquisition raises.
 
-### Repeated pulses
+### Averaging repeated acquisitions
 
-To average many pulses, loop the acquisition — each `run()` emits one trigger, so one pulse
-per acquisition, and each is saved and logged as usual:
+Each `run()` is one illuminated record. To average, loop — each acquisition is saved and
+logged as usual:
 
 ```python
 with DC2200() as led:
-    led.configure_ttl(current_a=0.01, output=True)   # arm once, fire once per run()
+    led.configure_ttl(current_a=0.01, output=True)   # arm once, fires once per run()
     streams = []
     for i in range(50):
-        ts = TimeStream(..., external_trigger=True, discard_start_ms=0,
-                        notes=f"LED pulse {i + 1}/50")
+        ts = TimeStream(..., external_trigger=[0, 1], discard_start_ms=0,
+                        notes=f"LED acquisition {i + 1}/50")
         ts.attach(led=led)
         ts.run()
         streams.append(ts)
 
-pulses = np.stack([s.signal[:, 0] for s in streams])
-mean_pulse = pulses.mean(axis=0)
+records = np.stack([s.signal[:, 0] for s in streams])
+mean_record = records.mean(axis=0)
 ```
 
 Do not use `fold_timestream` for this — it folds *one* record containing many drive periods,
-which is the sawtooth-bias case. Here each record holds a single pulse, so average across
-records.
+which is the sawtooth-bias case. Here each record holds a single illumination window, so
+average across records.
 
-### Why not a PWM train instead?
+### Getting a genuinely short pulse
 
-Because a PWM train's *start* is a software-timed USB write, it cannot be placed reliably
-inside an acquisition — the pulses would land at an unknown offset, different every run. Use
-[PWM mode](#pwm-pulse-train) when the pulses do not need to line up with data, and TTL mode
-whenever they do.
+TTL mode gives you an illumination *window* locked to the acquisition, not a short pulse
+inside it. If what you need is a brief flash, the options are:
+
+- **[PWM](#pwm-pulse-train) or [pulse mode](#pulse-mode-explicit-width)** — the DC2200 generates
+  the timing itself, so you get real short pulses, but the train *starts* on a software-timed
+  USB write and therefore lands at an unknown offset in the record, different every run. Fine
+  when the pulses need not line up with the data.
+- **`presto.pulsed`** — `Pulsed.output_digital_marker(at_time, duration, ports)` schedules a
+  digital marker of arbitrary duration at a defined time in a pulse sequence. That is a proper
+  hardware-timed short pulse, but it is a different presto measurement mode from `Lockin` and
+  is not wrapped by this library; `TimeStream` cannot produce it by changing a parameter.
 
 ### Both instruments at once
 
-`attach()` takes any number of instruments, so a run with both LED and gate bias records both:
+`attach()` takes any number of instruments, so a run with both LED and gate bias records both.
+Trigger the two ports together with `[1, 1]`:
 
 ```python
 with DC2200() as led, Agilent33220A() as bias:
-    led.configure_ttl(current_a=0.01)
-    bias.constant(0.98)
-    ts = TimeStream(..., external_trigger=True, discard_start_ms=0)
+    led.configure_ttl(current_a=0.01)      # LED on port 2
+    bias.sawtooth(vpp=2.0, freq_hz=500)    # gated ramp on port 1
+    ts = TimeStream(..., external_trigger=[1, 1], discard_start_ms=0)
     led.output = True                      # arm last, immediately before run()
     ts.attach(led=led, bias=bias)
     ts.run()
 ```
 
-Note that the single Presto trigger line gates whatever is wired to it. Driving the LED and a
-gated bias ramp from the same trigger fires them together; independent timing needs a second
-trigger channel.
+Both ports share one `delay`/`width`, so this fires them simultaneously and holds both high for
+the acquisition — you cannot stagger them. If the bias should ramp while the LED stays dark,
+use `external_trigger=True` (port 1 only) and leave the LED output disabled; the reverse is
+`[0, 1]` with `bias.constant(...)` instead of a gated ramp.
 
 ## SCPI gotchas
 
