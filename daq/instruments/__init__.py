@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
 """Benchtop instrument drivers (non-Presto hardware reached over VISA)."""
 
-from ._visa import InstrumentError, VisaInstrument, probe_visa_resources
+from ._visa import (
+    InstrumentError,
+    VisaInstrument,
+    probe_visa_resources,
+    visa_backend_info,
+)
 from .dc2200 import DC2200
 from .function_generator import Agilent33220A
 
@@ -11,4 +16,5 @@ __all__ = [
     "InstrumentError",
     "VisaInstrument",
     "probe_visa_resources",
+    "visa_backend_info",
 ]
