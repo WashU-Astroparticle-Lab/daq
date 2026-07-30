@@ -639,6 +639,195 @@ try:
 except ValueError:
     check("fold rejects a too-short record", True)
 
+# ---------------------------------------------------------------- transient VISA failures
+#
+# A DC2200 died mid-run with VI_ERROR_RSRC_NFOUND on a device that was fine minutes
+# earlier, and that a probe microseconds later listed and read a clean *IDN? from -- so
+# the instrument never left the bus. The blip surfaces at two points, discovery and
+# open, and construction retries both. These checks pin that behaviour down, including
+# the part that is easy to get wrong: releasing the VISA session when the post-open
+# handshake fails. Nothing else holds a reference to a half-built instrument, so a leak
+# there claims an exclusive-access USB resource until the interpreter exits, which turns
+# one transient into every later open failing.
+
+from daq.instruments import _visa as _visa_mod  # noqa: E402
+
+
+class SleepRecorder:
+    """Stand-in for the module's ``time``, so backoff is asserted without waiting."""
+
+    def __init__(self):
+        self.delays = []
+
+    def sleep(self, seconds):
+        self.delays.append(seconds)
+
+
+class FlakyRM(FakeRM):
+    """Resource manager that fails the first *n_failures* discoveries or opens.
+
+    :param fail_stage: ``"list"`` to fail resolution (``list_resources`` returns nothing,
+        as when the device is momentarily invisible), or ``"open"`` to fail the open with
+        the ``VI_ERROR_RSRC_NFOUND`` seen on the bench.
+    """
+
+    def __init__(self, resources, n_failures, fail_stage):
+        super().__init__(resources)
+        self.n_failures = n_failures
+        self.fail_stage = fail_stage
+        self.list_calls = 0
+        self.open_attempts = 0
+
+    def list_resources(self):
+        self.list_calls += 1
+        if self.fail_stage == "list" and self.list_calls <= self.n_failures:
+            return ()
+        return super().list_resources()
+
+    def open_resource(self, name):
+        self.open_attempts += 1
+        if self.fail_stage == "open" and self.open_attempts <= self.n_failures:
+            raise OSError("VI_ERROR_RSRC_NFOUND: Insufficient location information")
+        return super().open_resource(name)
+
+
+def install_rm(rm):
+    """Install an already-built resource manager as the fake pyvisa."""
+    mod = types.ModuleType("pyvisa")
+    mod.ResourceManager = lambda backend="": rm
+    sys.modules["pyvisa"] = mod
+    return rm
+
+
+LED_NAME = "USB0::0x1313::0x80C8::M01271962::INSTR"
+
+
+def fresh_led():
+    return {LED_NAME: FakeResource(LED_NAME, LED_IDN, led_state())}
+
+
+# Report a missing retry feature as failed checks rather than crashing partway through
+# the file, so reverting the fix still yields a readable summary instead of a traceback
+# that discards every result above.
+_real_time = getattr(_visa_mod, "time", None)
+_has_retry = _real_time is not None and hasattr(DC2200, "OPEN_RETRIES")
+
+if not _has_retry:
+    for _label in (
+        "healthy open incurs no retry delay",
+        "recovers from a transient open failure",
+        "used exactly 3 open attempts",
+        "backs off linearly between attempts",
+        "recovers when the discovery probe cannot open",
+        "recovers from a transient discovery failure",
+        "retried resolution, not just the open",
+        "error lists every attempt, not just the last",
+    ):
+        check(_label, False, "VisaInstrument does not retry a failed open")
+
+try:
+    if _has_retry:
+        # -- a healthy instrument must incur no delay at all
+        clock = SleepRecorder()
+        _visa_mod.time = clock
+        install_rm(FakeRM(fresh_led()))
+        DC2200().close()
+        check("healthy open incurs no retry delay", clock.delays == [], str(clock.delays))
+
+        # -- open-stage transient: the bench failure, two blips then success. Constructed with
+        #    an explicit resource so discovery is skipped -- autodiscovery probes candidates by
+        #    opening them, which would absorb the injected faults before the real open is
+        #    reached and make the attempt count mean something else.
+        clock = SleepRecorder()
+        _visa_mod.time = clock
+        rm = install_rm(FlakyRM(fresh_led(), n_failures=2, fail_stage="open"))
+        led = DC2200(resource=LED_NAME)
+        check("recovers from a transient open failure", led.resource == LED_NAME, led.resource)
+        check("used exactly 3 open attempts", rm.open_attempts == 3, str(rm.open_attempts))
+        check(
+            "backs off linearly between attempts",
+            clock.delays == [DC2200.OPEN_RETRY_DELAY_S, 2 * DC2200.OPEN_RETRY_DELAY_S],
+            str(clock.delays),
+        )
+        led.close()
+
+        # -- the same blip during autodiscovery, where the probe rather than the real open is
+        #    what cannot complete
+        clock = SleepRecorder()
+        _visa_mod.time = clock
+        rm = install_rm(FlakyRM(fresh_led(), n_failures=2, fail_stage="open"))
+        led = DC2200()
+        check(
+            "recovers when the discovery probe cannot open", led.resource == LED_NAME, led.resource
+        )
+        led.close()
+
+        # -- discovery-stage transient: the same blip, surfacing before any open. The first
+        #    version of this fix retried only the open and would still have died here.
+        clock = SleepRecorder()
+        _visa_mod.time = clock
+        rm = install_rm(FlakyRM(fresh_led(), n_failures=2, fail_stage="list"))
+        led = DC2200()
+        check("recovers from a transient discovery failure", led.resource == LED_NAME, led.resource)
+        check("retried resolution, not just the open", rm.list_calls == 3, str(rm.list_calls))
+        led.close()
+
+        # -- a real absence must still raise, and name every attempt rather than only the last
+        clock = SleepRecorder()
+        _visa_mod.time = clock
+        rm = install_rm(FlakyRM(fresh_led(), n_failures=99, fail_stage="open"))
+        try:
+            DC2200()
+            check("persistent failure still raises", False, "no exception")
+        except InstrumentError as exc:
+            msg = str(exc)
+            check("persistent failure still raises", True)
+            check(
+                "error lists every attempt, not just the last",
+                msg.count("attempt ") == DC2200.OPEN_RETRIES,
+                f"{msg.count('attempt ')} of {DC2200.OPEN_RETRIES}",
+            )
+            check("error names the underlying VISA fault", "VI_ERROR_RSRC_NFOUND" in msg)
+
+    # -- a failed handshake must release the session it already holds
+    class BrokenIdn(FakeResource):
+        """Opens fine, drains errors fine, then fails the *IDN? handshake."""
+
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.close_calls = 0
+
+        def query(self, cmd):
+            if cmd.strip().upper() == "*IDN?":
+                raise OSError("VI_ERROR_TMO: Timeout expired before operation completed")
+            return super().query(cmd)
+
+        def close(self):
+            self.close_calls += 1
+            super().close()
+
+    # No clock stub needed here: the handshake runs after the open succeeds, so this path
+    # never retries. It is also independent of the retry feature, hence outside the guard.
+    broken = BrokenIdn(LED_NAME, LED_IDN, led_state())
+    install_rm(FakeRM({LED_NAME: broken}))
+    try:
+        # Explicit resource again: via discovery the probe's own *IDN? would fail first, so
+        # construction would die in resolution and never reach the handshake under test.
+        DC2200(resource=LED_NAME)
+        check("a failed handshake propagates", False, "no exception")
+    except Exception as exc:
+        check("a failed handshake propagates", True, type(exc).__name__)
+        check(
+            "the original fault is not masked by cleanup",
+            "VI_ERROR_TMO" in str(exc),
+            str(exc)[:60],
+        )
+    check("a failed handshake releases the VISA session", broken.closed)
+    check("the session is closed exactly once", broken.close_calls == 1, str(broken.close_calls))
+finally:
+    if _real_time is not None:
+        _visa_mod.time = _real_time
+
 # ---------------------------------------------------------------- summary
 failed = [r for r in results if not r[1]]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
