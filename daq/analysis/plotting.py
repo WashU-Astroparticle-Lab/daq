@@ -269,7 +269,8 @@ def plot_iq_comparison(
         no ``freq_arr``/``resp_arr`` (i.e. has not been run).
     """
     import matplotlib.pyplot as plt
-    from resonator_tools import circuit
+
+    from .resonator import fit_notch
 
     if density not in ("scatter", "kde", "contour", "hexbin", "hist2d"):
         raise ValueError(
@@ -290,8 +291,7 @@ def plot_iq_comparison(
             max(f_ctr - span / 4, freq_arr.min()),
             min(f_ctr + span / 4, freq_arr.max()),
         )
-    port = circuit.notch_port(freq_arr, resp_arr)
-    port.autofit(fcrop=fcrop)
+    port = fit_notch(freq_arr, resp_arr, fcrop=fcrop)
 
     fit = port.fitresults
     env = np.asarray(fit["environmental_term"])
@@ -360,7 +360,7 @@ def plot_iq_comparison(
             zorder=10,
             label="QC trace",
         )
-   
+
     if freq_shift is not None:
         for sign in (+1, -1):
             s_idx = int(np.argmin(np.abs(freq_arr - (fr + sign * freq_shift))))

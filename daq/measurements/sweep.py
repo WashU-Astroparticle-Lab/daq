@@ -147,9 +147,9 @@ class Sweep(Base):
         if self.freq_arr is None or self.resp_arr is None:
             return False
 
-        try:
-            from resonator_tools import circuit
-        except ImportError:
+        from daq.analysis.resonator import fit_notch, resonator_tools_available
+
+        if not resonator_tools_available():
             # resonator_tools not available, skip fitting
             return False
 
@@ -164,8 +164,7 @@ class Sweep(Base):
                 f_ctr + self.freq_span / 4, self.freq_arr.max()
             )
 
-            port = circuit.notch_port(self.freq_arr, self.resp_arr)
-            port.autofit(fcrop=(f_min, f_max))
+            port = fit_notch(self.freq_arr, self.resp_arr, fcrop=(f_min, f_max))
 
             # Store fit results for database
             self.fit_results = port.fitresults
@@ -235,19 +234,15 @@ class Sweep(Base):
         if self.resp_arr is None:
             raise RuntimeError
 
-        try:
-            from resonator_tools import circuit
+        from daq.analysis.resonator import fit_notch, resonator_tools_available
 
-            _do_fit = do_fit
-        except ImportError:
-            _do_fit = False
+        _do_fit = do_fit and resonator_tools_available()
 
         resp_dB = 20.0 * np.log10(np.abs(self.resp_arr))
 
         def do_fit(fmin, fmax):
             if _do_fit:
-                port = circuit.notch_port(self.freq_arr, self.resp_arr)  # pyright: ignore[reportPossiblyUnboundVariable]
-                port.autofit(fcrop=(fmin, fmax))
+                port = fit_notch(self.freq_arr, self.resp_arr, fcrop=(fmin, fmax))
                 sim_db = 20 * np.log10(np.abs(port.z_data_sim))
                 f_min = port.f_data[np.argmin(sim_db)]  # type: ignore
                 print("----------------")

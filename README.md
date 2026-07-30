@@ -29,7 +29,12 @@ pip install -e .
 - pandas (for database querying)
 - pymongo (for database integration)
 - presto
-- resonator_tools
+- resonator_tools (optional, for resonator fitting: `pip install resonator_tools`)
+
+Use the **upstream** `resonator_tools` from PyPI. The old WashU fork
+(`FaroutYLq/resonator_tools`) is no longer required — `daq.analysis.resonator`
+recovers the environmental term through the package's public `do_calibration()` API,
+producing bit-for-bit identical values.
 
 ## Usage
 
