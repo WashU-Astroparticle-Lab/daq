@@ -20,7 +20,14 @@ from ..triggers import MAX_TRIGGER_PORTS, TriggerAny, resolve_trigger_states
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
 
-__all__ = ["MAX_TRIGGER_PORTS", "TimeStream", "TriggerAny"]
+__all__ = [
+    "BoolAny",
+    "FloatAny",
+    "MAX_TRIGGER_PORTS",
+    "TimeStream",
+    "TriggerAny",
+    "resolve_trigger_states",
+]
 
 
 class TimeStream(Base):

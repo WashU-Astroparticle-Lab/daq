@@ -25,6 +25,7 @@ repository root::
 import os
 import sys
 import tempfile
+import warnings
 
 try:
     import presto  # noqa: F401
@@ -165,6 +166,39 @@ check("explicit states beat the instrument", states_of(steps[0]) == [0, 0, 1], s
 
 check("True still means port 1", states_of(make(trigger_states=True).trigger_states) == [1])
 
+# 3b. The default re-reads the generator on EVERY run. Caching the first run's answer would
+# mean that rewiring the rig and re-running the same object silently gates the old port --
+# the failure this class exists to prevent, reintroduced through the back door.
+qct = make()
+first = run_with(qct, FakeBias(trigger_port=1))
+second = run_with(qct, FakeBias(trigger_port=2))
+check(
+    "a second run follows a rewired generator",
+    states_of(first[0]) == [1] and states_of(second[0]) == [0, 1],
+    f"{states_of(first[0])} then {states_of(second[0])}",
+)
+
+qct = make(trigger_states=[0, 1])
+again = run_with(qct, FakeBias(trigger_port=2))
+check("an explicit routing survives repeated runs", states_of(again[0]) == [0, 1])
+
+# 3c. An explicit routing that leaves the generator's own port unasserted still gates
+# *something*, so it passes the no-port check -- but the ramp waits on a port nothing
+# asserts. Warn rather than raise: the generator's declared port may itself be the wrong one.
+qct = make(trigger_states=[0, 1])
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    run_with(qct, FakeBias(trigger_port=1))
+check(
+    "a routing that skips the generator's port warns",
+    any("trigger_port=1" in str(w.message) for w in caught),
+    str([str(w.message)[:60] for w in caught]),
+)
+with warnings.catch_warnings(record=True) as quiet:
+    warnings.simplefilter("always")
+    run_with(make(), FakeBias(trigger_port=2))
+check("a correct routing does not warn", not quiet, str([str(w.message)[:40] for w in quiet]))
+
 # 4. A routing that gates nothing must raise -- it would record a static bias.
 for bad in (False, [0], [0, 0]):
     try:
@@ -207,6 +241,14 @@ with tempfile.TemporaryDirectory() as tmp:
         "trigger states survive the HDF5 round trip",
         states_of(reloaded.trigger_states) == [0, 1],
         str(reloaded.trigger_states),
+    )
+    # The stored routing describes the run that made the file, not the bench in front of you:
+    # re-running a loaded measurement must read the generator it is handed.
+    steps = run_with(reloaded, FakeBias(trigger_port=1))
+    check(
+        "re-running a loaded measurement re-reads the generator",
+        states_of(steps[0]) == [1],
+        str(states_of(steps[0])),
     )
 
     # Files written before the parameter existed carry no dataset; they were all port 1.

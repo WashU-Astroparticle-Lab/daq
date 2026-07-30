@@ -17,8 +17,10 @@ trigger_port`, and :func:`trigger_for` turns any set of instruments into the sta
     with Agilent33220A() as bias, DC2200() as led:
         ts = TimeStream(..., external_trigger=trigger_for(bias, led))
 
-This module deliberately imports nothing but :mod:`numpy`, so instrument code can use it on a
-machine with no ``presto`` install.
+This module deliberately imports nothing but :mod:`numpy`, so the instrument layer can share
+the port semantics without depending on ``presto``. (Reaching it as ``daq.triggers`` still
+executes ``daq/__init__.py``, which does import ``presto`` -- that coupling predates this
+module and is why the offline suites stub the package.)
 
 """
 
@@ -109,22 +111,30 @@ def trigger_for(*sources: Any, state: int = 1) -> npt.NDArray[np.int64]:
     gated in the same acquisition are gated identically; independent timing needs separate
     acquisitions.
 
-    :param sources: Instruments (anything with a ``trigger_port``) and/or port numbers.
+    :param sources: Instruments (anything with a ``trigger_port``) and/or port numbers. At
+        least one is required.
     :param state: Trigger state to set for each port: ``1`` fires on every lock-in window,
         ``2`` on every sum window.
-    :raises ValueError: If *state* is not ``1`` or ``2``, or a port is unknown or out of range.
+    :raises ValueError: If no source is given, *state* is not ``1`` or ``2``, or a port is
+        unknown or out of range.
     :raises TypeError: If a source is neither an instrument nor a port number.
-    :returns: The states array, ready to pass as ``TimeStream(external_trigger=...)``. Empty
-        when no source is given, i.e. no port is triggered.
+    :returns: The states array, ready to pass as ``TimeStream(external_trigger=...)``.
 
     """
     if state not in (1, 2):
         raise ValueError(
             f"state must be 1 (every lock-in window) or 2 (every sum window), got {state}"
         )
+    if not sources:
+        # Returning "gate nothing" here would put a silently ungated acquisition inside the
+        # very helper written to prevent them -- and `trigger_for(*instruments)` over a list
+        # that turned out empty is exactly how that happens. Gating nothing is spelled
+        # external_trigger=False, at the call site, where it is visible.
+        raise ValueError(
+            "trigger_for() needs at least one instrument or port to gate. To gate nothing, "
+            "pass external_trigger=False instead of an empty trigger_for()."
+        )
     ports = [trigger_port_of(source) for source in sources]
-    if not ports:
-        return np.zeros(0, dtype=np.int64)
     states = np.zeros(max(ports), dtype=np.int64)
     for port in ports:
         states[port - 1] = state

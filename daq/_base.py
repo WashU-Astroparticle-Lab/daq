@@ -44,7 +44,7 @@ class Base:
 
             with Agilent33220A() as bias:
                 bias.sawtooth(vpp=2.0, freq_hz=500)
-                ts = TimeStream(..., external_trigger=True)
+                ts = TimeStream(..., external_trigger=trigger_for(bias))
                 ts.attach(bias=bias)
                 ts.run()
 

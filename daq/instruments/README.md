@@ -437,7 +437,10 @@ A rig that differs says so once, in whichever place fits:
 
 Ports must be 1–4; anything else raises where you set it, rather than producing a states list
 that quietly gates nothing. `trigger_for` also accepts a bare port number (`trigger_for(3)`) if
-no instrument object is in hand, and raises if an instrument's `trigger_port` is `None`.
+no instrument object is in hand, and raises if an instrument's `trigger_port` is `None` or if
+called with no source at all — `trigger_for(*instruments)` over a list that turned out empty
+would otherwise hand back a silently ungated acquisition. Gating nothing is spelled
+`external_trigger=False`, at the call site, where it is visible.
 
 `settings()` reports `trigger_port`, so `attach()` writes it into the HDF5 attributes and the
 MongoDB document — the wiring is the one part of a measurement the data file cannot otherwise

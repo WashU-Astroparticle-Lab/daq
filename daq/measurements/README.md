@@ -388,13 +388,16 @@ ordering *are* the measurement.
 **Trigger routing**: only step 2 is gated, and by default it gates whichever port the bias
 generator says it is wired to — `Agilent33220A.trigger_port`, port 1 in the lab's default
 setup, overridable per instrument or via `DAQ_FGEN_TRIGGER_PORT`. Rewiring the rig therefore
-needs no change to the measurement. This matters because getting it wrong is silent: an
-ungated ramp sits at its burst start level and step 2 records a static bias rather than a swept
-one. The resolved states are validated before the first acquisition — a routing that gates no
-port raises — printed at the start of the run, and saved with the record (`trigger_states` in
-HDF5 and MongoDB), so a stored measurement pins down which port was gated. Files written before
-the parameter existed load as port 1, which is what the old hardcoded `external_trigger=True`
-meant.
+needs no change to the measurement, and the generator is consulted on *every* run, so fixing a
+port and re-running the same object gates the new one. This matters because getting it wrong is
+silent: an ungated ramp sits at its burst start level and step 2 records a static bias rather
+than a swept one. The resolved states are validated before the first acquisition — a routing
+that gates no port raises, and an explicit one that leaves the generator's own port unasserted
+warns — printed at the start of the run, and saved with the record (`trigger_states` in HDF5
+and MongoDB), so a stored measurement pins down which port was gated. `load()` restores that
+routing for inspection but does not pin it: re-running a loaded measurement re-reads the
+generator in hand. Files written before the parameter existed load as port 1, which is what the
+old hardcoded `external_trigger=True` meant.
 
 **Usage Example**:
 ```python
