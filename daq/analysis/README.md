@@ -405,7 +405,7 @@ The acquisition has to span a whole number of ramp periods. `Agilent33220A.sampl
 computes that `pixel_counts` for you, including the samples `TimeStream` discards at the start:
 
 ```python
-from daq import Agilent33220A, TimeStream
+from daq import Agilent33220A, TimeStream, trigger_for
 from daq.analysis import fold_timestream, plot_qc_trace
 
 RAMP_HZ, FS, N_PERIODS = 500, 5e4, 200
@@ -416,7 +416,8 @@ with Agilent33220A() as bias:
         lo_freq=fr, if_freqs=[0], df=FS,
         pixel_counts=bias.samples_for_periods(N_PERIODS, FS),
         amp=amp, output_port=1, input_port=1,
-        device="my_device", external_trigger=True,    # port 1 gates the ramp
+        device="my_device",
+        external_trigger=trigger_for(bias),           # the port the generator is wired to
     )
     qc.attach(bias=bias)
     qc.run()

@@ -1,9 +1,14 @@
 """Offline verification of ``daq.instruments`` against a simulated VISA backend.
 
-Runs with no hardware, no VISA runtime and no ``presto`` install: a fake ``pyvisa`` module is
+Runs with no hardware, no VISA runtime and no database: a fake ``pyvisa`` module is
 injected into ``sys.modules`` *before* ``daq.instruments`` is imported, so every check
 exercises the real driver code against simulated instruments (including ones that reject
 commands, answer slowly, or hold the wrong model).
+
+``presto`` must nonetheless be importable, since ``daq/__init__.py`` pulls in the measurement
+classes, which import it. The drivers themselves do not -- ``daq.instruments`` and
+``daq.triggers`` have no presto dependency of their own -- but no import path reaches them
+without executing the package ``__init__``.
 
 Run from the repository root::
 
@@ -618,6 +623,106 @@ check(
 check(
     "attach bookkeeping is private, so it is not saved",
     not any(k == "_attached_keys" for k in doc2),
+)
+
+# 10b. Trigger routing: which Presto digital output port gates which instrument (#53).
+# The failure this guards against is silent -- a gated instrument on an unasserted port
+# simply never fires, and the acquisition looks like a dead detector -- so the wiring lives
+# on the instrument and every measurement derives its states from there.
+import os  # noqa: E402
+
+from daq.config import reload_settings  # noqa: E402
+from daq.triggers import trigger_for  # noqa: E402
+
+check("33220A declares port 1 by default", fg.trigger_port == 1, str(fg.trigger_port))
+check("DC2200 declares port 2 by default", led.trigger_port == 2, str(led.trigger_port))
+check("trigger_for(bias) gates port 1", trigger_for(fg).tolist() == [1])
+check("trigger_for(led) gates port 2", trigger_for(led).tolist() == [0, 1])
+check("trigger_for(bias, led) gates both", trigger_for(fg, led).tolist() == [1, 1])
+check("trigger_for takes a bare port number", trigger_for(4).tolist() == [0, 0, 0, 1])
+check(
+    "trigger_for(port, state=2) gates on the sum window",
+    trigger_for(2, state=2).tolist() == [0, 2],
+)
+try:
+    # `trigger_for(*instruments)` over a list that turned out empty must not quietly produce
+    # an ungated acquisition inside the helper written to prevent exactly that.
+    trigger_for()
+    check("trigger_for() with no source raises", False, "returned a states list")
+except ValueError as exc:
+    check("trigger_for() with no source raises", "at least one" in str(exc))
+check(
+    "the LED is not gated by the plain external_trigger=True shorthand",
+    trigger_for(led).tolist() != [1],
+)
+
+check("an explicit trigger_port wins", Agilent33220A(trigger_port=3).trigger_port == 3)
+for bad in (0, 5, 1.5, "2", True):
+    try:
+        Agilent33220A(trigger_port=bad)
+        check(f"trigger_port={bad!r} rejected", False, "constructed")
+    except ValueError:
+        check(f"trigger_port={bad!r} rejected", True)
+try:
+    fg.trigger_port = 9
+    check("assigning an invalid port raises", False, "assigned")
+except ValueError:
+    check("assigning an invalid port raises", fg.trigger_port == 1, str(fg.trigger_port))
+
+# Each driver must read its *own* environment variable -- crossing the two would put the
+# generator on the LED's port, which is the wrong-port failure this whole mechanism guards.
+for cls, var, other, default in (
+    (Agilent33220A, "DAQ_FGEN_TRIGGER_PORT", "DAQ_LED_TRIGGER_PORT", 1),
+    (DC2200, "DAQ_LED_TRIGGER_PORT", "DAQ_FGEN_TRIGGER_PORT", 2),
+):
+    os.environ[var] = "3"
+    os.environ[other] = "4"
+    reload_settings()
+    try:
+        check(f"{var} overrides {cls.__name__}'s default", cls().trigger_port == 3)
+    finally:
+        os.environ.pop(var)
+        os.environ.pop(other)
+        reload_settings()
+    check(f"clearing {var} restores the default", cls().trigger_port == default)
+
+os.environ["DAQ_FGEN_TRIGGER_PORT"] = "9"
+reload_settings()
+try:
+    Agilent33220A()
+    check("an out-of-range trigger-port variable raises", False, "constructed")
+except ValueError as exc:
+    check("an out-of-range trigger-port variable raises", "DAQ_FGEN_TRIGGER_PORT" in str(exc))
+finally:
+    os.environ.pop("DAQ_FGEN_TRIGGER_PORT")
+    reload_settings()
+
+# An instrument that does not say where it is wired must raise rather than be guessed at.
+unwired = Agilent33220A()
+unwired.trigger_port = None
+try:
+    trigger_for(unwired)
+    check("an undeclared trigger_port raises", False, "resolved anyway")
+except ValueError as exc:
+    check("an undeclared trigger_port raises", "trigger_port is None" in str(exc))
+try:
+    trigger_for("port 1")
+    check("trigger_for rejects a non-instrument", False)
+except TypeError:
+    check("trigger_for rejects a non-instrument", True)
+
+# The wiring belongs in the saved record: it is the one part a data file cannot show.
+m3 = FakeMeasurement()
+m3.attach(bias=fg, led=led)
+check(
+    "attach records each instrument's trigger port",
+    m3.bias_trigger_port == 1 and m3.led_trigger_port == 2,
+    f"bias={m3.bias_trigger_port}, led={m3.led_trigger_port}",
+)
+doc3 = m3._build_document("3", "timestream", "/h.h5", "dev", None, None)
+check(
+    "the wiring reaches the MongoDB document",
+    doc3.get("bias_trigger_port") == 1 and doc3.get("led_trigger_port") == 2,
 )
 
 # 11. fold_timestream reproduces the bench block-average.

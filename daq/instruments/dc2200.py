@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional, Tuple
 
-from ..config import get_led_resource
+from ..config import get_led_resource, get_led_trigger_port
 from ._visa import InstrumentError, VisaInstrument
 
 
@@ -39,12 +39,23 @@ class DC2200(VisaInstrument):
     :param timeout_ms: VISA I/O timeout in milliseconds.
     :param backend: PyVISA backend spec. Defaults to ``DAQ_VISA_BACKEND``.
     :param transcript_path: Optional path to a SCPI transcript file.
+    :param trigger_port: Presto digital output port wired to the rear-panel modulation input,
+        which gates :meth:`configure_ttl`. Defaults to ``DAQ_LED_TRIGGER_PORT``, then to
+        :attr:`TRIGGER_PORT`.
 
     """
 
     IDN_KEYWORDS = ("DC2200",)
     RESOURCE_HINTS = ("0x1313::0x80C8",)
     ENV_VAR = "DAQ_LED_RESOURCE"
+    TRIGGER_PORT = 2
+    """Presto digital output port wired to the modulation input in the lab's default setup.
+
+    Only :meth:`configure_ttl` is gated by it -- PWM and pulse mode are timed by the
+    instrument itself and start on the software write that enables the output.
+
+    """
+    TRIGGER_PORT_ENV_VAR = "DAQ_LED_TRIGGER_PORT"
 
     # --- SCPI headers, from the DC2200 Operation Manual v1.8 (29-Nov-2023), section 4.3.2.
     # Optional (bracketed) tree nodes are omitted: SOURce1:PULSe[:BRIGhtness][:LEVel]
@@ -72,6 +83,7 @@ class DC2200(VisaInstrument):
         timeout_ms: int = 5000,
         backend: Optional[str] = None,
         transcript_path: Optional[str] = None,
+        trigger_port: Optional[int] = None,
     ) -> None:
         self._current_limit: Optional[float] = None
         super().__init__(
@@ -79,6 +91,7 @@ class DC2200(VisaInstrument):
             timeout_ms=timeout_ms,
             backend=backend,
             transcript_path=transcript_path,
+            trigger_port=trigger_port,
         )
 
     @classmethod
@@ -89,6 +102,15 @@ class DC2200(VisaInstrument):
 
         """
         return get_led_resource()
+
+    @classmethod
+    def env_trigger_port(cls) -> Optional[int]:
+        """Return the trigger port configured via ``DAQ_LED_TRIGGER_PORT``.
+
+        :returns: The configured port number, or ``None``.
+
+        """
+        return get_led_trigger_port()
 
     # ------------------------------------------------------------------ output state
 
@@ -233,10 +255,12 @@ class DC2200(VisaInstrument):
         ``Pulsed.output_digital_marker`` (synchronised, but a different measurement mode that
         this library does not wrap).
 
-        In the lab's default wiring the modulation input is on Presto **digital output port
-        2**, so pair this with ``TimeStream(external_trigger=[0, 1])``; plain
-        ``external_trigger=True`` gates port 1 (the function generator) and leaves the LED
-        dark.
+        Pair this with ``TimeStream(external_trigger=trigger_for(led))``, which asserts
+        whichever port :attr:`~daq.instruments._visa.VisaInstrument.trigger_port` says the
+        modulation input is wired to -- **digital output port 2** in the lab's default wiring,
+        overridable per instrument or through ``DAQ_LED_TRIGGER_PORT``. Naming the port by
+        hand is what goes wrong here: a plain ``external_trigger=True`` gates port 1 (the
+        function generator) and leaves the LED dark for the whole run.
 
         Configuring the mode does **not** arm the LED. Enabling the output (``output=True``
         here, or ``led.output = True`` later) arms the output stage, after which the LED

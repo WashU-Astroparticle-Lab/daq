@@ -25,6 +25,8 @@ class Settings:
     mongodb_collection_name: str
     fgen_resource: Optional[str]
     led_resource: Optional[str]
+    fgen_trigger_port: Optional[int]
+    led_trigger_port: Optional[int]
     visa_backend: str
 
     @classmethod
@@ -42,6 +44,14 @@ class Settings:
             mongodb_collection_name=os.getenv("DAQ_MONGODB_COLLECTION_NAME", "measurement"),
             fgen_resource=_parse_optional_str(os.getenv("DAQ_FGEN_RESOURCE")),
             led_resource=_parse_optional_str(os.getenv("DAQ_LED_RESOURCE")),
+            fgen_trigger_port=_parse_optional_int(
+                os.getenv("DAQ_FGEN_TRIGGER_PORT"),
+                env_var="DAQ_FGEN_TRIGGER_PORT",
+            ),
+            led_trigger_port=_parse_optional_int(
+                os.getenv("DAQ_LED_TRIGGER_PORT"),
+                env_var="DAQ_LED_TRIGGER_PORT",
+            ),
             visa_backend=os.getenv("DAQ_VISA_BACKEND", ""),
         )
 
@@ -120,6 +130,24 @@ def get_fgen_resource() -> Optional[str]:
 def get_led_resource() -> Optional[str]:
     """Return the configured LED-driver VISA resource, or ``None`` to autodiscover."""
     return get_settings().led_resource
+
+
+def get_fgen_trigger_port() -> Optional[int]:
+    """Return the Presto digital output port wired to the function generator's gate input.
+
+    ``None`` falls back to the driver's own default (port 1 for the Agilent 33220A).
+
+    """
+    return get_settings().fgen_trigger_port
+
+
+def get_led_trigger_port() -> Optional[int]:
+    """Return the Presto digital output port wired to the LED driver's modulation input.
+
+    ``None`` falls back to the driver's own default (port 2 for the DC2200).
+
+    """
+    return get_settings().led_trigger_port
 
 
 def get_visa_backend() -> str:

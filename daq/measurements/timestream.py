@@ -4,7 +4,7 @@ TimeStream measurement class for acquiring time-domain data with multiple freque
 """
 
 import warnings
-from typing import Callable, List, Optional, Sequence, Union
+from typing import Callable, List, Optional, Union
 
 import h5py
 import numpy as np
@@ -15,16 +15,19 @@ from presto.utils import untwist_downconversion
 
 from .._base import Base
 from ..config import get_presto_address, get_presto_port
+from ..triggers import MAX_TRIGGER_PORTS, TriggerAny, resolve_trigger_states
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
-TriggerAny = Union[bool, Sequence[int], npt.NDArray[np.integer]]
 
-#: Presto exposes four digital output ports. presto packs the per-port trigger
-#: states two bits at a time into a single uint8 (``Msg__LckSetDf``), and
-#: ``Pulsed.output_digital_marker`` bounds its ports to 1-4, so a longer states
-#: list would silently overflow the wire format rather than address a 5th port.
-MAX_TRIGGER_PORTS = 4
+__all__ = [
+    "BoolAny",
+    "FloatAny",
+    "MAX_TRIGGER_PORTS",
+    "TimeStream",
+    "TriggerAny",
+    "resolve_trigger_states",
+]
 
 
 class TimeStream(Base):
@@ -106,7 +109,9 @@ class TimeStream(Base):
         # Per-digital-output-port trigger states, resolved to the list presto's
         # set_trigger_out expects. Element i configures port i+1, so which
         # instrument is gated depends on what is wired where: [1] drives port 1
-        # only, [0, 1] port 2 only, [1, 1] both. See resolve_trigger_states.
+        # only, [0, 1] port 2 only, [1, 1] both. Prefer daq.triggers.trigger_for
+        # (external_trigger=trigger_for(bias, led)) to naming ports here -- it
+        # reads the wiring off the instruments. See resolve_trigger_states.
         self.external_trigger = self.resolve_trigger_states(external_trigger)
         # The first tens of milliseconds of an acquisition are typically startup
         # junk. discard_start_ms leading milliseconds are dropped from the
@@ -149,64 +154,26 @@ class TimeStream(Base):
     def resolve_trigger_states(external_trigger: TriggerAny) -> npt.NDArray[np.int64]:
         """Normalise an ``external_trigger`` argument to presto's per-port states list.
 
-        presto's :meth:`presto.lockin.Lockin.set_trigger_out` takes one state **per digital
-        output port**: element *i* configures port *i+1*, where ``0`` means no trigger, ``1``
-        triggers on every lock-in window and ``2`` on every sum window. Which instrument is
-        gated is therefore purely a question of what is wired to which port::
-
-            [1]     or [1, 0]  -- port 1 only  (e.g. a gated Agilent 33220A ramp)
-            [0, 1]             -- port 2 only  (e.g. a DC2200 in TTL mode)
-            [1, 1]             -- both ports, fired together
-
-        ``True`` is accepted as a shorthand for ``[1]``, which is what every caller written
-        before per-port routing existed meant, and ``False`` for "no trigger at all".
-
-        Note that ``delay`` and ``width`` are **global**, not per port -- presto sends them as
-        a single pair alongside ``df`` -- so ports enabled in the same acquisition necessarily
-        share their timing. Independent timing needs separate acquisitions.
+        Thin alias for :func:`daq.triggers.resolve_trigger_states`, which owns the port
+        semantics so instrument drivers can share them without importing ``presto``. See it
+        for the full description of the states and their timing constraints.
 
         Because the resolved value is what :attr:`external_trigger` stores, that attribute is
         an array rather than the bool it was before per-port routing existed. Test it with
         ``.any()`` or ``.size``; plain ``if ts.external_trigger:`` raises on an empty or
         multi-element array.
 
+        Prefer :func:`daq.triggers.trigger_for` over writing port numbers here: it derives the
+        states from the instruments themselves, so a rig wired differently from the lab
+        default gates the right hardware without editing the measurement.
+
         :param external_trigger: ``True``/``False``, or a sequence of per-port states.
         :return: The resolved states as an integer array; empty when no port is triggered.
         :raises ValueError: If a state is outside ``{0, 1, 2}``, is non-integral, or more than
-            :data:`MAX_TRIGGER_PORTS` ports are addressed.
+            :data:`~daq.triggers.MAX_TRIGGER_PORTS` ports are addressed.
 
         """
-        if isinstance(external_trigger, (bool, np.bool_)):
-            return np.array([1], dtype=np.int64) if external_trigger else np.zeros(0, np.int64)
-        raw = np.atleast_1d(np.asarray(external_trigger))
-        # Reject non-integral input rather than truncating it. A state computed as
-        # 0.999... would otherwise silently become 0 -- the trigger never fires and
-        # the acquisition looks like a dead detector rather than a misconfiguration.
-        if np.issubdtype(raw.dtype, np.floating):
-            if not np.all(raw == np.round(raw)):
-                raise ValueError(
-                    f"external_trigger states must be whole numbers, got {raw.tolist()}"
-                )
-        elif not np.issubdtype(raw.dtype, np.integer) and not np.issubdtype(raw.dtype, np.bool_):
-            raise ValueError(
-                "external_trigger must be a bool or a sequence of integer per-port states, "
-                f"got dtype {raw.dtype}"
-            )
-        states = raw.astype(np.int64)
-        if states.ndim != 1:
-            raise ValueError(f"external_trigger must be one-dimensional, got shape {states.shape}")
-        if states.size > MAX_TRIGGER_PORTS:
-            raise ValueError(
-                f"external_trigger addresses {states.size} ports, but presto has only "
-                f"{MAX_TRIGGER_PORTS} digital output ports; a longer list overflows the "
-                "uint8 that carries the packed states"
-            )
-        if np.any((states < 0) | (states > 2)):
-            raise ValueError(
-                "external_trigger states must be 0 (off), 1 (every lock-in window) or "
-                f"2 (every sum window), got {states.tolist()}"
-            )
-        return states
+        return resolve_trigger_states(external_trigger)
 
     def check_discard(self) -> None:
         if self.discard_start_ms < 0:

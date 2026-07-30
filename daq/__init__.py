@@ -8,6 +8,7 @@ from .measurements import (
     TimeStream,
     TwoTonePower,
 )
+from .triggers import resolve_trigger_states, trigger_for
 
 __all__ = [
     "amp_to_power_dbm",
@@ -22,4 +23,6 @@ __all__ = [
     "SweepPower",
     "TimeStream",
     "TwoTonePower",
+    "resolve_trigger_states",
+    "trigger_for",
 ]

@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """Benchtop instrument drivers (non-Presto hardware reached over VISA)."""
 
+from ..triggers import trigger_for
 from ._visa import (
     InstrumentError,
     VisaInstrument,
@@ -16,5 +17,6 @@ __all__ = [
     "InstrumentError",
     "VisaInstrument",
     "probe_visa_resources",
+    "trigger_for",
     "visa_backend_info",
 ]

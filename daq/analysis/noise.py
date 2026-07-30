@@ -810,8 +810,9 @@ def averaged_psd_timestream(
     :param device: Forwarded to :class:`TimeStream` (used in the saved metadata).
     :param filter: Forwarded to :class:`TimeStream`.
     :param notes: Forwarded to :class:`TimeStream`.
-    :param external_trigger: Forwarded to :class:`TimeStream`. ``True`` gates digital output
-        port 1; pass a per-port states list (e.g. ``[0, 1]``) to gate a different port.
+    :param external_trigger: Forwarded to :class:`TimeStream`. Prefer
+        :func:`~daq.triggers.trigger_for`, which reads the port off the instrument to gate
+        (``trigger_for(led)``); ``True`` is the older shorthand for digital output port 1.
     :param presto_address: Forwarded to :meth:`TimeStream.run`.
     :param presto_port: Forwarded to :meth:`TimeStream.run`.
     :param ext_ref_clk: Forwarded to :meth:`TimeStream.run`.
