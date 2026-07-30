@@ -261,15 +261,18 @@ class TimeStream(Base):
         :param save_filename: Explicit output path; auto-generated when ``None``.
         :param on_acquire: Optional callable invoked **once, immediately before acquisition
             starts** -- after the seconds of connect/configure/tune work and after
-            ``apply_settings()`` (so any trigger output is already asserted), just before
-            ``get_pixels()``. This is the few-millisecond-accurate place to software-start
-            side hardware whose timing should line up with sample zero, e.g. a DC2200 pulse
-            train (``on_acquire=lambda: led arm``): started *before* ``run()`` it would lead
-            the data by an unknown seconds-scale offset, started here it leads by roughly one
-            USB write. Keep it fast and side-effect-only; its return value is ignored. If it
-            raises, the acquisition is abandoned and the exception propagates (the Presto
-            connection closes; any instrument armed by earlier code is the caller's to
-            disarm, e.g. via its ``with`` block).
+            ``apply_settings()`` (so any configured trigger output is already asserted), just
+            before ``get_pixels()``. This is the place to software-start side hardware whose
+            timing should land close to sample zero, e.g. a DC2200 pulse train via
+            ``on_acquire=lambda: setattr(led, "output", True)``: started *before* ``run()``
+            the offset from sample zero is seconds and varies per run; started here it is set
+            by a few SCPI round trips against the ``get_pixels`` start -- ms-scale, but its
+            sign and size are **not yet bench-measured**, so read the actual offset off the
+            data (the first recorded pulse position, modulo the pulse period). Keep the
+            callable fast and side-effect-only; its return value is ignored. If it raises,
+            the acquisition is abandoned and the exception propagates -- the Presto outputs
+            are muted on the way out and the connection closes, but disarming any instrument
+            the caller armed stays with the caller (e.g. its ``with`` block).
         :returns: Path of the saved HDF5 file.
 
         """
@@ -317,14 +320,30 @@ class TimeStream(Base):
 
             lck.apply_settings()
 
-            if on_acquire is not None:
-                # Last stop before data: everything slow (connect, configure, tune) is done
-                # and the trigger is asserted, so side hardware started here lands within a
-                # few ms of sample zero instead of an unknown seconds-scale offset.
-                on_acquire()
+            try:
+                if on_acquire is not None:
+                    # Last stop before data: everything slow (connect, configure, tune) is
+                    # done and any trigger output is asserted, so side hardware started here
+                    # lands ms-scale from sample zero instead of a seconds-scale offset.
+                    on_acquire()
 
-            # Acquire data
-            pixel_dict = lck.get_pixels(self.pixel_counts)
+                # Acquire data
+                pixel_dict = lck.get_pixels(self.pixel_counts)
+            finally:
+                # Mute on the exception path too. Without this, a raising hook (arbitrary
+                # user code, running at exactly the moment the outputs are live) would close
+                # the connection with the tones still driving and any trigger re-asserting
+                # every lock-in window -- a TTL-armed LED would stay lit indefinitely.
+                # Best-effort: a mute failure must not mask the original exception.
+                try:
+                    if trigger_states.any():
+                        # set_trigger_out rebuilds its control word from zero, so a single
+                        # 0 clears every port, not just port 1.
+                        lck.set_trigger_out([0])
+                    og.set_amplitudes(0.0)
+                    lck.apply_settings()
+                except Exception as mute_err:
+                    print(f"WARN: failed to mute Presto outputs during cleanup: {mute_err}")
 
             self.freq_arr, self.pixel_i, self.pixel_q = pixel_dict[self.input_port]
             self.lsb, self.usb = untwist_downconversion(self.pixel_i, self.pixel_q)
@@ -337,14 +356,6 @@ class TimeStream(Base):
             # data directly, without remembering USB/LSB conventions.
             self.signal = np.where(self.is_usb[np.newaxis, :], self.usb, self.lsb)
             self.signal_freqs = np.where(self.is_usb, self.freqs_usb, self.freqs_lsb)
-
-            # Mute outputs at the end
-            if trigger_states.any():
-                # set_trigger_out rebuilds its control word from zero, so a single
-                # 0 clears every port, not just port 1.
-                lck.set_trigger_out([0])  # Turns off trigger signal
-            og.set_amplitudes(0.0)
-            lck.apply_settings()
 
         # Save the full acquisition first, then drop the leading junk from the
         # in-memory arrays so the returned object matches the analysed window.

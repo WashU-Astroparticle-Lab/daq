@@ -568,14 +568,16 @@ last moment before data:
 ```
 ts.run(on_acquire=...)
   ├─ connect / configure mixer / tune        seconds, variable  ← why pre-run() timing fails
-  ├─ apply_settings()                        trigger asserts here
-  ├─ on_acquire()                            ← your callable: one USB write, ~ms
-  └─ get_pixels()                            sample zero, a few ms later
+  ├─ apply_settings()                        trigger (if configured) asserts here
+  ├─ on_acquire()                            ← your callable: a few SCPI round trips
+  └─ get_pixels()                            sample zero
 ```
 
-`on_acquire` is called exactly once, after all the slow setup and after the trigger asserts,
-immediately before acquisition. A pulse train started there leads sample zero by roughly one
-USB write — repeatable per record — instead of by seconds:
+`on_acquire` is called exactly once, after all the slow setup, immediately before
+acquisition. A pulse train started there sits within **milliseconds-to-tens-of-ms** of sample
+zero — set by a few SCPI round trips (each `write` brackets the command with `SYST:ERR?`
+checks) racing the `get_pixels` start round-trip — instead of the seconds-scale, per-run
+variable offset of anything started before `run()`:
 
 ```python
 with DC2200() as led:
@@ -586,16 +588,29 @@ with DC2200() as led:
     led.output = False
 ```
 
-Every record then holds pulses at exact instrument-timed spacing (500 ms here), all starting
-within a few ms of sample zero. The residual offset is directly visible in the data — the
-first pulse's onset measures it — so the first bench run calibrates it. Because the train
-starts near `t = 0`, the default `discard_start_ms` trim would eat the first pulse; pass `0`
-to keep it, or accept losing pulse one.
+Every record then holds pulses at exact instrument-timed spacing (500 ms here), at a roughly
+repeatable offset from acquisition start.
+
+**The offset's sign and size are not yet bench-measured.** Which side of sample zero the
+train starts on decides what happens to pulse one:
+
+- Train starts *before* sample zero → a short first pulse (10 µs here) fires before
+  acquisition and is never recorded; the first *recorded* pulse lands near
+  `period − offset`.
+- Train starts *after* sample zero → pulse one lands at small positive `t`, where the
+  default 25 ms `discard_start_ms` trim could eat it — hence `discard_start_ms=0` in the
+  recipe.
+
+Either way the actual offset is read off the data: the position of the first recorded pulse,
+**modulo the pulse period**. Measure it on the first bench record before relying on a number.
 
 Keep the callable to a single fast write. If it raises, the acquisition is abandoned and the
-exception propagates; the instrument is disarmed by its `with` block, not by `run()`. The
-Presto trigger ports are untouched by this mechanism, so a gated bias ramp on port 1 works in
-the same acquisition.
+exception propagates; `run()` mutes the Presto outputs on the way out, but disarming the
+instrument stays with its `with` block. The Presto trigger ports are untouched by this
+mechanism, so a gated bias ramp on port 1 works in the same acquisition — note the hook's
+latency then sits between the ramp start (trigger assertion at `apply_settings`) and sample
+zero, adding the same ms-scale skew to the ramp-vs-data alignment that `fold_timestream`
+assumes small (~1 % of a 500 ms period per 5 ms of offset).
 
 ### Both instruments at once
 
