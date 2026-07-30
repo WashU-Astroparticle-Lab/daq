@@ -9,6 +9,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [Folding a periodically-driven time stream (QC trace)](#folding-a-periodically-driven-time-stream-qc-trace)
+  - [The packaged routine](#the-packaged-routine)
 - [I/Q Comparison Plot](#iq-comparison-plot)
 - [Correlated Noise Removal](#correlated-noise-removal)
   - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
@@ -401,6 +402,40 @@ time_ms, avg_iq = fold_timestream(qc.signal[:, 0], FS, n_periods=200)
 
 Passing `raw=` to `plot_qc_trace` overlays one un-averaged period in grey behind the averaged
 curve, which shows directly how much the averaging bought.
+
+Prefer `period_s` over `n_periods` when folding a real acquisition: `TimeStream.run` tunes `df`
+slightly away from what you asked for, and dividing the record by `n_periods` can land on a
+window a sample short of the true period, which smears the average across blocks instead of
+dropping a leftover. `period_s=1 / RAMP_HZ` with `fs=qc.df` always gives the physical period.
+
+### The packaged routine
+
+`QCTrace` runs the whole bench sequence — locating sweep, gated-ramp QC trace, a hunt for the
+gate bias with the largest parity contrast, and a stream under a free-running ramp — and saves
+the folded trace as its own record:
+
+```python
+from daq import QCTrace, power_dbm_to_amp
+
+qct = QCTrace(
+    freq_center=2.8e9,
+    amp=power_dbm_to_amp(2.8, -110 + 78),      # device power + attenuation
+    output_port=1, input_port=1,
+    ramp_vpp=2.0, ramp_freq_hz=500,
+    sampling_frequency=5e4, num_periods=200,
+    n_bias_try=20, ts_duration_s=5.0,
+    device="my_device", filter="VBFZ-2575-S+, ZX60-83LN-S+",
+)
+qct.run()                                       # opens the 33220A itself
+qct.analyze()                                   # contrast vs bias + folded I/Q
+
+qct.time_ms, qct.avg_iq                         # the QC trace
+qct.best_bias, qct.best_bias_stream             # winning gate bias and its stream
+```
+
+Feed `qct.best_bias_stream` to `compute_psd` / `fit_parity_psd` for the parity spectrum at the
+best operating point. See the `QCTrace` entry in `CLAUDE.md` for the full parameter set and what
+lands in HDF5 and MongoDB.
 
 ---
 

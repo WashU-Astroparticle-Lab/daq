@@ -119,6 +119,24 @@ number of ramp periods **plus** the samples `TimeStream` discards at the start �
 same `discard_ms` you pass as `discard_start_ms`. Folding the result with
 `daq.analysis.fold_timestream` requires that whole-period alignment.
 
+The corollary: `sawtooth(gated=True)` with `external_trigger=False` records a **static** bias,
+not a swept one. The generator sits at its burst start level while the gate is low, and nothing
+asserts the gate. For a ramp that runs through an untriggered acquisition, use
+`sawtooth(gated=False)`.
+
+`QCTrace` packages the whole sequence — locating sweep, gated QC trace, constant-bias hunt and
+free-running ramp — with the gating and the bias states already right:
+
+```python
+from daq import QCTrace
+
+qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+qct.run()                       # opens and closes the 33220A itself
+# ...or keep ownership of the session:
+with Agilent33220A() as bias:
+    qct.run(bias=bias)          # output de-energised on the way out, session left open
+```
+
 ## LED driver (DC2200) modes
 
 The DC2200 has three modes, selected by the `configure_*` method you call. They differ in
