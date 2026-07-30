@@ -38,16 +38,41 @@ session holding the instrument (NI MAX, Thorlabs software, another notebook kern
 | `DAQ_LED_RESOURCE` | VISA resource for the LED driver. Unset → autodiscover. |
 | `DAQ_VISA_BACKEND` | `""` for NI-VISA (default), `"@py"` for pyvisa-py. |
 
-When a resource is not configured, the driver lists every VISA resource, asks each one
-`*IDN?`, and keeps the single match for its model. It deliberately **raises** when zero or
-several match rather than picking the first — grabbing `list_resources()[0]` silently binds
-to the wrong instrument as soon as a second one is plugged in, and produces plausible-looking
-data from it.
+**You normally do not need to set these.** With the function generator, the LED driver and
+any number of unrelated instruments on the same computer, `Agilent33220A()` and `DC2200()`
+find their own hardware unaided:
 
-List what is connected:
+```python
+with Agilent33220A() as bias, DC2200() as led:   # no addresses anywhere
+    ...
+```
 
-```bash
-python -c "import pyvisa; print(pyvisa.ResourceManager().list_resources())"
+The rule is **exactly one match for that model**, not one device in total. Each driver lists
+the visible VISA resources, asks each `*IDN?`, and keeps the one whose reply identifies it —
+`33220A` for the generator, `DC2200` for the LED. A scope, a multimeter or a USB-serial gadget
+answers with something else and is ignored.
+
+It deliberately **raises** when zero or several match, rather than picking the first —
+grabbing `list_resources()[0]` silently binds to the wrong instrument as soon as a second one
+is plugged in, and then produces plausible-looking data from it. So you are asked to choose
+only when the situation is genuinely ambiguous, e.g. two 33220As on one bench.
+
+Each driver also carries the USB vendor/product ID of its model, and probes only matching
+resources when any are present, so unrelated devices are not opened at all. That keeps
+discovery quick: a device that never answers `*IDN?` would otherwise cost `PROBE_TIMEOUT_MS`
+(5 s) on every construction. The hint is only an optimisation — if nothing matches it, because
+the instrument is on GPIB for instance, discovery falls back to probing everything.
+
+**When to set the variables anyway:** two units of the same model; a model whose `*IDN?` does
+not contain the expected string; or a rig where you want start-up to be fully deterministic and
+skip probing altogether. Setting a resource bypasses discovery entirely.
+
+List what is connected, with each device's identity:
+
+```python
+from daq.instruments import probe_visa_resources
+for resource, idn in probe_visa_resources():
+    print(resource, "->", idn)
 ```
 
 ## Usage
