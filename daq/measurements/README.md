@@ -337,6 +337,76 @@ tt.analyze(quantity="quadrature", linecut=True)
 
 ---
 
+### 6. QCTrace (`qc_trace.py`)
+
+**Purpose**: Quantum-capacitance (charge-parity / quasiparticle-tunnelling) trace on one
+device. Unlike the classes above it drives no hardware of its own — it composes a `Sweep`,
+several `TimeStream`s and an `Agilent33220A` gate-bias source, because the four steps and their
+ordering *are* the measurement.
+
+**Sequence** (run in order by `run()`):
+1. A `Sweep` with auto-fit to locate `fr`; every later step reads out there. Raises
+   `RuntimeError` if the fit yields no usable `fr` (the sweep's own file is still saved).
+2. The **QC trace** — a gated sawtooth on the gate plus an externally-triggered `TimeStream`
+   spanning `num_periods` whole ramp periods, folded into one period by `fold_timestream`.
+3. A **bias hunt** — one constant-bias `TimeStream` per entry of `bias_voltages`, keeping the
+   largest parity contrast `std(|signal|)`.
+4. One `TimeStream` under a **free-running** ramp, the same length as the tries.
+
+**Key Parameters**:
+- `freq_center`: Centre frequency of the locating sweep (Hz)
+- `amp`: Drive amplitude (fraction of full scale; use `power_dbm_to_amp` to convert from dBm),
+  shared by the sweep and every time stream
+- `output_port` / `input_port`: DAC output / ADC input port
+- `ramp_vpp`, `ramp_freq_hz`, `ramp_offset_v`, `ramp_symmetry_pct`: gate sawtooth shape
+- `sampling_frequency`, `num_periods`: time-stream sample rate (Hz) and periods averaged
+- `n_bias_try` / `bias_voltages`: number of random constant-bias tries, or explicit voltages
+  to scan (e.g. a `numpy.linspace`) instead of sampling
+- `v_min` / `v_max`, `seed`: bounds and seed for the random bias draw
+- `ts_duration_s`: length (s) of each constant-bias try and of the ramp stream
+- `device` (required for DB), `filter`, `notes`
+
+**Wiring assumption**: the QC-trace step gates the ramp with `external_trigger=True`, which
+asserts **Presto digital output port 1 only**. This class assumes the 33220A trigger input is
+wired to port 1; on any other port the ramp is never gated and step 2 records a static bias.
+Routing to a different port is not exposed here — rewire to port 1, or drive a `TimeStream` by
+hand.
+
+**Usage Example**:
+```python
+from daq import QCTrace, power_dbm_to_amp
+
+qct = QCTrace(
+    freq_center=2.8e9,
+    amp=power_dbm_to_amp(2.8, -110 + 78),   # device power + attenuation
+    output_port=1, input_port=1,
+    ramp_vpp=2.0, ramp_freq_hz=500,
+    sampling_frequency=5e4, num_periods=200,
+    n_bias_try=20, ts_duration_s=5.0,
+    device="B260416-NG-D1_dev3",
+    filter="VBFZ-2575-S+, ZX60-83LN-S+ and ZX60-63GLN+ warm amp",
+)
+qct.run()                       # opens the 33220A itself; or run(bias=<open instrument>)
+qct.analyze()                   # parity contrast vs bias, above the folded I/Q trace
+```
+
+Note `run()` takes the **bias generator** as its only positional argument, not
+`presto_address`; the Presto connection parameters are keyword-only
+(`run(presto_address=...)`).
+
+**Records**: every step saves its own HDF5 + MongoDB record via the normal path with
+`attach(bias=...)` applied, so each raw acquisition stays individually loadable. `QCTrace` saves
+one further `qc_trace` record with the derived products (`fr`, `time_ms`/`avg_iq`,
+`parity_contrast`, `best_bias`) and the constituent file paths (`sweep_file`, `qc_file`,
+`best_bias_file`, `ramp_file`), plus the sweep's fit (`fit_fr`/`fit_Qi`/…). The constituent
+objects hang off read-only properties (`sweep`, `qc_stream`, `bias_streams`,
+`best_bias_stream`, `ramp_stream`); `load()` restores the derived record but not those objects.
+
+**Analysis**: parity contrast versus gate bias with the winner marked, above the folded I/Q
+trace over one ramp period.
+
+---
+
 ## Common Parameters
 
 All measurements share these common parameters:
@@ -399,6 +469,7 @@ Each measurement class provides an `analyze()` method for visualization:
 - **SweepPower**: 2D heatmap with fitted `fr`/`Qi` vs. drive power
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
+- **QCTrace**: parity contrast vs. gate bias, above the block-averaged I/Q QC trace
 
 ---
 

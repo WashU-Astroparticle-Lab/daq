@@ -429,9 +429,11 @@ pulse](#getting-a-genuinely-short-pulse).
 
 > **Inferred, not yet measured.** The continuous-high behaviour follows from the presto
 > Python layer (the docstring's "at the start of every demodulation window", and the
-> window-relative `(start, stop)` clock pair sent with `df`) and from the fact that `QCTrace`'s
-> gated ramp spans the whole record. The FPGA's exact response to `width` exceeding the window
-> period has not been checked on a scope. If you have one on the bench, probing the trigger
+> window-relative `(start, stop)` clock pair sent with `df`) and is consistent with the
+> archived bench predecessor of `QCTrace`, which took usable QC traces under this exact
+> gated-ramp, 30 ms-width configuration over whole records. (`QCTrace` itself has not yet been
+> bench-run, so it is not independent evidence here.) The FPGA's exact response to `width`
+> exceeding the window period has not been checked on a scope. If you have one on the bench, probing the trigger
 > line during an `external_trigger` run settles this and the idle-level question below in one
 > trace — and is worth doing before designing a measurement around the timing.
 
