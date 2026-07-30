@@ -36,6 +36,14 @@ class Agilent33220A(VisaInstrument):
     """
 
     IDN_KEYWORDS = ("33220A",)
+    RESOURCE_HINTS = ("0x0957::0x0407",)
+    """Agilent USB vendor/product ID for the 33220A.
+
+    Narrows autodiscovery to the likely resource so unrelated instruments are not opened and
+    interrogated. Purely an optimisation: if no visible resource matches the hint -- the unit
+    is on GPIB, say -- discovery falls back to probing everything.
+
+    """
     ENV_VAR = "DAQ_FGEN_RESOURCE"
 
     MIN_VPP_BY_LOAD: Dict[str, float] = {"INF": 0.02, "50": 0.01}
