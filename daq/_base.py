@@ -30,6 +30,49 @@ class Base:
     }
     """Parameters to configure the data converters (ADC and DAC)"""
 
+    def attach(self, **instruments: Any) -> None:
+        """Record auxiliary instrument settings on this measurement.
+
+        Each instrument's :meth:`~daq.instruments._visa.VisaInstrument.settings` mapping is
+        flattened onto the measurement as ``<name>_<key>`` scalar attributes, which
+        :meth:`_save` then writes to the HDF5 attributes and :meth:`_build_document` to the
+        MongoDB document. That makes bias voltages, LED pulse parameters and the like
+        queryable through :func:`~daq.db.database.select_runs`, instead of surviving only
+        inside a ``notes`` string.
+
+        Call it before :meth:`run`, once the instruments are configured::
+
+            with Agilent33220A() as bias:
+                bias.sawtooth(vpp=2.0, freq_hz=500)
+                ts = TimeStream(..., external_trigger=True)
+                ts.attach(bias=bias)
+                ts.run()
+
+        :param instruments: Keyword arguments mapping a short prefix to either an instrument
+            exposing a ``settings()`` method, or a plain dict of scalars.
+        :raises TypeError: If a value is neither an instrument nor a mapping.
+
+        """
+        for name, instrument in instruments.items():
+            if hasattr(instrument, "settings"):
+                settings = instrument.settings()
+            elif isinstance(instrument, dict):
+                settings = instrument
+            else:
+                raise TypeError(
+                    f"attach({name}=...) expects an instrument with a settings() method or a "
+                    f"dict, got {type(instrument).__name__}"
+                )
+
+            for key, value in settings.items():
+                # None has no HDF5 representation and would only produce a save warning.
+                if value is None:
+                    continue
+                attribute = f"{name}_{key}"
+                if attribute in self.__dict__:
+                    print(f"WARN: attach() is overwriting existing attribute {attribute}")
+                setattr(self, attribute, value)
+
     def _save(self, script_path: str, save_filename: Optional[str] = None) -> str:
         script_path = os.path.realpath(script_path)
         

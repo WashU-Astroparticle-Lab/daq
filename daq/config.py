@@ -23,6 +23,9 @@ class Settings:
     mongodb_uri: str
     mongodb_db_name: str
     mongodb_collection_name: str
+    fgen_resource: Optional[str]
+    led_resource: Optional[str]
+    visa_backend: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -37,6 +40,9 @@ class Settings:
             mongodb_uri=os.getenv("DAQ_MONGODB_URI", "mongodb://localhost:27017"),
             mongodb_db_name=os.getenv("DAQ_MONGODB_DB_NAME", "WashU_Astroparticle_Detector"),
             mongodb_collection_name=os.getenv("DAQ_MONGODB_COLLECTION_NAME", "measurement"),
+            fgen_resource=_parse_optional_str(os.getenv("DAQ_FGEN_RESOURCE")),
+            led_resource=_parse_optional_str(os.getenv("DAQ_LED_RESOURCE")),
+            visa_backend=os.getenv("DAQ_VISA_BACKEND", ""),
         )
 
 
@@ -48,6 +54,13 @@ def _parse_optional_int(value: Optional[str], *, env_var: str) -> Optional[int]:
         return int(value)
     except ValueError as exc:
         raise ValueError(f"{env_var} must be an integer or empty, got {value!r}.") from exc
+
+
+def _parse_optional_str(value: Optional[str]) -> Optional[str]:
+    """Return a stripped string, or ``None`` when unset or blank."""
+    if value is None or value.strip() == "":
+        return None
+    return value.strip()
 
 
 def _parse_data_folder(value: Optional[str]) -> Path:
@@ -97,3 +110,18 @@ def get_mongodb_db_name() -> str:
 def get_mongodb_collection_name() -> str:
     """Return the configured MongoDB collection name."""
     return get_settings().mongodb_collection_name
+
+
+def get_fgen_resource() -> Optional[str]:
+    """Return the configured function-generator VISA resource, or ``None`` to autodiscover."""
+    return get_settings().fgen_resource
+
+
+def get_led_resource() -> Optional[str]:
+    """Return the configured LED-driver VISA resource, or ``None`` to autodiscover."""
+    return get_settings().led_resource
+
+
+def get_visa_backend() -> str:
+    """Return the configured PyVISA backend (``""`` for NI-VISA, ``"@py"`` for pyvisa-py)."""
+    return get_settings().visa_backend
