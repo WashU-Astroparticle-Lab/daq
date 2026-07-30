@@ -88,8 +88,9 @@ results.
   everything). The saved HDF5 keeps the full, untrimmed acquisition.
 - `external_trigger`: Which Presto digital output ports assert a trigger during the
   acquisition, used to gate external instruments. `False` (default) triggers nothing;
-  `True` is shorthand for `[1]` (port 1 only). Pass a per-port states list to route
-  the trigger elsewhere — see **Gating external instruments** below.
+  `True` is shorthand for `[1]` (port 1 only). Prefer `trigger_for(bias, led)`, which
+  reads the ports off the instruments themselves — see **Gating external instruments**
+  below.
 - `device`: Device name (required for DB)
 - `filter`: Filter name (optional)
 - `notes`: Measurement notes (optional)
@@ -131,6 +132,21 @@ every sum window. Which instrument you gate is therefore decided by what is wire
 
 The Presto has four digital output ports, so at most four states; a longer list raises, as do
 non-integral states (a state computed as `0.999…` would otherwise silently disable the port).
+
+**Don't write the port numbers by hand.** Each driver carries the port it is wired to, and
+`trigger_for` turns instruments into the states list — so a rig wired differently from the lab
+default gates the right hardware without editing the measurement:
+
+```python
+from daq import DC2200, Agilent33220A, TimeStream, trigger_for
+
+with Agilent33220A() as bias, DC2200() as led:
+    ts = TimeStream(..., external_trigger=trigger_for(bias, led))   # -> [1, 1]
+```
+
+Override the wiring per instrument (`Agilent33220A(trigger_port=3)`) or per rig, with
+`DAQ_FGEN_TRIGGER_PORT` / `DAQ_LED_TRIGGER_PORT`. `attach()` records each instrument's
+`trigger_port`, so the saved measurement says which port was expected to gate what.
 
 > **`ts.external_trigger` is an array, not a bool.** The constructor argument still accepts
 > `True`/`False` and means exactly what it always did, but the attribute now stores the
@@ -364,13 +380,21 @@ ordering *are* the measurement.
   to scan (e.g. a `numpy.linspace`) instead of sampling
 - `v_min` / `v_max`, `seed`: bounds and seed for the random bias draw
 - `ts_duration_s`: length (s) of each constant-bias try and of the ramp stream
+- `trigger_states`: which Presto digital output ports gate the QC-trace step. `None` (default)
+  takes the port from the bias generator's own `trigger_port`; pass presto states (`[1]`,
+  `[0, 1]`, or `True` for port 1) to override it for one measurement
 - `device` (required for DB), `filter`, `notes`
 
-**Wiring assumption**: the QC-trace step gates the ramp with `external_trigger=True`, which
-asserts **Presto digital output port 1 only**. This class assumes the 33220A trigger input is
-wired to port 1; on any other port the ramp is never gated and step 2 records a static bias.
-Routing to a different port is not exposed here — rewire to port 1, or drive a `TimeStream` by
-hand.
+**Trigger routing**: only step 2 is gated, and by default it gates whichever port the bias
+generator says it is wired to — `Agilent33220A.trigger_port`, port 1 in the lab's default
+setup, overridable per instrument or via `DAQ_FGEN_TRIGGER_PORT`. Rewiring the rig therefore
+needs no change to the measurement. This matters because getting it wrong is silent: an
+ungated ramp sits at its burst start level and step 2 records a static bias rather than a swept
+one. The resolved states are validated before the first acquisition — a routing that gates no
+port raises — printed at the start of the run, and saved with the record (`trigger_states` in
+HDF5 and MongoDB), so a stored measurement pins down which port was gated. Files written before
+the parameter existed load as port 1, which is what the old hardcoded `external_trigger=True`
+meant.
 
 **Usage Example**:
 ```python

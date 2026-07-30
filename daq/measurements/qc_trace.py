@@ -19,8 +19,14 @@ import numpy.typing as npt
 from .._base import Base
 from ..analysis.folding import fold_timestream
 from ..instruments import Agilent33220A
+from ..triggers import (
+    TriggerAny,
+    describe_trigger_states,
+    resolve_trigger_states,
+    trigger_for,
+)
 from .sweep import Sweep
-from .timestream import TimeStream, TriggerAny
+from .timestream import TimeStream
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
@@ -55,14 +61,14 @@ class QCTrace(Base):
 
     Requires the Presto **and** the 33220A over VISA; it cannot run without hardware.
 
-    **Wiring assumption.** The gated QC-trace step drives the ramp with ``external_trigger=
-    True``, which asserts **Presto digital output port 1 only**. This class assumes the
-    33220A's external trigger input is wired to that port; if your gate generator is on a
-    different port, the ramp will never be gated and the QC-trace step records a static bias
-    instead of a swept one. Routing the trigger to another port is not exposed here (see
-    :meth:`~daq.measurements.timestream.TimeStream.resolve_trigger_states` for the per-port
-    states a bare ``TimeStream`` accepts) -- rewire to port 1, or drive the sequence by hand
-    with ``TimeStream`` if your setup differs.
+    **Trigger routing.** Only step 2 is gated, and by default it gates whichever Presto
+    digital output port the bias generator says it is wired to --
+    :attr:`Agilent33220A.trigger_port <daq.instruments._visa.VisaInstrument.trigger_port>`,
+    port 1 in the lab's default setup, overridable per instrument or through
+    ``DAQ_FGEN_TRIGGER_PORT``. Pass *trigger_states* to override the routing for one
+    measurement. Getting this wrong is a silent failure -- an ungated ramp sits at its burst
+    start level and step 2 records a static bias rather than a swept one -- so the resolved
+    states are validated up front, refused if they gate nothing, and saved with the record.
 
     :param freq_center: Centre frequency of the locating sweep in hertz.
     :param amp: Drive amplitude in DAC full scale, shared by the sweep and every time stream.
@@ -93,6 +99,12 @@ class QCTrace(Base):
         its in-memory arrays. Passed through to
         :class:`~daq.measurements.timestream.TimeStream` and accounted for in the QC trace's
         sample count.
+    :param trigger_states: Which Presto digital output ports gate the QC-trace step, as
+        presto's per-port states (``[1]`` for port 1, ``[0, 1]`` for port 2, ``True`` as
+        shorthand for ``[1]``). ``None`` (the default) reads the port off the bias generator
+        handed to :meth:`run`, which is what keeps the routing right on a rig wired
+        differently from the lab default. Validated in ``__init__`` when given explicitly, so
+        a bad routing raises before any hardware is touched.
     :param dither: Whether to dither the Presto output.
     :param seed: Seed for the random bias draw. The drawn voltages are saved either way, so
         this only matters for reproducing the draw itself.
@@ -124,6 +136,7 @@ class QCTrace(Base):
         sweep_df: float = 5e3,
         sweep_num_averages: int = 50,
         discard_start_ms: float = 25.0,
+        trigger_states: Optional[TriggerAny] = None,
         dither: bool = True,
         seed: Optional[int] = None,
         device: Optional[str] = None,
@@ -176,6 +189,13 @@ class QCTrace(Base):
         self.num_periods = num_periods
         self.ts_duration_s = ts_duration_s
         self.discard_start_ms = float(discard_start_ms)
+
+        # Which digital output ports gate step 2. Resolved here when given explicitly so a
+        # bad routing raises before the hardware is touched; left None to be read off the
+        # bias generator in run(), where the instrument that knows its own wiring is in hand.
+        self.trigger_states = (
+            None if trigger_states is None else self._check_trigger_states(trigger_states)
+        )
 
         # The random draw defaults to the span the ramp itself covers, so the hunt looks for
         # the operating point inside the range the QC trace swept through.
@@ -300,6 +320,44 @@ class QCTrace(Base):
         """
         return step if self.notes is None else f"{self.notes} -- {step}"
 
+    @staticmethod
+    def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
+        """Resolve *trigger_states* and refuse a routing that gates nothing.
+
+        A gated ramp with no port asserted is exactly the silent failure this measurement
+        cannot afford: the generator holds its burst start level, the acquisition succeeds,
+        and step 2 records a static bias that looks like a dead device. ``False`` and
+        all-zero states are therefore rejected rather than run.
+
+        :param trigger_states: Anything :func:`~daq.triggers.resolve_trigger_states` accepts.
+        :raises ValueError: If the states are invalid, or gate no port at all.
+        :returns: The resolved per-port states.
+
+        """
+        states = resolve_trigger_states(trigger_states)
+        if not states.any():
+            raise ValueError(
+                f"trigger_states={trigger_states!r} gates no digital output port, so the "
+                "QC-trace ramp would never run: the generator would hold its burst start "
+                "level and step 2 would record a static bias instead of a swept one. Pass "
+                "the port that gates the bias generator (True or [1] for port 1), or leave "
+                "trigger_states unset to take it from the generator's own trigger_port."
+            )
+        return states
+
+    def _resolve_run_trigger_states(self, bias: Agilent33220A) -> npt.NDArray[np.int64]:
+        """Decide which ports gate the QC-trace step of this run.
+
+        :param bias: The gate-bias generator this run is using.
+        :raises ValueError: If the routing gates no port, or the generator does not declare
+            a ``trigger_port``.
+        :returns: The resolved per-port states.
+
+        """
+        if self.trigger_states is not None:
+            return self._check_trigger_states(self.trigger_states)
+        return self._check_trigger_states(trigger_for(bias))
+
     def _make_timestream(
         self,
         pixel_counts: int,
@@ -310,11 +368,11 @@ class QCTrace(Base):
         """Build a single-tone time stream on resonance, shared by every acquisition step.
 
         :param pixel_counts: Number of samples to acquire, including the discarded start.
-        :param external_trigger: Whether the Presto asserts its trigger output, which gates
-            the ramp when the generator is in gated-burst mode. ``True`` means digital output
-            port 1, which is where the gate ramp generator is expected to be wired; pass a
-            per-port states list to gate a different port (see
-            :meth:`~daq.measurements.timestream.TimeStream.resolve_trigger_states`).
+        :param external_trigger: Which Presto digital output ports assert a trigger, gating
+            the ramp when the generator is in gated-burst mode. ``False`` for the ungated
+            steps; for the QC trace this comes from :meth:`_resolve_run_trigger_states`,
+            i.e. from the generator's own ``trigger_port`` unless *trigger_states* overrode
+            it.
         :param notes: Step description for the sub-measurement's note.
         :returns: The configured time stream.
 
@@ -389,6 +447,9 @@ class QCTrace(Base):
         :param presto_port: Presto port. Defaults to the presto default.
         :param ext_ref_clk: Whether to use an external reference clock.
         :param save_filename: Explicit path for this measurement's own HDF5 file.
+        :raises ValueError: If the QC-trace step's trigger routing gates no port -- including
+            when *trigger_states* was left unset and *bias* declares no ``trigger_port``.
+            Raised before any acquisition, since an ungated ramp records a static bias.
         :raises RuntimeError: If the locating sweep does not yield a usable ``fr``; the sweep's
             own file is still saved, and its path is given in the message.
         :returns: Path of this measurement's HDF5 file.
@@ -406,6 +467,15 @@ class QCTrace(Base):
             else:
                 # The caller owns the session, but never leave a bias on the gate.
                 stack.callback(setattr, bias, "output", False)
+
+            # Settle the routing before the first acquisition: the generator is open, so its
+            # wiring is knowable, and a bad routing should abort the run rather than surface
+            # as a flat QC trace an hour later.
+            self.trigger_states = self._resolve_run_trigger_states(bias)
+            print(
+                "QC trace: gating the ramp on Presto digital output "
+                f"{describe_trigger_states(self.trigger_states)}"
+            )
 
             # --- 1. Locate fr, with the gate unbiased ---
             bias.output = False
@@ -453,7 +523,7 @@ class QCTrace(Base):
                     freq_hz=self.ramp_freq_hz,
                     discard_ms=self.discard_start_ms,
                 ),
-                external_trigger=True,
+                external_trigger=self.trigger_states,
                 notes="Gated sawtooth QC trace",
             )
             self._qc_stream.attach(bias=bias)
@@ -569,6 +639,11 @@ class QCTrace(Base):
                 sweep_df=float(attrs["sweep_df"]),  # type: ignore
                 sweep_num_averages=int(attrs["sweep_num_averages"]),  # type: ignore
                 discard_start_ms=float(attrs["discard_start_ms"]),  # type: ignore
+                # Absent in files written before the routing was configurable; those runs
+                # gated port 1, which is what the hardcoded external_trigger=True meant.
+                trigger_states=(
+                    h5f["trigger_states"][()] if "trigger_states" in h5f else True  # type: ignore
+                ),
                 dither=bool(attrs["dither"]),  # type: ignore
                 device=attrs.get("device", None),
                 filter=attrs.get("filter", None),

@@ -620,6 +620,77 @@ check(
     not any(k == "_attached_keys" for k in doc2),
 )
 
+# 10b. Trigger routing: which Presto digital output port gates which instrument (#53).
+# The failure this guards against is silent -- a gated instrument on an unasserted port
+# simply never fires, and the acquisition looks like a dead detector -- so the wiring lives
+# on the instrument and every measurement derives its states from there.
+import os  # noqa: E402
+
+from daq.config import reload_settings  # noqa: E402
+from daq.triggers import trigger_for  # noqa: E402
+
+check("33220A declares port 1 by default", fg.trigger_port == 1, str(fg.trigger_port))
+check("DC2200 declares port 2 by default", led.trigger_port == 2, str(led.trigger_port))
+check("trigger_for(bias) gates port 1", trigger_for(fg).tolist() == [1])
+check("trigger_for(led) gates port 2", trigger_for(led).tolist() == [0, 1])
+check("trigger_for(bias, led) gates both", trigger_for(fg, led).tolist() == [1, 1])
+check("trigger_for() gates nothing", trigger_for().size == 0)
+check("trigger_for takes a bare port number", trigger_for(4).tolist() == [0, 0, 0, 1])
+check(
+    "the LED is not gated by the plain external_trigger=True shorthand",
+    trigger_for(led).tolist() != [1],
+)
+
+check("an explicit trigger_port wins", Agilent33220A(trigger_port=3).trigger_port == 3)
+for bad in (0, 5, 1.5, "2", True):
+    try:
+        Agilent33220A(trigger_port=bad)
+        check(f"trigger_port={bad!r} rejected", False, "constructed")
+    except ValueError:
+        check(f"trigger_port={bad!r} rejected", True)
+try:
+    fg.trigger_port = 9
+    check("assigning an invalid port raises", False, "assigned")
+except ValueError:
+    check("assigning an invalid port raises", fg.trigger_port == 1, str(fg.trigger_port))
+
+os.environ["DAQ_LED_TRIGGER_PORT"] = "3"
+reload_settings()
+try:
+    check("DAQ_LED_TRIGGER_PORT overrides the default", DC2200().trigger_port == 3)
+finally:
+    os.environ.pop("DAQ_LED_TRIGGER_PORT")
+    reload_settings()
+check("clearing the variable restores the default", DC2200().trigger_port == 2)
+
+# An instrument that does not say where it is wired must raise rather than be guessed at.
+unwired = Agilent33220A()
+unwired.trigger_port = None
+try:
+    trigger_for(unwired)
+    check("an undeclared trigger_port raises", False, "resolved anyway")
+except ValueError as exc:
+    check("an undeclared trigger_port raises", "trigger_port is None" in str(exc))
+try:
+    trigger_for("port 1")
+    check("trigger_for rejects a non-instrument", False)
+except TypeError:
+    check("trigger_for rejects a non-instrument", True)
+
+# The wiring belongs in the saved record: it is the one part a data file cannot show.
+m3 = FakeMeasurement()
+m3.attach(bias=fg, led=led)
+check(
+    "attach records each instrument's trigger port",
+    m3.bias_trigger_port == 1 and m3.led_trigger_port == 2,
+    f"bias={m3.bias_trigger_port}, led={m3.led_trigger_port}",
+)
+doc3 = m3._build_document("3", "timestream", "/h.h5", "dev", None, None)
+check(
+    "the wiring reaches the MongoDB document",
+    doc3.get("bias_trigger_port") == 1 and doc3.get("led_trigger_port") == 2,
+)
+
 # 11. fold_timestream reproduces the bench block-average.
 fs, ramp_hz, n_per = 5e4, 500.0, 200
 window = int(fs / ramp_hz)

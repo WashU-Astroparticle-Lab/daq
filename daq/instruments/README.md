@@ -36,6 +36,8 @@ session holding the instrument (NI MAX, Thorlabs software, another notebook kern
 |---|---|
 | `DAQ_FGEN_RESOURCE` | VISA resource for the function generator. Unset → autodiscover. |
 | `DAQ_LED_RESOURCE` | VISA resource for the LED driver. Unset → autodiscover. |
+| `DAQ_FGEN_TRIGGER_PORT` | Presto digital output port wired to the generator's gate input. Unset → 1. |
+| `DAQ_LED_TRIGGER_PORT` | Presto digital output port wired to the LED's modulation input. Unset → 2. |
 | `DAQ_VISA_BACKEND` | `""` for NI-VISA (default), `"@py"` for pyvisa-py. |
 
 **You normally do not need to set these.** With the function generator, the LED driver and
@@ -81,7 +83,7 @@ Every instrument is a context manager whose exit **always** turns the output off
 on exception. Prefer this form for anything unattended:
 
 ```python
-from daq import Agilent33220A, TimeStream
+from daq import Agilent33220A, TimeStream, trigger_for
 
 with Agilent33220A() as bias:
     bias.sawtooth(vpp=2.0, freq_hz=500)          # gated on the Presto trigger by default
@@ -89,7 +91,8 @@ with Agilent33220A() as bias:
         lo_freq=fr, if_freqs=[0], df=5e4,
         pixel_counts=bias.samples_for_periods(200, 5e4),
         amp=amp, output_port=1, input_port=1,
-        device="my_device", external_trigger=True,    # port 1 gates the ramp
+        device="my_device",
+        external_trigger=trigger_for(bias),        # the port the generator says it is on
     )
     ts.attach(bias=bias)                          # settings -> HDF5 attrs + MongoDB
     ts.run()
@@ -135,13 +138,14 @@ record reflects what the instrument actually did.
 
 ### Synchronising the bias to an acquisition
 
-`TimeStream(external_trigger=True)` makes the Presto assert **digital output port 1** for the
-duration of the acquisition. `sawtooth(gated=True)` (the default) puts the 33220A in
-gated-burst mode, so the ramp runs only while that trigger is asserted. Pair them, with the
-generator's external-gate input wired to port 1.
+`TimeStream(external_trigger=trigger_for(bias))` makes the Presto assert the generator's own
+**trigger port** — 1 by default — for the duration of the acquisition. `sawtooth(gated=True)`
+(the default) puts the 33220A in gated-burst mode, so the ramp runs only while that trigger is
+asserted. Pair the two.
 
-If the generator is on a different port, pass the per-port states list instead of `True` —
-`[0, 1]` for port 2, and so on. See [Routing the trigger](#routing-the-trigger).
+If the generator is wired elsewhere, tell the *instrument* (`Agilent33220A(trigger_port=2)`, or
+`DAQ_FGEN_TRIGGER_PORT`) rather than the measurement, and `trigger_for` follows. See
+[Routing the trigger](#routing-the-trigger).
 
 `samples_for_periods(n_periods, sample_rate)` returns the `pixel_counts` spanning a whole
 number of ramp periods **plus** the samples `TimeStream` discards at the start — pass the
@@ -165,6 +169,10 @@ qct.run()                       # opens and closes the 33220A itself
 with Agilent33220A() as bias:
     qct.run(bias=bias)          # output de-energised on the way out, session left open
 ```
+
+It gates its QC-trace step on the generator's own `trigger_port`, so a rewired rig needs no
+change here either; `QCTrace(trigger_states=…)` overrides the routing for one measurement, and
+a routing that gates nothing raises rather than recording a static bias.
 
 ## LED driver (DC2200) modes
 
@@ -400,6 +408,41 @@ The Presto has four digital output ports (presto packs the states two bits at a 
 single byte, and `Pulsed.output_digital_marker` bounds ports to 1–4), so a list longer than
 four raises rather than silently overflowing the wire format.
 
+### Let the instrument name its own port
+
+Writing those states by hand is the one mistake this section exists to prevent, and it fails
+**silently**: a gated instrument on a port nobody asserted just never fires — the ramp holds
+its start level, the LED stays dark — and the acquisition succeeds with data that looks like a
+dead device. So each driver carries the port it is wired to, and `trigger_for` builds the
+states from the instruments:
+
+```python
+from daq import Agilent33220A, DC2200, TimeStream, trigger_for
+
+with Agilent33220A() as bias, DC2200() as led:
+    trigger_for(bias)        # -> [1]      the generator's port
+    trigger_for(led)         # -> [0, 1]   the LED's port
+    trigger_for(bias, led)   # -> [1, 1]   both, fired together
+    ts = TimeStream(..., external_trigger=trigger_for(led))
+```
+
+The default ports are the lab's wiring — 1 for the `Agilent33220A`, 2 for the `DC2200`.
+A rig that differs says so once, in whichever place fits:
+
+| where | how | scope |
+|---|---|---|
+| per instrument | `Agilent33220A(trigger_port=3)`, or `bias.trigger_port = 3` | one session |
+| per computer | `DAQ_FGEN_TRIGGER_PORT`, `DAQ_LED_TRIGGER_PORT` | every run on that rig |
+| per model | the driver's `TRIGGER_PORT` class attribute | the repo default |
+
+Ports must be 1–4; anything else raises where you set it, rather than producing a states list
+that quietly gates nothing. `trigger_for` also accepts a bare port number (`trigger_for(3)`) if
+no instrument object is in hand, and raises if an instrument's `trigger_port` is `None`.
+
+`settings()` reports `trigger_port`, so `attach()` writes it into the HDF5 attributes and the
+MongoDB document — the wiring is the one part of a measurement the data file cannot otherwise
+show, and the part whose being wrong looks exactly like a dead detector.
+
 **Timing is global, not per port.** presto sends one `delay`/`width` pair alongside `df`, so
 every port enabled in the same acquisition is gated identically. You cannot hold one port high
 across the record while pulsing another; that needs separate acquisitions.
@@ -444,8 +487,10 @@ acquisition begins, which is the only reliable reference.
 Presto digital output port 2  ──►  DC2200 rear-panel SMA modulation input
 ```
 
-Port 2 is the lab's default; port 1 carries the 33220A gate. Whichever you use, say so with
-`external_trigger` — `[0, 1]` for port 2 — or the LED simply never fires.
+Port 2 is the lab's default; port 1 carries the 33220A gate. If yours is elsewhere, set it on
+the driver — `DC2200(trigger_port=…)` or `DAQ_LED_TRIGGER_PORT` — and gate the acquisition with
+`external_trigger=trigger_for(led)`. Naming the port in the measurement instead is how the LED
+ends up dark for a whole run.
 
 The DC2200 modulation input takes TTL levels (low 0–0.8 V, high 2.0–5.0 V, 10 kΩ). In TTL mode the LED drives at the
 configured current while that input is high and is off while it is low, so the LED is lit for
@@ -454,7 +499,7 @@ exactly as long as the Presto asserts that port: the whole acquisition.
 ### Recipe
 
 ```python
-from daq import DC2200, TimeStream
+from daq import DC2200, TimeStream, trigger_for
 
 TIME_TOTAL_S, FS = 1.0, 5e4
 
@@ -467,7 +512,7 @@ with DC2200() as led:
         amp=amp, output_port=1, input_port=1,
         device="my_device",
         notes="LED response",
-        external_trigger=[0, 1],           # port 2 -> the DC2200 modulation input
+        external_trigger=trigger_for(led),  # the port the LED says it is wired to
         discard_start_ms=0,                # keep the turn-on edge -- see below
     )
 
@@ -531,7 +576,7 @@ with DC2200() as led:
     led.configure_ttl(current_a=0.01, output=True)   # arm once, fires once per run()
     streams = []
     for i in range(50):
-        ts = TimeStream(..., external_trigger=[0, 1], discard_start_ms=0,
+        ts = TimeStream(..., external_trigger=trigger_for(led), discard_start_ms=0,
                         notes=f"LED acquisition {i + 1}/50")
         ts.attach(led=led)
         ts.run()
@@ -615,13 +660,13 @@ assumes small (~1 % of a 500 ms period per 5 ms of offset).
 ### Both instruments at once
 
 `attach()` takes any number of instruments, so a run with both LED and gate bias records both.
-Trigger the two ports together with `[1, 1]`:
+Trigger both ports together by naming both instruments:
 
 ```python
 with DC2200() as led, Agilent33220A() as bias:
-    led.configure_ttl(current_a=0.01)      # LED on port 2
-    bias.sawtooth(vpp=2.0, freq_hz=500)    # gated ramp on port 1
-    ts = TimeStream(..., external_trigger=[1, 1], discard_start_ms=0)
+    led.configure_ttl(current_a=0.01)      # LED on its own port (2 by default)
+    bias.sawtooth(vpp=2.0, freq_hz=500)    # gated ramp on the generator's port (1)
+    ts = TimeStream(..., external_trigger=trigger_for(led, bias), discard_start_ms=0)
     led.output = True                      # arm last, immediately before run()
     ts.attach(led=led, bias=bias)
     ts.run()
@@ -629,8 +674,8 @@ with DC2200() as led, Agilent33220A() as bias:
 
 Both ports share one `delay`/`width`, so this fires them simultaneously and holds both high for
 the acquisition — you cannot stagger them. If the bias should ramp while the LED stays dark,
-use `external_trigger=True` (port 1 only) and leave the LED output disabled; the reverse is
-`[0, 1]` with `bias.constant(...)` instead of a gated ramp.
+use `trigger_for(bias)` and leave the LED output disabled; the reverse is `trigger_for(led)`
+with `bias.constant(...)` instead of a gated ramp.
 
 ## SCPI gotchas
 

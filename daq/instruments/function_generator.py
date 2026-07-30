@@ -6,7 +6,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict, Optional
 
-from ..config import get_fgen_resource
+from ..config import get_fgen_resource, get_fgen_trigger_port
 from ._visa import InstrumentError, VisaInstrument
 
 
@@ -17,8 +17,10 @@ class Agilent33220A(VisaInstrument):
 
     - :meth:`constant` -- a fixed DC bias.
     - :meth:`sawtooth` -- a repeating voltage ramp, normally *gated* so that it runs only
-      while the Presto asserts its trigger output (``TimeStream(external_trigger=True)``,
-      i.e. digital output port 1, where this generator's gate input is wired).
+      while the Presto asserts its trigger output. Pair it with
+      ``TimeStream(external_trigger=trigger_for(bias))``, which asserts whichever digital
+      output port :attr:`~daq.instruments._visa.VisaInstrument.trigger_port` says this
+      generator's external-gate input is wired to (port 1 by default here).
 
     Both setters are **hermetic**: each writes the full state its mode depends on, including
     explicitly disabling burst mode. This matters because the 33220A does not support burst
@@ -33,6 +35,8 @@ class Agilent33220A(VisaInstrument):
     :param timeout_ms: VISA I/O timeout in milliseconds.
     :param backend: PyVISA backend spec. Defaults to ``DAQ_VISA_BACKEND``.
     :param transcript_path: Optional path to a SCPI transcript file.
+    :param trigger_port: Presto digital output port wired to this generator's external-gate
+        input. Defaults to ``DAQ_FGEN_TRIGGER_PORT``, then to :attr:`TRIGGER_PORT`.
 
     """
 
@@ -46,6 +50,9 @@ class Agilent33220A(VisaInstrument):
 
     """
     ENV_VAR = "DAQ_FGEN_RESOURCE"
+    TRIGGER_PORT = 1
+    """Presto digital output port carrying this generator's gate signal in the lab's wiring."""
+    TRIGGER_PORT_ENV_VAR = "DAQ_FGEN_TRIGGER_PORT"
 
     MIN_VPP_BY_LOAD: Dict[str, float] = {"INF": 0.02, "50": 0.01}
     """Minimum programmable peak-to-peak amplitude (V), per output-load setting."""
@@ -60,6 +67,7 @@ class Agilent33220A(VisaInstrument):
         timeout_ms: int = 5000,
         backend: Optional[str] = None,
         transcript_path: Optional[str] = None,
+        trigger_port: Optional[int] = None,
     ) -> None:
         self.load = str(load).upper()
         # Last-configured ramp parameters, kept so samples_for_periods() and settings() can
@@ -70,6 +78,7 @@ class Agilent33220A(VisaInstrument):
             timeout_ms=timeout_ms,
             backend=backend,
             transcript_path=transcript_path,
+            trigger_port=trigger_port,
         )
 
     @classmethod
@@ -80,6 +89,15 @@ class Agilent33220A(VisaInstrument):
 
         """
         return get_fgen_resource()
+
+    @classmethod
+    def env_trigger_port(cls) -> Optional[int]:
+        """Return the trigger port configured via ``DAQ_FGEN_TRIGGER_PORT``.
+
+        :returns: The configured port number, or ``None``.
+
+        """
+        return get_fgen_trigger_port()
 
     # ------------------------------------------------------------------ output state
 
@@ -178,9 +196,14 @@ class Agilent33220A(VisaInstrument):
         With ``gated=True`` (the default) the generator runs in gated-burst mode and emits the
         ramp only while its external trigger input is asserted, which is how the Presto
         synchronises the bias to an acquisition -- pair it with
-        ``TimeStream(external_trigger=True)``, which asserts digital output port 1 for the
-        duration of the acquisition. Pass a per-port states list instead if the gate input is
-        on another port. With ``gated=False`` the ramp free-runs.
+        ``TimeStream(external_trigger=trigger_for(bias))``, which asserts this generator's
+        :attr:`~daq.instruments._visa.VisaInstrument.trigger_port` for the duration of the
+        acquisition. With ``gated=False`` the ramp free-runs.
+
+        A gated ramp whose port is *not* asserted does not fail loudly: the generator sits at
+        its burst start level and the acquisition records a static bias. Deriving the port
+        from the instrument rather than hardcoding one is what keeps that from happening on a
+        rig wired differently from the lab default.
 
         :param vpp: Peak-to-peak amplitude in volts.
         :param freq_hz: Ramp repetition frequency in hertz.

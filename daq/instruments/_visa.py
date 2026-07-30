@@ -23,6 +23,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import get_visa_backend
+from ..triggers import validate_trigger_port
 
 logger = logging.getLogger(__name__)
 
@@ -207,11 +208,25 @@ class VisaInstrument:
     :param backend: PyVISA backend spec. Defaults to ``DAQ_VISA_BACKEND``.
     :param transcript_path: Optional path to a text file receiving every SCPI write, query and
         error response, for debugging a misbehaving instrument.
+    :param trigger_port: Presto digital output port this instrument's trigger/gate/modulation
+        input is wired to. Defaults to the subclass's environment variable and then to its
+        :attr:`TRIGGER_PORT` default.
 
     """
 
     IDN_KEYWORDS: Tuple[str, ...] = ()
     """Substrings identifying this model in its ``*IDN?`` response (case-insensitive)."""
+    TRIGGER_PORT: Optional[int] = None
+    """Default Presto digital output port gating this model, or ``None`` if it is not gated.
+
+    Which port an instrument is gated by is a fact about the *bench*, not about the
+    measurement, so it belongs here rather than in every acquisition that uses the
+    instrument. Subclasses set the lab's default wiring; a rig that differs overrides it per
+    instance (``Agilent33220A(trigger_port=3)``) or through the driver's
+    ``DAQ_*_TRIGGER_PORT`` environment variable, and every measurement follows automatically
+    via :func:`~daq.triggers.trigger_for`.
+
+    """
     RESOURCE_HINTS: Tuple[str, ...] = ()
     """Substrings expected in the VISA resource name, used to skip unrelated resources."""
     READ_TERMINATION: str = "\n"
@@ -266,7 +281,9 @@ class VisaInstrument:
         timeout_ms: int = 5000,
         backend: Optional[str] = None,
         transcript_path: Optional[str] = None,
+        trigger_port: Optional[int] = None,
     ) -> None:
+        self.trigger_port = self._resolve_trigger_port(trigger_port)
         self._backend = get_visa_backend() if backend is None else backend
         self._rm = _get_resource_manager(self._backend)
         self._transcript = open(transcript_path, "a", encoding="utf-8") if transcript_path else None
@@ -325,6 +342,67 @@ class VisaInstrument:
             self.close()
             raise
         self._log(f"IDN    {self.idn}")
+
+    # ------------------------------------------------------------------ trigger routing
+
+    @classmethod
+    def env_trigger_port(cls) -> Optional[int]:
+        """Return the trigger port configured for this instrument, or ``None``.
+
+        Subclasses override this to read their own ``DAQ_*_TRIGGER_PORT`` setting.
+
+        :returns: The configured port number, or ``None``.
+
+        """
+        return None
+
+    @classmethod
+    def _resolve_trigger_port(cls, trigger_port: Optional[int]) -> Optional[int]:
+        """Resolve which digital output port gates this instrument.
+
+        Resolution order mirrors the resource: explicit argument, then the subclass's
+        environment variable, then the model's :attr:`TRIGGER_PORT` default.
+
+        :param trigger_port: Explicit port number, or ``None`` to fall through.
+        :raises ValueError: If the resolved port is not a Presto digital output port.
+        :returns: The resolved port number, or ``None`` if nothing declares one.
+
+        """
+        if trigger_port is not None:
+            return validate_trigger_port(trigger_port, name=f"{cls.__name__} trigger_port")
+        configured = cls.env_trigger_port()
+        if configured is not None:
+            return validate_trigger_port(
+                configured, name=getattr(cls, "TRIGGER_PORT_ENV_VAR", "trigger_port")
+            )
+        return validate_trigger_port(cls.TRIGGER_PORT, name=f"{cls.__name__}.TRIGGER_PORT")
+
+    @property
+    def trigger_port(self) -> Optional[int]:
+        """Presto digital output port this instrument's trigger input is wired to.
+
+        Pass it to a measurement through :func:`~daq.triggers.trigger_for` rather than
+        writing port numbers into the measurement::
+
+            ts = TimeStream(..., external_trigger=trigger_for(bias))
+
+        Assigning re-validates, so a rig rewired mid-session stays consistent. ``None`` means
+        this instrument is not gated by the Presto at all.
+
+        :returns: The port number, 1-based, or ``None``.
+
+        """
+        return self._trigger_port
+
+    @trigger_port.setter
+    def trigger_port(self, port: Optional[int]) -> None:
+        """Set which digital output port gates this instrument.
+
+        :param port: Port number, or ``None`` for "not gated by the Presto".
+        :raises ValueError: If *port* is not a Presto digital output port.
+
+        """
+        self._trigger_port = validate_trigger_port(port, name=f"{type(self).__name__} trigger_port")
 
     # ------------------------------------------------------------------ discovery
 
@@ -622,10 +700,14 @@ class VisaInstrument:
         :meth:`daq._base.Base.attach`, which folds this into the HDF5 attributes and MongoDB
         document of a measurement.
 
+        :attr:`trigger_port` is included so the saved record pins down *which* port was
+        expected to gate this instrument -- the one piece of the wiring that a data file
+        otherwise cannot show, and the one whose being wrong looks like a dead detector.
+
         :returns: Flat mapping of setting name to scalar value.
 
         """
-        return {"resource": self.resource, "idn": self.idn}
+        return {"resource": self.resource, "idn": self.idn, "trigger_port": self.trigger_port}
 
     def _close_transcript(self) -> None:
         """Close the SCPI transcript file, if one is open."""
