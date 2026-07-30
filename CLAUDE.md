@@ -14,7 +14,126 @@ conda activate presto
 ```
 
 ## References
-The `presto` package is documented here: https://www.intermod.pro/manuals/presto/index.html, and this should be the major reference to be read before searching externally.
+
+**Two documents are authoritative for anything about the Presto. Treat them as the bible.**
+
+| | |
+|---|---|
+| **`presto` Python API manual** | https://www.intermod.pro/manuals/presto/index.html |
+| **Presto spec sheet (hardware)** | https://intermod.pro/res/docs/presto_spec_sheet.pdf |
+
+Our hardware is a **Presto-8**. The rules:
+
+1. **Read these before searching externally**, and before reasoning from
+   `site-packages/presto/*.py`.
+2. **When the documents and an inference from the source disagree, the documents win.** The
+   source shows *what the Python layer sends*; it does not show what the FPGA does with it.
+   Several wrong conclusions in this repo's history came from reasoning about hardware
+   behaviour purely from the wrapper — including a "30 ms trigger pulse" that the hardware
+   never emits, and a Pulsed sampling-window figure that was off by exactly 2× until the spec
+   sheet settled it.
+3. Reading the source is still right for **exact call ordering, argument validation and
+   constants** — things the documents do not cover. Cite `file:line` when you do.
+4. **If neither document settles a hardware-timing claim, say so and mark it unverified.**
+   Do not promote an inference to a fact because it is plausible.
+
+The spec sheet is a scanned-layout PDF: `WebFetch` cannot read it, but the `Read` tool can
+(pass `pages`). Do not conclude it is unavailable.
+
+Page map for the API manual (relative to `https://www.intermod.pro/manuals/presto/`):
+
+| Topic | Page |
+|---|---|
+| Digital / trigger ports | `special/digital_ports.html` |
+| Direct vs Mixed converter modes | `special/direct_mixed.html` |
+| Mixer math, synchronising mixers | `special/mixer.html`, `special/sync_mixers.html` |
+| HF outputs, DC outputs | `special/HF_outputs.html`, `special/DC_outputs.html` |
+| Phase encoding, DAC config, sequence plots | `special/XY_pulses.html`, `special/recommended_dac_config.html`, `special/plot_sequences.html` |
+| API modules | `source/{lockin,pulsed,hardware,dcbias,spectral,utils,ssh,version}.html` |
+
+### Presto-8 hardware, from the spec sheet (2024-07-15)
+
+| | Presto-8 |
+|---|---|
+| RF outputs | 8× SMA, 14-bit DAC up to 10 GS/s, output power range 0–24 dB |
+| RF inputs | 8× SMA, 14-bit ADC up to 5 GS/s, input attenuation 0–27 dB in 1-dB steps |
+| IF bandwidth | 1 GHz (−3 dB at 964 MHz) — this is what caps `\|IF\| < 500 MHz` per sideband |
+| NCO | 48-bit frequency (40 µHz), 18-bit phase (30 µrad); fully digital IQ mixer |
+| **Digital markers / triggers** | **4 inputs, 4 outputs**; input impedance **10 kΩ**; output impedance **50 Ω**; **output 3.3 V**; rise 470 ps (20–80 %) / 820 ps (10–90 %), fall 620 ps / 1060 ps, typical **into 50 Ω** |
+| Clock reference | internal TCXO, ±50 ppb; external programmable reference **input up to 750 MHz and output up to 3 GHz, 10 MHz default** |
+| HF outputs | 2 ports, 10 MHz – 15 GHz, 8 dBm @ 8 GHz (CW pump tones, no flexible phase sync) |
+| DC bias output | 16 channels (4× SMA + 1× DSub-25), ranges 0–3.33 V / 0–6.67 V / ±3.33 V / ±6.67 V / ±10 V, 16-bit, output impedance 1 kΩ, compliance 10 mA |
+| Continuous-wave mode | 192 generators and 192 demodulators, distributable between ports |
+| Pulse mode | contiguous sampling window **max 524 µs (2¹⁹ samples)**; total sample memory **268 ms (2²⁹ samples)**; FPGA averaging up to 65k (2¹⁶) windows; template matching **128 templates, max length 1 µs**; sequencer **10 736 events**, **event time resolution 2 ns**; feedback latency 184–254 ns |
+| Comms / power | Gigabit Ethernet; 100–250 V, 50–60 Hz; 2 U rack, 6 kg |
+
+Two consequences worth keeping in mind. The **digital outputs are 3.3 V into 50 Ω** — driving
+an unterminated high-impedance input (the DC2200's TTL input is 10 kΩ) can roughly double
+that, above a 5 V TTL maximum, so terminate at the far end. And the **external clock reference
+output (10 MHz default)** means any external generator with a 10 MHz reference input can be
+locked to the Presto, removing free-running-crystal drift between the two.
+
+### Established behaviour, from the API manual and `presto` 2.16.0 source
+
+Provenance is marked because it determines how much weight a claim carries.
+
+- **`Lockin`'s only digital control is `set_trigger_out`**, and it is *window-locked*: the
+  trigger re-asserts at the start of every lock-in window, i.e. at rate `df`. One state per
+  port (`0` off, `1` every lock-in window, `2` every sum window), packed two bits at a time
+  into a uint8, so at most four ports. `delay`/`width` are **global, not per port** — a single
+  pair sent alongside `df` in `Msg__LckSetDf` — so ports enabled together are gated
+  identically. (source)
+- **Consequence: a `TimeStream` cannot make the Presto emit a short pulse at a slow rate.**
+  Width ≥ `1/df` holds the line high for the whole acquisition; width < `1/df` chops it into a
+  pulse train at the sample rate. There is no width that yields one short pulse in a long
+  record. The sum-window divider (`state=2`) does not rescue this either: `nsum` is capped at
+  1023, so a 100 ms repetition needs `df ≤ ~10 kHz`, which no longer resolves a 0.1 ms
+  feature. Getting a genuinely short, acquisition-locked pulse needs either an external pulse
+  generator gated by the trigger line, or `presto.pulsed`. (source)
+- **`output_digital_marker` is `Pulsed`-only** — arbitrary duration at a defined time in a
+  sequence, ports 1–4, at the 3.3 V / 50 Ω levels above. (manual + spec)
+- **Digital inputs only start a `Pulsed` sequence.** They are reachable exclusively as
+  `TriggerSource.DigitalIn1..4` passed to `Pulsed.run()`, which reaches the hardware via
+  `hardware.set_run()` — called *only* from `pulsed.py`. There is **no API to read a digital
+  input**, and a `Lockin` acquisition cannot be armed from one: it arms with `Msg__LckGet` +
+  `Msg__RfdcSync` and never calls `set_run`. So "let the external hardware free-run and trigger
+  the acquisition off its marker" is not available to `TimeStream`. (source)
+- **A `Lockin` acquisition starts inside `get_pixels()`, not at `apply_settings()`.**
+  `apply_settings` starts signal *generation*; `_get_pixels_common` sends `Msg__LckGet`, calls
+  `hardware.sync()`, then blocks on an 8-byte server handshake, and the pixel window aligns to
+  the next SYSREF edge. This is why `TimeStream.run(on_acquire=)` genuinely runs before sample
+  zero — and equally why its offset is a software/network latency over Gigabit Ethernet, not a
+  hardware one, so it cannot be trusted below the ~10 ms scale. (source)
+- **`Pulsed` is windowed, not continuous, and cannot replace `TimeStream` for multi-tone
+  streams.** The contiguous window is 524 µs at full rate (spec sheet; note `MAX_STORE_LEN` in
+  the source is 2²⁰ = 1 048 576, twice 2¹⁹, because it counts I and Q separately — trust the
+  spec sheet). Because a store holds *raw* samples, window length and usable tone span trade
+  off against each other at a fixed budget, scaling with `Pulsed`'s `downsampling` argument `D`:
+
+  | `D` | `fs` | tone span | contiguous window |
+  |---|---|---|---|
+  | 1 | 1000 MS/s | ±500 MHz | 524 µs |
+  | 8 | 125 MS/s | ±62.5 MHz | 4.2 ms |
+  | 32 | 31.2 MS/s | ±15.6 MHz | 16.8 ms |
+  | 128 | 7.8 MS/s | ±3.9 MHz | 67 ms |
+
+  So covering a 100 ms period needs `D ≈ 256`, confining every tone to ±2 MHz, while the
+  ±500 MHz spread `TimeStream`'s `is_usb` machinery exists to exploit allows only a 524 µs
+  window. `Lockin` has no such coupling because the FPGA demodulates *before* storage — it
+  keeps `n_tones` complex numbers per `1/df` instead of raw samples, a reduction of
+  `fs / (n_tones × df)`, order 10⁴ for two tones at `df = 50 kHz`. **That reduction is the only
+  reason a multi-tone multi-second stream is possible at all.** (spec + source)
+- **`Pulsed`'s hardware demodulator is template matching, and it is sized for qubit readout,
+  not for streaming.** `setup_template_matching_pair` + `match()` + `get_template_matching_data`
+  compute an inner product on the FPGA, but templates cap at 1 µs (128 template slots per the
+  spec sheet; `MAX_TEMPLATE_LEN = 2044` points, halved in Mixed mode, longer ones split across
+  slots) and each `match()` yields **one complex number per event** against a whole-sequence
+  budget of 10 736 events. A 5 s × 50 kHz single-tone stream would need 250 000 match events —
+  23× the entire sequencer capacity. Do not propose template matching as a lock-in substitute.
+  (spec + source)
+- **`CLK_T` is configuration-dependent**, not a fixed board constant: 2.5 ns (`CLK_F` 400 MHz)
+  when `adc_fsample` is `G3_2`, otherwise 2 ns (500 MHz). Any timing figure quoted in clock
+  counts — e.g. the 24-bit trigger-width ceiling — moves with it. (source)
 
 ## Commands
 
