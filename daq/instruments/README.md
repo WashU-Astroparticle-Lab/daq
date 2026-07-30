@@ -446,6 +446,55 @@ would otherwise hand back a silently ungated acquisition. Gating nothing is spel
 MongoDB document — the wiring is the one part of a measurement the data file cannot otherwise
 show, and the part whose being wrong looks exactly like a dead detector.
 
+### Worked example: moving the LED to another port
+
+Say the DC2200's modulation input has been moved from port 2 to port 4 — the LED cable now
+shares a feedthrough with something else. Nothing about the measurement changes; the *rig*
+changed, so you say so once:
+
+```bash
+export DAQ_LED_TRIGGER_PORT=4        # or: DC2200(trigger_port=4), for one session
+```
+
+```python
+from daq import DC2200, TimeStream, trigger_for
+
+with DC2200() as led:
+    led.configure_ttl(current_a=0.01)             # mode + current; LED not armed yet
+    ts = TimeStream(
+        lo_freq=fr, if_freqs=[0], df=5e4, pixel_counts=50_000,
+        amp=amp, output_port=1, input_port=1,
+        device="my_device",
+        external_trigger=trigger_for(led),        # -> [0, 0, 0, 1], follows the env var
+        discard_start_ms=0,                       # keep the turn-on edge
+    )
+    led.output = True                             # arm immediately before the run
+    ts.attach(led=led)                            # records led_trigger_port=4 in the file
+    ts.run()
+```
+
+Every acquisition in every notebook follows, because none of them names a port. Written the
+old way — `external_trigger=[0, 1]` copied from a recipe, or `True` out of habit — this run
+would have completed normally with the LED dark for all 1 s of it, and nothing in the data or
+the saved record would say why.
+
+The same shape applies to the gate generator, and there it also reaches `QCTrace`, which
+previously hardcoded port 1 and could not be routed at all:
+
+```bash
+export DAQ_FGEN_TRIGGER_PORT=3
+```
+
+```python
+from daq import QCTrace
+
+qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+qct.run()        # "QC trace: gating the ramp on Presto digital output port 3"
+```
+
+`run()` re-reads the generator each time, so if you discover mid-session that the gate is
+actually on port 2, `bias.trigger_port = 2` and re-running the same object gates port 2.
+
 **Timing is global, not per port.** presto sends one `delay`/`width` pair alongside `df`, so
 every port enabled in the same acquisition is gated identically. You cannot hold one port high
 across the record while pulsing another; that needs separate acquisitions.

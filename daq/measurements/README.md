@@ -421,6 +421,22 @@ Note `run()` takes the **bias generator** as its only positional argument, not
 `presto_address`; the Presto connection parameters are keyword-only
 (`run(presto_address=...)`).
 
+**Routing the gate on a differently-wired rig** — nothing about the measurement changes, so
+tell the instrument, not the measurement:
+
+```python
+from daq import Agilent33220A, QCTrace
+
+with Agilent33220A(trigger_port=3) as bias:      # or export DAQ_FGEN_TRIGGER_PORT=3
+    qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+    qct.run(bias=bias)      # "QC trace: gating the ramp on Presto digital output port 3"
+```
+
+The generator is re-read on every run, so a port corrected mid-session (`bias.trigger_port =
+2`) takes effect on the next `qct.run(bias=bias)` — no need to rebuild the measurement. To
+pin the routing to the measurement instead, pass `QCTrace(..., trigger_states=[0, 0, 1])`;
+that overrides the generator, and warns if it leaves the generator's own port unasserted.
+
 **Records**: every step saves its own HDF5 + MongoDB record via the normal path with
 `attach(bias=...)` applied, so each raw acquisition stays individually loadable. `QCTrace` saves
 one further `qc_trace` record with the derived products (`fr`, `time_ms`/`avg_iq`,
