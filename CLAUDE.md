@@ -29,7 +29,14 @@ black --line-length 100 daq/
 docformatter --style sphinx --wrap-summaries 100 --wrap-descriptions 100 daq/
 ```
 
-There are no automated tests or CI workflows in this repo.
+There is no CI. An offline verification suite lives in `tests/` and runs with **no hardware, no VISA runtime and no MongoDB**:
+
+```bash
+python tests/test_instruments.py     # daq.instruments vs a simulated VISA backend (no presto needed)
+python tests/test_timestream_run.py  # TimeStream.run() ordering/muting vs a mocked Lockin (skips if presto absent)
+```
+
+Each prints one PASS/FAIL line per check and exits non-zero on failure. They are standalone scripts, not pytest suites — `tests/test_instruments.py` must inject its fake `pyvisa` before importing `daq.instruments`, so run them as scripts. Extend them when touching the instruments layer or `TimeStream.run()`.
 
 ## Configuration
 
