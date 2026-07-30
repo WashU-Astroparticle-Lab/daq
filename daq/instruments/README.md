@@ -550,14 +550,67 @@ average across records.
 TTL mode gives you an illumination *window* locked to the acquisition, not a short pulse
 inside it. If what you need is a brief flash, the options are:
 
-- **[PWM](#pwm-pulse-train) or [pulse mode](#pulse-mode-explicit-width)** — the DC2200 generates
-  the timing itself, so you get real short pulses, but the train *starts* on a software-timed
-  USB write and therefore lands at an unknown offset in the record, different every run. Fine
-  when the pulses need not line up with the data.
+- **[PWM](#pwm-pulse-train) or [pulse mode](#pulse-mode-explicit-onoff-times)** — the DC2200
+  generates the timing itself, so you get real short pulses, but the train *starts* on a
+  software-timed USB write. Started before `run()` that means an unknown seconds-scale offset;
+  started via `on_acquire` (below) the offset shrinks to a few milliseconds.
 - **`presto.pulsed`** — `Pulsed.output_digital_marker(at_time, duration, ports)` schedules a
   digital marker of arbitrary duration at a defined time in a pulse sequence. That is a proper
   hardware-timed short pulse, but it is a different presto measurement mode from `Lockin` and
   is not wrapped by this library; `TimeStream` cannot produce it by changing a parameter.
+
+### Short pulses at a few-ms offset: `on_acquire`
+
+When exact sync is out of reach (no free wiring path, `presto.pulsed` not warranted) but a
+few-millisecond alignment is enough, start the pulse train from **inside** `run()`, at the
+last moment before data:
+
+```
+ts.run(on_acquire=...)
+  ├─ connect / configure mixer / tune        seconds, variable  ← why pre-run() timing fails
+  ├─ apply_settings()                        trigger (if configured) asserts here
+  ├─ on_acquire()                            ← your callable: a few SCPI round trips
+  └─ get_pixels()                            sample zero
+```
+
+`on_acquire` is called exactly once, after all the slow setup, immediately before
+acquisition. A pulse train started there sits within **milliseconds-to-tens-of-ms** of sample
+zero — set by a few SCPI round trips (each `write` brackets the command with `SYST:ERR?`
+checks) racing the `get_pixels` start round-trip — instead of the seconds-scale, per-run
+variable offset of anything started before `run()`:
+
+```python
+with DC2200() as led:
+    led.configure_pulse(on_time_s=10e-6, freq_hz=2.0, current_a=1.0e-3, count=0)
+    ts = TimeStream(..., discard_start_ms=0)
+    ts.attach(led=led)
+    ts.run(on_acquire=lambda: setattr(led, "output", True))
+    led.output = False
+```
+
+Every record then holds pulses at exact instrument-timed spacing (500 ms here), at a roughly
+repeatable offset from acquisition start.
+
+**The offset's sign and size are not yet bench-measured.** Which side of sample zero the
+train starts on decides what happens to pulse one:
+
+- Train starts *before* sample zero → a short first pulse (10 µs here) fires before
+  acquisition and is never recorded; the first *recorded* pulse lands near
+  `period − offset`.
+- Train starts *after* sample zero → pulse one lands at small positive `t`, where the
+  default 25 ms `discard_start_ms` trim could eat it — hence `discard_start_ms=0` in the
+  recipe.
+
+Either way the actual offset is read off the data: the position of the first recorded pulse,
+**modulo the pulse period**. Measure it on the first bench record before relying on a number.
+
+Keep the callable to a single fast write. If it raises, the acquisition is abandoned and the
+exception propagates; `run()` mutes the Presto outputs on the way out, but disarming the
+instrument stays with its `with` block. The Presto trigger ports are untouched by this
+mechanism, so a gated bias ramp on port 1 works in the same acquisition — note the hook's
+latency then sits between the ramp start (trigger assertion at `apply_settings`) and sample
+zero, adding the same ms-scale skew to the ramp-vs-data alignment that `fold_timestream`
+assumes small (~1 % of a 500 ms period per 5 ms of offset).
 
 ### Both instruments at once
 
