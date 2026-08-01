@@ -7,11 +7,13 @@ from .sweep_power import SweepPower
 from .timestream import TimeStream
 from .two_tone_power import TwoTonePower
 
-# Imported after TimeStream: QCTrace composes Sweep and TimeStream, and pulls in
-# daq.analysis for the folding step.
+# Imported after TimeStream: both compose TimeStream, and QCTrace pulls in daq.analysis for
+# the folding step.
+from .bias_hunt import BiasHunt
 from .qc_trace import QCTrace
 
 __all__ = [
+    "BiasHunt",
     "QCTrace",
     "Sweep",
     "SweepFreqAndDC",

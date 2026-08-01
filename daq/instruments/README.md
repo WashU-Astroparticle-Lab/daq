@@ -157,22 +157,26 @@ not a swept one. The generator sits at its burst start level while the gate is l
 asserts the gate. For a ramp that runs through an untriggered acquisition, use
 `sawtooth(gated=False)`.
 
-`QCTrace` packages the whole sequence — locating sweep, gated QC trace, constant-bias hunt and
-free-running ramp — with the gating and the bias states already right:
+`QCTrace` packages the gated ramp with the gating already right, and `BiasHunt` the
+constant-bias hunt with nothing gated. Both read out at a frequency you supply — normally the
+`fr` from a fitted `Sweep` — and both leave the gate de-energised on the way out:
 
 ```python
-from daq import QCTrace
+from daq import BiasHunt, QCTrace
 
-qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+qct = QCTrace(readout_freq=fr, amp=amp, output_port=1, input_port=1, device="my_device")
 qct.run()                       # opens and closes the 33220A itself
 # ...or keep ownership of the session:
 with Agilent33220A() as bias:
     qct.run(bias=bias)          # output de-energised on the way out, session left open
+    BiasHunt(readout_freq=fr, amp=amp, output_port=1, input_port=1,
+             v_min=0.0, v_max=2.0, device="my_device").run(bias=bias)
 ```
 
-It gates its QC-trace step on the generator's own `trigger_port`, so a rewired rig needs no
-change here either; `QCTrace(trigger_states=…)` overrides the routing for one measurement, and
-a routing that gates nothing raises rather than recording a static bias.
+`QCTrace` gates on the generator's own `trigger_port`, so a rewired rig needs no change here
+either; `QCTrace(trigger_states=…)` overrides the routing for one measurement, and a routing
+that gates nothing raises rather than recording a static bias. `BiasHunt` gates nothing at all
+— its bias is a DC level already written over SCPI.
 
 ## LED driver (DC2200) modes
 
@@ -488,7 +492,7 @@ export DAQ_FGEN_TRIGGER_PORT=3
 ```python
 from daq import QCTrace
 
-qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+qct = QCTrace(readout_freq=fr, amp=amp, output_port=1, input_port=1, device="my_device")
 qct.run()        # "QC trace: gating the ramp on Presto digital output port 3"
 ```
 

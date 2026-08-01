@@ -277,6 +277,9 @@ class Base:
             # Convert numpy types to Python native types
             if isinstance(value, np.ndarray):
                 document[attribute] = value.tolist()
+            elif isinstance(value, (list, tuple)):
+                # e.g. BiasHunt.bias_files. Stringifying these would make them unqueryable.
+                document[attribute] = list(value)
             elif isinstance(value, (np.integer, np.floating)):
                 document[attribute] = value.item()
             elif np.isscalar(value) or value is None:
@@ -299,6 +302,7 @@ class Base:
         Handles the amp/frequency pairings for each measurement type:
 
         - ``amp`` (scalar) at ``freq_center`` → ``power_dbm``
+        - ``amp`` (scalar) at ``readout_freq`` → ``power_dbm``
         - ``amp_arr`` at ``freq_center`` → ``power_dbm_arr``
         - ``readout_amp`` at ``readout_freq`` → ``readout_power_dbm``
         - ``control_amp_arr`` at ``control_freq_center`` → ``control_power_dbm_arr``
@@ -312,6 +316,16 @@ class Base:
                 if np.isscalar(amp_val):
                     document["power_dbm"] = float(
                         amp_to_power_dbm(freq_hz * 1e-9, amp_val)
+                    )
+
+            # QCTrace, BiasHunt: scalar amp at the caller-supplied readout frequency. These
+            # carry no freq_center of their own -- the resonance is located by a separate
+            # Sweep -- and no readout_amp, so neither branch either side of this catches them.
+            if hasattr(self, "amp") and hasattr(self, "readout_freq"):
+                amp_val = getattr(self, "amp")
+                if np.isscalar(amp_val) and not hasattr(self, "readout_amp"):
+                    document["power_dbm"] = float(
+                        amp_to_power_dbm(getattr(self, "readout_freq") * 1e-9, amp_val)
                     )
 
             # TimeStream: per-tone amp array at the selected sideband frequency

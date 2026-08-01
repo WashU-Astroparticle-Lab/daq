@@ -28,7 +28,7 @@ Common to every measurement:
 |---|---|
 | `utc_time` | UTC timestamp (ISO string) |
 | `number` | 8-digit cumulative measurement number |
-| `type` | `"sweep"`, `"timestream"`, `"qc_trace"`, … |
+| `type` | `"sweep"`, `"timestream"`, `"qc_trace"`, `"bias_hunt"`, … |
 | `device` | Device name (required) |
 | `filter` | Filter name (optional) |
 | `notes` | Free-text notes (optional) |
@@ -39,11 +39,12 @@ Calibrated power is added automatically:
 
 | Field | Measurement |
 |---|---|
-| `power_dbm` | `Sweep`, `SweepFreqAndDC` (scalar); `TimeStream` (per-tone list) |
+| `power_dbm` | `Sweep`, `SweepFreqAndDC`, `QCTrace`, `BiasHunt` (scalar); `TimeStream` (per-tone list) |
 | `power_dbm_arr` | `SweepPower` (drive power array) |
 | `readout_power_dbm`, `control_power_dbm_arr` | `TwoTonePower` |
 
-Fit results are added when auto-fitting succeeds (`Sweep`, and `QCTrace`'s composite record):
+Fit results are added when auto-fitting succeeds (`Sweep`; `QCTrace` and `BiasHunt` carry none
+of their own, since neither fits a resonance — they read out where you tell them to):
 `fit_fr`, `fit_Qi`, `fit_Qc`, `fit_Ql` with their `_err` counterparts, plus `fit_kappa = fr/Qc`.
 These keys are simply absent when `auto_fit=False` or the fit fails — filter on them with
 `df['fit_fr'].notna()` rather than assuming they exist.

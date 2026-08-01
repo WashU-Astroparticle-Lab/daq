@@ -1,18 +1,22 @@
-"""Offline verification of ``QCTrace``'s trigger routing (#53).
+"""Offline verification of ``QCTrace``: trigger routing (#53) and the folding step.
 
-``QCTrace`` gates exactly one of its four steps -- the QC trace itself -- and getting the
-routing wrong is *silent*: an ungated 33220A holds its burst start level, the acquisition
-succeeds, and the folded trace is flat. These checks pin the routing down without hardware by
-swapping ``Sweep`` and ``TimeStream`` in the module for recorders and driving ``run()`` with a
-stand-in bias generator, then asserting which per-port states each step actually asked for:
+``QCTrace`` is one gated acquisition, and getting the gate routing wrong is *silent*: an
+ungated 33220A holds its burst start level, the acquisition succeeds, and the folded trace is
+flat. These checks pin the routing down without hardware by swapping ``TimeStream`` in the
+shared readout module for a recorder and driving ``run()`` with a stand-in bias generator, then
+asserting which per-port states the acquisition actually asked for:
 
-- the QC step follows the bias generator's own ``trigger_port``, so a rewired rig gates the
+- the acquisition follows the bias generator's own ``trigger_port``, so a rewired rig gates the
   right port with no change to the measurement;
 - an explicit ``trigger_states`` overrides it, and is validated in ``__init__``;
 - a routing that gates *nothing* raises instead of recording a static bias;
-- the bias hunt and the free-running ramp stay ungated;
-- the resolved states survive the HDF5 round trip, and files written before the parameter
-  existed load as port 1 (what the old hardcoded ``external_trigger=True`` meant).
+- the resolved states survive the HDF5 round trip.
+
+Plus the fold: ``run()`` folds on the ramp's own period at the *tuned* sample rate, and
+``fold()`` is re-callable on a stream loaded back from ``qc_file``.
+
+Note the ``TimeStream`` swap targets ``daq.measurements._gate_bias``, not this measurement's own
+module: the readout builder both ``QCTrace`` and ``BiasHunt`` acquire through lives there.
 
 Requires ``presto`` to be importable (``QCTrace`` imports it transitively); no hardware and no
 network. The database calls are stubbed rather than left to fail, so the round-trip check does
@@ -33,11 +37,10 @@ except ImportError:
     print("SKIP: presto is not installed; QCTrace cannot be imported without it")
     sys.exit(0)
 
-import h5py
 import numpy as np
 
 import daq._base as base_mod
-import daq.measurements.qc_trace as qcm
+import daq.measurements._gate_bias as gate_bias_mod
 from daq.measurements.qc_trace import QCTrace
 
 # The save path is exercised for the round trip below; keep it off the network.
@@ -54,29 +57,33 @@ def check(label, condition, detail=""):
 
 # ---------------------------------------------------------------- stand-ins
 
-
-class FakeSweep:
-    """A locating sweep that always finds a resonance."""
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.fit_results = {"fr": 2.8e9, "fr_err": 10.0}
-
-    def run(self, **kwargs):
-        return "/tmp/sweep.h5"
+RAMP_HZ = 500.0
+FS = 5e4
+N_PERIODS = 10
+#: Noise on the synthetic response, well under the per-sample step of the ramp buried in it
+#: (1 / 100), so a correct fold leaves that ramp monotonic and an incorrect one does not.
+NOISE = 1e-3
 
 
 class FakeTimeStream:
-    """Records the ``external_trigger`` each step asked for; produces plausible data."""
+    """Records the ``external_trigger`` the step asked for; produces plausible data."""
 
     instances = []
+    #: Sample rate the "hardware" tunes to, which run() must fold on rather than the
+    #: requested one -- a window off by a sample smears the average across blocks.
+    tuned_df = FS
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.df = kwargs["df"]
-        rng = np.random.default_rng(0)
+        self.df = FakeTimeStream.tuned_df
         n = int(kwargs["pixel_counts"])
-        self.signal = (rng.standard_normal((n, 1)) + 1j * rng.standard_normal((n, 1))) * 1e-3
+        # A ramp-shaped response repeating once per period, plus noise: folding must recover
+        # the ramp. Built on the tuned rate, as a real acquisition would be.
+        per = int(round(self.df / RAMP_HZ))
+        rng = np.random.default_rng(0)
+        ramp = np.tile(np.arange(per) / per, n // per + 1)[:n]
+        noise = rng.standard_normal(n) + 1j * rng.standard_normal(n)
+        self.signal = (ramp + 1j * ramp + NOISE * noise).reshape(n, 1)
         FakeTimeStream.instances.append(self)
 
     def attach(self, **instruments):
@@ -101,24 +108,26 @@ class FakeBias:
         self.calls.append(("constant", voltage))
 
     def samples_for_periods(self, n_periods, sample_rate, *, freq_hz=None, discard_ms=25.0):
-        return 1000
+        return int(round(sample_rate / freq_hz)) * int(n_periods)
 
 
-qcm.Sweep = FakeSweep
-qcm.TimeStream = FakeTimeStream
+gate_bias_mod.TimeStream = FakeTimeStream
+
+# Stub the save at *class* level, not per instance: an instance attribute would itself land in
+# the saved record, since Base._save walks __dict__. The real one is kept for the round trip.
+save_for_real = QCTrace.save
+QCTrace.save = lambda self, save_filename=None: "/dev/null"  # type: ignore[assignment]
 
 
 def make(**kwargs):
     params = dict(
-        freq_center=2.8e9,
+        readout_freq=2.8e9,
         amp=0.01,
         output_port=1,
         input_port=1,
-        ramp_freq_hz=500.0,
-        sampling_frequency=5e4,
-        num_periods=10,
-        n_bias_try=2,
-        ts_duration_s=0.01,
+        ramp_freq_hz=RAMP_HZ,
+        sampling_frequency=FS,
+        num_periods=N_PERIODS,
         discard_start_ms=0.0,
         device="offline-test",
     )
@@ -129,7 +138,6 @@ def make(**kwargs):
 def run_with(qct, bias):
     """Drive ``run()`` past the save step and return the per-step trigger states."""
     FakeTimeStream.instances = []
-    qct.save = lambda save_filename=None: "/dev/null"  # type: ignore[assignment]
     qct.run(bias=bias)
     return [ts.kwargs["external_trigger"] for ts in FakeTimeStream.instances]
 
@@ -140,23 +148,18 @@ def states_of(value):
 
 # ---------------------------------------------------------------- routing
 
-# 1. The default follows the generator's own wiring, and only the QC step is gated.
+# 1. The default follows the generator's own wiring, and the acquisition is the only step.
 qct = make()
 check("routing is deferred to run()", qct.trigger_states is None)
 steps = run_with(qct, FakeBias(trigger_port=1))
-check("QC step gates the generator's port", states_of(steps[0]) == [1], str(states_of(steps[0])))
-check(
-    "bias hunt and free-running ramp stay ungated",
-    all(s is False for s in steps[1:]),
-    str(steps[1:]),
-)
+check("exactly one acquisition", len(steps) == 1, str(len(steps)))
+check("it gates the generator's port", states_of(steps[0]) == [1], str(states_of(steps[0])))
 check("resolved states land on the measurement", states_of(qct.trigger_states) == [1])
 
 # 2. Rewire the generator and the same measurement follows it -- the point of #53.
 qct = make()
 steps = run_with(qct, FakeBias(trigger_port=2))
 check("a generator on port 2 is gated on port 2", states_of(steps[0]) == [0, 1], str(steps[0]))
-check("the other steps are unaffected", all(s is False for s in steps[1:]))
 
 # 3. An explicit routing overrides the instrument, and is checked in __init__.
 qct = make(trigger_states=[0, 0, 1])
@@ -217,7 +220,6 @@ for bad in ([3], [1, 1, 1, 1, 1], [0.5]):
 # 5. A generator that does not say where it is wired fails before any acquisition.
 qct = make()
 FakeTimeStream.instances = []
-qct.save = lambda save_filename=None: "/dev/null"  # type: ignore[assignment]
 try:
     qct.run(bias=FakeBias(trigger_port=None))
     check("undeclared trigger_port raises", False, "ran anyway")
@@ -225,23 +227,149 @@ except ValueError as exc:
     check("undeclared trigger_port raises", "trigger_port is None" in str(exc), str(exc)[:60])
 check("nothing was acquired before the routing failed", not FakeTimeStream.instances)
 
+# 6. The ramp is gated, since a free-running one would not line up with the blocks.
+bias = FakeBias(trigger_port=1)
+bias.output = True
+run_with(make(), bias)
+check("the sawtooth is gated", bias.calls == [("sawtooth", True)], str(bias.calls))
+
+# 7. The gate is never left energised -- on the happy path or on the way out of a failure.
+# A bias left on an unattended device is the one failure here that outlives the session.
+check("a caller-supplied generator is de-energised on success", bias.output is False)
+
+failing = make()
+failing_bias = FakeBias(trigger_port=1)
+failing_bias.output = True
+failing_bias.samples_for_periods = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    failing.run(bias=failing_bias)
+    check("an exception mid-run still de-energises the gate", False, "no exception raised")
+except RuntimeError:
+    check("an exception mid-run still de-energises the gate", failing_bias.output is False)
+
+# ---------------------------------------------------------------- drift warning
+
+# A ramp rate that does not divide the sample rate makes every folded block start a fraction of
+# a sample later than the last, and the drift accumulates: the trace comes out smeared with
+# nothing to show for it. Warn at construction, where the caller can still change the numbers.
+with warnings.catch_warnings(record=True) as drift:
+    warnings.simplefilter("always")
+    make(ramp_freq_hz=300.0)  # 50 kHz / 300 Hz = 166.67 samples per period
+check(
+    "a non-integral ramp period warns",
+    any("whole multiple" in str(w.message) for w in drift),
+    str([str(w.message)[:60] for w in drift]),
+)
+with warnings.catch_warnings(record=True) as clean:
+    warnings.simplefilter("always")
+    make(ramp_freq_hz=250.0)  # 200 samples per period, exactly
+check("an integral ramp period does not warn", not clean, str([str(w.message)[:40] for w in clean]))
+
+# ---------------------------------------------------------------- folding
+
+# run() folds on the ramp's own period at the TUNED sample rate. Tune df away from what was
+# asked for: dividing the record by num_periods would then land a sample short of the physical
+# period and smear the average across blocks.
+#
+# The offset has to be big enough to CHANGE the window, or the check cannot fail: at
+# RAMP_HZ = 500, round(50100 / 500) == round(50000 / 500) == 100, so a tune of +100 Hz is
+# indistinguishable from no tuning at all. +300 Hz gives 101 samples against the requested
+# rate's 100, so folding at the wrong rate is caught here.
+FakeTimeStream.tuned_df = FS + 300.0
+qct = make()
+run_with(qct, FakeBias(trigger_port=1))
+FakeTimeStream.tuned_df = FS
+expected = int(round(qct.qc_stream.df / RAMP_HZ))
+requested = int(round(FS / RAMP_HZ))
+check(
+    "the tuned rate is distinguishable from the requested one",
+    expected != requested,
+    f"tuned {expected} vs requested {requested} samples per period",
+)
+check(
+    "run() folds one period at the tuned rate",
+    qct.avg_iq is not None and qct.avg_iq.shape == (2, expected),
+    f"{None if qct.avg_iq is None else qct.avg_iq.shape} vs (2, {expected})",
+)
+check(
+    "the folded trace recovers the ramp",
+    # The injected response is a rising ramp per period, in both quadratures; averaging must
+    # leave it monotonic despite the noise it was buried in.
+    np.all(np.diff(qct.avg_iq[0]) > 0)
+    and np.allclose(qct.avg_iq[0], qct.avg_iq[1], atol=10 * NOISE),
+    f"min slope {np.min(np.diff(qct.avg_iq[0])):.2e}",
+)
+check(
+    "time_ms spans one period",
+    np.isclose(qct.time_ms[-1] + qct.time_ms[1], 1e3 / RAMP_HZ, rtol=1e-2),
+    f"{qct.time_ms[-1]:.4f} ms vs {1e3 / RAMP_HZ:.4f} ms",
+)
+
+# fold() is re-callable, on this measurement's stream or on one loaded back from qc_file.
+qct.fold(n_periods=N_PERIODS)
+check(
+    "fold(n_periods=) re-folds in place",
+    qct.avg_iq.shape[1] == qct.qc_stream.signal.shape[0] // N_PERIODS,
+)
+qct.fold()
+check("fold() returns to the ramp period", qct.avg_iq.shape == (2, expected))
+t_ms, avg = qct.fold(qct.qc_stream)
+check("fold() accepts an explicit stream", avg.shape == (2, expected) and t_ms.shape[0] == expected)
+
+# A bare array carries no tuned rate. Silently substituting the *requested* sampling_frequency
+# would fold at the wrong rate -- exactly what folding on stream.df exists to prevent -- so this
+# must raise rather than guess.
+try:
+    qct.fold(np.zeros(4096, dtype=complex))
+    check("fold() refuses an array with no tuned rate", False, "folded anyway")
+except TypeError as exc:
+    check("fold() refuses an array with no tuned rate", "tuned sample rate" in str(exc))
+
+# The blocks actually averaged, not the blocks requested: the sqrt(N) noise gain is over the
+# former, and nothing else in the saved record reveals the difference.
+qct.fold()
+n_samples = qct.qc_stream.signal.shape[0]
+check(
+    "num_periods_folded counts the blocks actually averaged",
+    qct.num_periods_folded == n_samples // expected,
+    f"{qct.num_periods_folded} vs {n_samples // expected} (requested {N_PERIODS})",
+)
+
+for kwargs in ({"period_s": 1e-3, "n_periods": 5},):
+    try:
+        qct.fold(**kwargs)
+        check(f"fold({kwargs}) rejected", False, "accepted")
+    except ValueError:
+        check(f"fold({kwargs}) rejected", True)
+
+fresh = make()
+try:
+    fresh.fold()
+    check("fold() before run() raises", False, "folded")
+except RuntimeError as exc:
+    check("fold() before run() raises", "No time stream to fold" in str(exc))
+
 # ---------------------------------------------------------------- persistence
 
 qct = make(trigger_states=[0, 1])
-qct.fr = 2.8e9
-qct.fr_err = 10.0
-qct.time_ms = np.linspace(0, 2, 100)
-qct.avg_iq = np.zeros((2, 100))
-qct.parity_contrast = np.array([1.0, 2.0])
+run_with(qct, FakeBias(trigger_port=2))
 with tempfile.TemporaryDirectory() as tmp:
     path = os.path.join(tmp, "00000001-offline-test-qc_trace.h5")
-    qct.save(save_filename=path)
+    save_for_real(qct, save_filename=path)
     reloaded = QCTrace.load(path)
     check(
         "trigger states survive the HDF5 round trip",
         states_of(reloaded.trigger_states) == [0, 1],
         str(reloaded.trigger_states),
     )
+    check(
+        "the folded trace survives the round trip",
+        np.allclose(reloaded.avg_iq, qct.avg_iq) and np.allclose(reloaded.time_ms, qct.time_ms),
+    )
+    check("readout_freq round trips", reloaded.readout_freq == qct.readout_freq)
+    check("the raw acquisition's path round trips", reloaded.qc_file == qct.qc_file)
+    check("the raw stream is not restored", reloaded.qc_stream is None)
+
     # The stored routing describes the run that made the file, not the bench in front of you:
     # re-running a loaded measurement must read the generator it is handed.
     steps = run_with(reloaded, FakeBias(trigger_port=1))
@@ -249,19 +377,6 @@ with tempfile.TemporaryDirectory() as tmp:
         "re-running a loaded measurement re-reads the generator",
         states_of(steps[0]) == [1],
         str(states_of(steps[0])),
-    )
-
-    # Files written before the parameter existed carry no dataset; they were all port 1.
-    legacy = os.path.join(tmp, "00000002-offline-test-qc_trace.h5")
-    with h5py.File(path, "r") as src, h5py.File(legacy, "w") as dst:
-        for key in src.attrs:
-            dst.attrs[key] = src.attrs[key]
-        for key in src:
-            if key != "trigger_states":
-                src.copy(key, dst)
-    check(
-        "a pre-#53 file loads as port 1",
-        states_of(QCTrace.load(legacy).trigger_states) == [1],
     )
 
 # ------------------------------------------------------------------------------ summary

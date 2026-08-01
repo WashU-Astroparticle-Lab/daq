@@ -1,23 +1,21 @@
 # -*- coding: utf-8 -*-
 """Quantum-capacitance (QC) trace measurement.
 
-The bench routine for charge-parity / quasiparticle-tunnelling work on a single device,
-composing a :class:`~daq.measurements.sweep.Sweep`, several
-:class:`~daq.measurements.timestream.TimeStream` acquisitions and an
-:class:`~daq.instruments.function_generator.Agilent33220A` gate-bias source.
+One gated sawtooth on the gate, one externally-triggered
+:class:`~daq.measurements.timestream.TimeStream` spanning a whole number of ramp periods, and
+the fold of that record into a single period.
 """
 
 from __future__ import annotations
 
 import warnings
 from contextlib import ExitStack
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, Optional, Tuple
 
 import h5py
 import numpy as np
 import numpy.typing as npt
 
-from .._base import Base
 from ..analysis.folding import fold_timestream
 from ..instruments import Agilent33220A
 from ..triggers import (
@@ -26,57 +24,50 @@ from ..triggers import (
     resolve_trigger_states,
     trigger_for,
 )
-from .sweep import Sweep
+from ._gate_bias import GateBiasMeasurement
 from .timestream import TimeStream
 
-FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 
+class QCTrace(GateBiasMeasurement):
+    """Quantum-capacitance trace: a gated gate-voltage ramp, folded into one period.
 
-class QCTrace(Base):
-    """Quantum-capacitance trace: the full parity / quasiparticle-tunnelling routine.
+    The gate is swept by a sawtooth that repeats at ``ramp_freq_hz`` while a single-tone time
+    stream records continuously at :attr:`readout_freq`. The record spans ``num_periods`` whole
+    ramp periods, and :meth:`fold` block-averages it into one period: uncorrelated noise falls
+    by ``sqrt(num_periods)`` and what remains is the device's response to one sweep of the gate
+    voltage.
 
-    Runs, in order, the four steps that make up a QC-trace measurement on one device:
+    The ramp is *gated* on a Presto digital output, so it starts with the acquisition rather
+    than free-running against it -- which is what makes the blocks line up well enough to
+    average at all.
 
-    1. A frequency :class:`~daq.measurements.sweep.Sweep` with auto-fit, to locate ``fr``.
-       Everything downstream reads out at that frequency.
-    2. The **QC trace** itself: a gated voltage ramp on the gate, an externally-triggered
-       :class:`~daq.measurements.timestream.TimeStream` spanning ``num_periods`` whole ramp
-       periods, block-averaged into a single period by
-       :func:`~daq.analysis.folding.fold_timestream`. Uncorrelated noise falls by
-       ``sqrt(num_periods)``, leaving the device's response to one sweep of the gate voltage.
-    3. A **bias hunt**: one constant-bias time stream per entry of :attr:`bias_voltages`
-       (drawn at random over the ramp's voltage range by default), keeping the one with the
-       largest parity contrast, ``std(|signal|)``.
-    4. One time stream under a **free-running ramp**, the same length as the constant-bias
-       tries, for comparison against the best static bias.
+    This measurement does **not** locate the resonance. Read out where a fitted
+    :class:`~daq.measurements.sweep.Sweep` says to::
 
-    Every step saves its own HDF5 file and MongoDB record through the usual path, so the raw
-    sweep and each individual time stream stay individually loadable. This class saves one
-    further record holding the derived products -- the fitted ``fr``, the folded QC trace, the
-    contrast-versus-bias curve and the winning bias -- plus the file paths of the constituent
-    acquisitions.
+        sw = Sweep(freq_center=2.8e9, ..., auto_fit=True)
+        sw.run()
+        qct = QCTrace(readout_freq=sw.fit_results["fr"], ...)
 
-    The measurement is fully specified at construction: the bias voltages are drawn in
-    :meth:`__init__`, so the object (and its saved record) pin down exactly what was measured
-    regardless of the random seed.
+    and see :class:`~daq.measurements.bias_hunt.BiasHunt` for the companion measurement that
+    parks the gate at constant voltages and ranks them by parity contrast.
 
     Requires the Presto **and** the 33220A over VISA; it cannot run without hardware.
 
-    **Trigger routing.** Only step 2 is gated, and by default it gates whichever Presto
-    digital output port the bias generator says it is wired to --
+    **Trigger routing.** The acquisition is gated, by default on whichever Presto digital output
+    port the bias generator says it is wired to --
     :attr:`Agilent33220A.trigger_port <daq.instruments._visa.VisaInstrument.trigger_port>`,
     port 1 in the lab's default setup, overridable per instrument or through
     ``DAQ_FGEN_TRIGGER_PORT``. The generator is consulted on *every* run, so rewiring it and
     running again gates the new port; :meth:`load` restores the stored routing for inspection
     but does not pin it. Pass *trigger_states* to override the routing for one measurement.
-    Getting this wrong is a silent failure -- an ungated ramp sits at its burst start level
-    and step 2 records a static bias rather than a swept one -- so the resolved states are
+    Getting this wrong is a silent failure -- an ungated ramp sits at its burst start level and
+    the acquisition records a static bias rather than a swept one -- so the resolved states are
     validated up front, refused if they gate nothing, warned about if they leave the
     generator's own port unasserted, and saved with the record.
 
-    :param freq_center: Centre frequency of the locating sweep in hertz.
-    :param amp: Drive amplitude in DAC full scale, shared by the sweep and every time stream.
-        Convert from dBm with :func:`~daq.calibrations.power_dbm_to_amp`.
+    :param readout_freq: Readout frequency in hertz, normally a fitted ``fr``.
+    :param amp: Drive amplitude in DAC full scale. Convert from dBm with
+        :func:`~daq.calibrations.power_dbm_to_amp`.
     :param output_port: Presto output port.
     :param input_port: Presto input port.
     :param ramp_vpp: Ramp peak-to-peak amplitude in volts.
@@ -85,44 +76,28 @@ class QCTrace(Base):
         ramp unipolar-positive (the lab convention).
     :param ramp_symmetry_pct: Ramp symmetry in percent; ``100`` gives a ramp-up sawtooth.
     :param sampling_frequency: Time-stream sample rate in hertz.
-    :param num_periods: Number of whole ramp periods the QC trace spans and averages over.
-    :param n_bias_try: Number of constant-bias tries in the bias hunt. Ignored when
-        *bias_voltages* is given.
-    :param bias_voltages: Explicit bias voltages to try, instead of a random draw -- e.g. a
-        ``numpy.linspace`` to scan the range systematically.
-    :param v_min: Lower bound of the random bias draw in volts. Defaults to the ramp's minimum
-        voltage, ``ramp_offset_v - ramp_vpp / 2``.
-    :param v_max: Upper bound of the random bias draw in volts. Defaults to the ramp's maximum
-        voltage, ``ramp_offset_v + ramp_vpp / 2``.
-    :param ts_duration_s: Length in seconds of each constant-bias try and of the free-running
-        ramp stream, excluding the discarded start-up window.
-    :param freq_span: Span of the locating sweep in hertz.
-    :param sweep_df: Frequency step of the locating sweep in hertz.
-    :param sweep_num_averages: Averages per point in the locating sweep.
-    :param discard_start_ms: Leading milliseconds of start-up junk each time stream drops from
+    :param num_periods: Number of whole ramp periods the acquisition spans and averages over.
+    :param discard_start_ms: Leading milliseconds of start-up junk the time stream drops from
         its in-memory arrays. Passed through to
-        :class:`~daq.measurements.timestream.TimeStream` and accounted for in the QC trace's
-        sample count.
-    :param trigger_states: Which Presto digital output ports gate the QC-trace step, as
-        presto's per-port states (``[1]`` for port 1, ``[0, 1]`` for port 2, ``True`` as
-        shorthand for ``[1]``). ``None`` (the default) reads the port off the bias generator
-        handed to :meth:`run` -- on *every* run, so rewiring the generator and running again
-        gates the new port. Validated in ``__init__`` when given explicitly, so a bad routing
-        raises before any hardware is touched; an explicit routing that leaves the
-        generator's own port unasserted warns, since the ramp would then never be gated.
+        :class:`~daq.measurements.timestream.TimeStream` and accounted for in the sample count.
+    :param trigger_states: Which Presto digital output ports gate the acquisition, as presto's
+        per-port states (``[1]`` for port 1, ``[0, 1]`` for port 2, ``True`` as shorthand for
+        ``[1]``). ``None`` (the default) reads the port off the bias generator handed to
+        :meth:`run` -- on *every* run, so rewiring the generator and running again gates the new
+        port. Validated in ``__init__`` when given explicitly, so a bad routing raises before
+        any hardware is touched; an explicit routing that leaves the generator's own port
+        unasserted warns, since the ramp would then never be gated.
     :param dither: Whether to dither the Presto output.
-    :param seed: Seed for the random bias draw. The drawn voltages are saved either way, so
-        this only matters for reproducing the draw itself.
     :param device: Device name, required for database logging.
     :param filter: Filter / amplifier chain description, for database logging.
-    :param notes: Free-text note. Also prefixed onto each sub-measurement's own note.
+    :param notes: Free-text note. Also prefixed onto the time stream's own note.
     :raises ValueError: If any parameter is out of range.
 
     """
 
     def __init__(
         self,
-        freq_center: float,
+        readout_freq: float,
         amp: float,
         output_port: int,
         input_port: int,
@@ -132,32 +107,26 @@ class QCTrace(Base):
         ramp_symmetry_pct: float = 100.0,
         sampling_frequency: float = 5e4,
         num_periods: int = 200,
-        n_bias_try: int = 20,
-        bias_voltages: Optional[FloatAny] = None,
-        v_min: Optional[float] = None,
-        v_max: Optional[float] = None,
-        ts_duration_s: float = 5.0,
-        freq_span: float = 0.7e6,
-        sweep_df: float = 5e3,
-        sweep_num_averages: int = 50,
         discard_start_ms: float = 25.0,
+        trigger_states: Optional[TriggerAny] = None,
         dither: bool = True,
-        seed: Optional[int] = None,
         device: Optional[str] = None,
         filter: Optional[str] = None,
         notes: Optional[str] = None,
-        # Appended rather than grouped with the acquisition parameters, so every existing
-        # positional argument keeps its index.
-        trigger_states: Optional[TriggerAny] = None,
     ) -> None:
-        if not 0.0 < amp < 1.0:
-            raise ValueError(f"amp must be between 0 and 1 (DAC full scale), got {amp}")
-        if freq_span <= 0:
-            raise ValueError(f"freq_span must be positive, got {freq_span}")
-        if sweep_df <= 0:
-            raise ValueError(f"sweep_df must be positive, got {sweep_df}")
-        if sweep_num_averages < 1:
-            raise ValueError(f"sweep_num_averages must be at least 1, got {sweep_num_averages}")
+        self._init_readout(
+            readout_freq=readout_freq,
+            amp=amp,
+            output_port=output_port,
+            input_port=input_port,
+            sampling_frequency=sampling_frequency,
+            discard_start_ms=discard_start_ms,
+            dither=dither,
+            device=device,
+            filter=filter,
+            notes=notes,
+        )
+
         if ramp_vpp <= 0:
             raise ValueError(f"ramp_vpp must be positive, got {ramp_vpp}")
         if ramp_freq_hz <= 0:
@@ -166,40 +135,24 @@ class QCTrace(Base):
             raise ValueError(
                 f"ramp_symmetry_pct must be between 0 and 100, got {ramp_symmetry_pct}"
             )
-        if sampling_frequency <= 0:
-            raise ValueError(f"sampling_frequency must be positive, got {sampling_frequency}")
         if num_periods < 1:
             raise ValueError(f"num_periods must be at least 1, got {num_periods}")
-        if ts_duration_s <= 0:
-            raise ValueError(f"ts_duration_s must be positive, got {ts_duration_s}")
-        if sampling_frequency < ramp_freq_hz:
+        if self.sampling_frequency < ramp_freq_hz:
             raise ValueError(
                 f"sampling_frequency={sampling_frequency} Hz gives fewer than one sample per "
                 f"{ramp_freq_hz} Hz ramp period; raise the sample rate or slow the ramp."
             )
 
-        self.freq_center = freq_center
-        self.freq_span = freq_span
-        self.sweep_df = sweep_df
-        self.sweep_num_averages = sweep_num_averages
-        self.amp = amp
-        self.output_port = output_port
-        self.input_port = input_port
-        self.dither = dither
-
         self.ramp_vpp = ramp_vpp
         self.ramp_freq_hz = ramp_freq_hz
         self.ramp_offset_v = ramp_vpp / 2.0 if ramp_offset_v is None else ramp_offset_v
         self.ramp_symmetry_pct = ramp_symmetry_pct
-
-        self.sampling_frequency = sampling_frequency
         self.num_periods = num_periods
-        self.ts_duration_s = ts_duration_s
-        self.discard_start_ms = float(discard_start_ms)
+        self._warn_if_period_not_integral()
 
-        # Which digital output ports gate step 2. An explicit routing is resolved here, so a
-        # bad one raises before the hardware is touched; None defers to run(), where the
-        # generator that knows its own wiring is in hand.
+        # Which digital output ports gate the acquisition. An explicit routing is resolved
+        # here, so a bad one raises before the hardware is touched; None defers to run(), where
+        # the generator that knows its own wiring is in hand.
         #
         # The caller's choice is kept privately as well as on the record, because run() writes
         # the *resolved* states onto `trigger_states` for saving. Without the private copy, a
@@ -211,75 +164,26 @@ class QCTrace(Base):
         )
         self.trigger_states = self._trigger_states_arg
 
-        # The random draw defaults to the span the ramp itself covers, so the hunt looks for
-        # the operating point inside the range the QC trace swept through.
-        self.v_min = self.ramp_offset_v - ramp_vpp / 2.0 if v_min is None else v_min
-        self.v_max = self.ramp_offset_v + ramp_vpp / 2.0 if v_max is None else v_max
-        if self.v_max < self.v_min:
-            raise ValueError(f"v_max={self.v_max} is below v_min={self.v_min}")
-
-        # Draw here rather than in run(), so the measurement is fully specified -- and its
-        # saved record exactly reproducible -- before any hardware is touched.
-        self._seed = seed
-        if bias_voltages is None:
-            if n_bias_try < 1:
-                raise ValueError(f"n_bias_try must be at least 1, got {n_bias_try}")
-            rng = np.random.default_rng(seed)
-            self.bias_voltages = rng.uniform(self.v_min, self.v_max, n_bias_try)
-        else:
-            self.bias_voltages = np.atleast_1d(np.asarray(bias_voltages, dtype=np.float64))
-            if self.bias_voltages.size < 1:
-                raise ValueError("bias_voltages must hold at least one voltage")
-        self.n_bias_try = int(self.bias_voltages.size)
-
-        self.device = device
-        self.filter = filter
-        self.notes = notes
-
         # Results - replaced by run()
-        self.fr = None
-        """Fitted resonant frequency in hertz, read out by every time stream."""
-        self.fr_err = None
-        """Fit uncertainty on :attr:`fr` in hertz."""
-        self.fit_results = None
-        """``resonator_tools`` fit dict from the locating sweep (not written to HDF5)."""
         self.time_ms = None
         """Time axis of one ramp period in milliseconds."""
         self.avg_iq = None
         """Block-averaged QC trace, shape ``(2, n_samples)``; row 0 is I, row 1 is Q."""
-        self.parity_contrast = None
-        """``std(|signal|)`` for each entry of :attr:`bias_voltages`."""
-        self.best_bias = None
-        """Bias voltage with the largest parity contrast."""
-        self.best_contrast = None
-        """The largest parity contrast found."""
-        self.sweep_file = None
-        """Path of the locating sweep's HDF5 file."""
-        self.qc_file = None
-        """Path of the gated-ramp QC-trace time stream's HDF5 file."""
-        self.best_bias_file = None
-        """Path of the winning constant-bias time stream's HDF5 file."""
-        self.ramp_file = None
-        """Path of the free-running-ramp time stream's HDF5 file."""
+        self.num_periods_folded = None
+        """Blocks :meth:`fold` actually averaged -- the ``N`` in the ``sqrt(N)`` noise gain.
 
-        # Constituent measurement objects, kept off the saved record (Base skips
-        # underscore-prefixed attributes) and exposed through read-only properties.
-        self._sweep: Optional[Sweep] = None
+        Normally :attr:`num_periods`, but lower whenever the record does not divide evenly
+        into whole periods. Recorded separately because the requested count over-states the
+        averaging in that case, and the difference is not recoverable from the saved file.
+        """
+        self.qc_file = None
+        """Path of the gated-ramp time stream's HDF5 file."""
+
+        # The acquisition itself, kept off the saved record (Base skips underscore-prefixed
+        # attributes) and exposed through a read-only property.
         self._qc_stream: Optional[TimeStream] = None
-        self._bias_streams: List[TimeStream] = []
-        self._ramp_stream: Optional[TimeStream] = None
 
     # ------------------------------------------------------------------ constituent objects
-
-    @property
-    def sweep(self) -> Optional[Sweep]:
-        """The locating :class:`~daq.measurements.sweep.Sweep`, or ``None`` before
-        :meth:`run`.
-
-        :returns: The sweep measurement.
-
-        """
-        return self._sweep
 
     @property
     def qc_stream(self) -> Optional[TimeStream]:
@@ -290,49 +194,43 @@ class QCTrace(Base):
         """
         return self._qc_stream
 
-    @property
-    def bias_streams(self) -> List[TimeStream]:
-        """The constant-bias time streams, in :attr:`bias_voltages` order.
-
-        :returns: One time stream per bias try; empty before :meth:`run`.
-
-        """
-        return self._bias_streams
-
-    @property
-    def best_bias_stream(self) -> Optional[TimeStream]:
-        """The constant-bias time stream with the largest parity contrast.
-
-        This is the stream to feed to the parity analysis --
-        :func:`~daq.analysis.noise.compute_psd` and
-        :func:`~daq.analysis.noise.fit_parity_psd`.
-
-        :returns: The winning time stream, or ``None`` before :meth:`run`.
-
-        """
-        if not self._bias_streams or self.parity_contrast is None:
-            return None
-        return self._bias_streams[int(np.nanargmax(self.parity_contrast))]
-
-    @property
-    def ramp_stream(self) -> Optional[TimeStream]:
-        """The time stream taken under a free-running ramp.
-
-        :returns: The time stream, or ``None`` before :meth:`run`.
-
-        """
-        return self._ramp_stream
-
     # ------------------------------------------------------------------ helpers
 
-    def _notes(self, step: str) -> str:
-        """Compose a sub-measurement note, keeping this measurement's own note as a prefix.
+    def _warn_if_period_not_integral(self) -> None:
+        """Warn when one ramp period is not a whole number of samples.
 
-        :param step: Description of the step the sub-measurement belongs to.
-        :returns: The note to hand to the sub-measurement.
+        Folding cuts the record into blocks of ``round(period_s * fs)`` samples -- an integer.
+        When the true period is fractional, every block starts a fraction of a sample later
+        than the last and the error accumulates over :attr:`num_periods`, so a feature sharp
+        on the scale of the drift is averaged away rather than reinforced. At 50 kHz with a
+        300 Hz ramp (166.67 samples per period) a sharp feature loses about 90 % of its
+        contrast over 200 periods, and nothing about the resulting trace says so.
+
+        Warned rather than refused: a slow, smooth QC trace tolerates the drift, and the user
+        may know that. The cure is to pick a ``sampling_frequency`` that is a whole multiple of
+        ``ramp_freq_hz``.
+
+        This uses the *requested* sample rate, which is the one the caller can act on;
+        ``TimeStream.run`` tunes it slightly, so the realised drift differs a little. That
+        tuning is small and cannot rescue a ratio that is far from integral.
 
         """
-        return step if self.notes is None else f"{self.notes} -- {step}"
+        samples_per_period = self.sampling_frequency / self.ramp_freq_hz
+        drift = abs(samples_per_period - round(samples_per_period))
+        if drift <= 1e-6 * samples_per_period:
+            return
+        warnings.warn(
+            f"sampling_frequency={self.sampling_frequency:g} Hz is not a whole multiple of "
+            f"ramp_freq_hz={self.ramp_freq_hz:g} Hz: one ramp period is "
+            f"{samples_per_period:.4f} samples, so each folded block starts {drift:.4f} "
+            f"samples later than the last and drifts {drift * self.num_periods:.1f} samples "
+            f"({100 * drift * self.num_periods / samples_per_period:.0f} % of a period) over "
+            f"{self.num_periods} periods. Features sharper than that are averaged away, and "
+            "the folded trace gives no sign of it. Pick a sampling_frequency that divides "
+            f"evenly by the ramp rate (e.g. {round(samples_per_period) * self.ramp_freq_hz:g} "
+            "Hz).",
+            stacklevel=3,
+        )
 
     @staticmethod
     def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
@@ -340,8 +238,8 @@ class QCTrace(Base):
 
         A gated ramp with no port asserted is exactly the silent failure this measurement
         cannot afford: the generator holds its burst start level, the acquisition succeeds,
-        and step 2 records a static bias that looks like a dead device. ``False`` and
-        all-zero states are therefore rejected rather than run.
+        and the trace is flat because the gate never moved. ``False`` and all-zero states are
+        therefore rejected rather than run.
 
         :param trigger_states: Anything :func:`~daq.triggers.resolve_trigger_states` accepts.
         :raises ValueError: If the states are invalid, or gate no port at all.
@@ -353,14 +251,15 @@ class QCTrace(Base):
             raise ValueError(
                 f"trigger_states={trigger_states!r} gates no digital output port, so the "
                 "QC-trace ramp would never run: the generator would hold its burst start "
-                "level and step 2 would record a static bias instead of a swept one. Pass "
-                "the port that gates the bias generator (True or [1] for port 1), or leave "
-                "trigger_states unset to take it from the generator's own trigger_port."
+                "level and the acquisition would record a static bias instead of a swept "
+                "one. Pass the port that gates the bias generator (True or [1] for port 1), "
+                "or leave trigger_states unset to take it from the generator's own "
+                "trigger_port."
             )
         return states
 
     def _resolve_run_trigger_states(self, bias: Agilent33220A) -> npt.NDArray[np.int64]:
-        """Decide which ports gate the QC-trace step of this run.
+        """Decide which ports gate this run.
 
         Reads the caller's own argument, never the states a previous run resolved, so the
         default ("ask the generator") holds on every run of an object -- including one
@@ -399,70 +298,11 @@ class QCTrace(Base):
         warnings.warn(
             f"The QC trace gates {describe_trigger_states(states)}, but the bias generator "
             f"reports trigger_port={port}, which is not among them. Its gated ramp will wait "
-            "on a port nothing asserts and step 2 will record a static bias. Correct the "
-            "generator's wiring (bias.trigger_port, or DAQ_FGEN_TRIGGER_PORT) or include "
+            "on a port nothing asserts and the acquisition will record a static bias. Correct "
+            "the generator's wiring (bias.trigger_port, or DAQ_FGEN_TRIGGER_PORT) or include "
             f"port {port} in trigger_states.",
             stacklevel=3,
         )
-
-    def _make_timestream(
-        self,
-        pixel_counts: int,
-        *,
-        external_trigger: TriggerAny,
-        notes: str,
-    ) -> TimeStream:
-        """Build a single-tone time stream on resonance, shared by every acquisition step.
-
-        :param pixel_counts: Number of samples to acquire, including the discarded start.
-        :param external_trigger: Which Presto digital output ports assert a trigger, gating
-            the ramp when the generator is in gated-burst mode. ``False`` for the ungated
-            steps; for the QC trace this comes from :meth:`_resolve_run_trigger_states`,
-            i.e. from the generator's own ``trigger_port`` unless *trigger_states* overrode
-            it.
-        :param notes: Step description for the sub-measurement's note.
-        :returns: The configured time stream.
-
-        """
-        return TimeStream(
-            lo_freq=self.fr,
-            if_freqs=[0.0],
-            df=self.sampling_frequency,
-            pixel_counts=pixel_counts,
-            amp=self.amp,
-            output_port=self.output_port,
-            input_port=self.input_port,
-            dither=self.dither,
-            device=self.device,
-            filter=self.filter,
-            notes=self._notes(notes),
-            external_trigger=external_trigger,
-            discard_start_ms=self.discard_start_ms,
-        )
-
-    def _stream_samples(self) -> int:
-        """Return the sample count of a fixed-duration stream, including the discarded start.
-
-        :returns: Number of samples for the constant-bias tries and the ramp stream.
-
-        """
-        n_discard = int(round(self.discard_start_ms * 1e-3 * self.sampling_frequency))
-        return n_discard + int(round(self.ts_duration_s * self.sampling_frequency))
-
-    @staticmethod
-    def _parity_contrast(stream: TimeStream) -> float:
-        """Return the parity contrast of a time stream.
-
-        Charge-parity switching moves the resonator between two frequencies, so a
-        two-level-telegraph response shows up as a spread in the readout magnitude. The
-        standard deviation of ``|signal|`` is the cheap scalar proxy used to rank candidate
-        gate biases.
-
-        :param stream: A run single-tone time stream.
-        :returns: ``std(|signal|)`` over the trimmed record.
-
-        """
-        return float(np.std(np.abs(np.asarray(stream.signal)[:, 0])))
 
     # ------------------------------------------------------------------ acquisition
 
@@ -475,13 +315,12 @@ class QCTrace(Base):
         ext_ref_clk: bool = False,
         save_filename: Optional[str] = None,
     ) -> str:
-        """Run the four-step QC-trace sequence and save the derived record.
+        """Acquire the gated-ramp time stream, fold it, and save the derived record.
 
-        The gate-bias generator's output is forced off before the locating sweep and again
-        when the sequence finishes -- including on exception -- so no bias is left on the
-        device. When *bias* is omitted the generator is opened and closed here; when it is
-        passed in the caller keeps ownership of the VISA session and only the output is
-        de-energised.
+        The gate-bias generator's output is forced off when the acquisition finishes --
+        including on exception -- so no bias is left on the device. When *bias* is omitted the
+        generator is opened and closed here; when it is passed in the caller keeps ownership
+        of the VISA session and only the output is de-energised.
 
         Unlike the other measurement classes, this ``run`` takes the *bias generator* as its
         first (and only) positional argument, not ``presto_address`` -- the Presto connection
@@ -494,11 +333,9 @@ class QCTrace(Base):
         :param presto_port: Presto port. Defaults to the presto default.
         :param ext_ref_clk: Whether to use an external reference clock.
         :param save_filename: Explicit path for this measurement's own HDF5 file.
-        :raises ValueError: If the QC-trace step's trigger routing gates no port -- including
-            when *trigger_states* was left unset and *bias* declares no ``trigger_port``.
-            Raised before any acquisition, since an ungated ramp records a static bias.
-        :raises RuntimeError: If the locating sweep does not yield a usable ``fr``; the sweep's
-            own file is still saved, and its path is given in the message.
+        :raises ValueError: If the trigger routing gates no port -- including when
+            *trigger_states* was left unset and *bias* declares no ``trigger_port``. Raised
+            before the acquisition, since an ungated ramp records a static bias.
         :returns: Path of this measurement's HDF5 file.
 
         """
@@ -515,47 +352,16 @@ class QCTrace(Base):
                 # The caller owns the session, but never leave a bias on the gate.
                 stack.callback(setattr, bias, "output", False)
 
-            # Settle the routing before the first acquisition: the generator is open, so its
-            # wiring is knowable, and a bad routing should abort the run rather than surface
-            # as a flat QC trace an hour later.
+            # Settle the routing before the acquisition: the generator is open, so its wiring
+            # is knowable, and a bad routing should abort the run rather than surface as a flat
+            # QC trace afterwards.
             self.trigger_states = self._resolve_run_trigger_states(bias)
             print(
                 "QC trace: gating the ramp on Presto digital output "
                 f"{describe_trigger_states(self.trigger_states)}"
             )
+            print(f"QC trace: reading out at {self.readout_freq / 1e9:.6f} GHz")
 
-            # --- 1. Locate fr, with the gate unbiased ---
-            bias.output = False
-            self._sweep = Sweep(
-                freq_center=self.freq_center,
-                freq_span=self.freq_span,
-                df=self.sweep_df,
-                num_averages=self.sweep_num_averages,
-                amp=self.amp,
-                output_port=self.output_port,
-                input_port=self.input_port,
-                dither=self.dither,
-                device=self.device,
-                filter=self.filter,
-                notes=self._notes("Locate fr for the QC trace"),
-                auto_fit=True,
-            )
-            self.sweep_file = self._sweep.run(**run_kwargs)
-
-            fit = self._sweep.fit_results
-            if not fit or not np.isfinite(fit.get("fr", np.nan)):
-                raise RuntimeError(
-                    "The locating sweep did not yield a usable fr, so the QC trace cannot be "
-                    f"read out. The sweep itself is saved at {self.sweep_file}; inspect it "
-                    "with Sweep.load(...).analyze() and retry with a corrected freq_center "
-                    "or freq_span."
-                )
-            self.fit_results = fit
-            self.fr = float(fit["fr"])
-            self.fr_err = float(fit.get("fr_err", np.nan))
-            print(f"QC trace: reading out at fr = {self.fr / 1e9:.6f} GHz")
-
-            # --- 2. QC trace: gated ramp, externally triggered ---
             bias.sawtooth(
                 vpp=self.ramp_vpp,
                 freq_hz=self.ramp_freq_hz,
@@ -575,70 +381,89 @@ class QCTrace(Base):
             )
             self._qc_stream.attach(bias=bias)
             self.qc_file = self._qc_stream.run(**run_kwargs)
-            # Fold on the ramp's own period at the tuned sample rate rather than dividing the
-            # record by num_periods: tuning can shift df slightly, and a period window off by
-            # a sample would smear the average across blocks instead of dropping a leftover.
-            self.time_ms, self.avg_iq = fold_timestream(
-                self._qc_stream,
-                self._qc_stream.df,
-                period_s=1.0 / self.ramp_freq_hz,
-            )
-
-            # --- 3. Bias hunt: keep the constant bias with the largest parity contrast ---
-            ts_samples = self._stream_samples()
-            contrasts = np.full(self.n_bias_try, np.nan)
-            best_so_far = -np.inf
-            self._bias_streams = []
-            for ii, voltage in enumerate(self.bias_voltages):
-                bias.constant(float(voltage))
-                stream = self._make_timestream(
-                    ts_samples,
-                    external_trigger=False,
-                    notes=f"Constant bias {voltage:.4f} V (try {ii + 1}/{self.n_bias_try})",
-                )
-                stream.attach(bias=bias)
-                path = stream.run(**run_kwargs)
-
-                contrasts[ii] = self._parity_contrast(stream)
-                self._bias_streams.append(stream)
-                print(
-                    f"Bias try {ii + 1}/{self.n_bias_try}: {voltage:.4f} V, "
-                    f"std(|signal|) = {contrasts[ii]:.4e}"
-                )
-                if contrasts[ii] > best_so_far:
-                    best_so_far = contrasts[ii]
-                    self.best_bias_file = path
-
-            self.parity_contrast = contrasts
-            best = int(np.nanargmax(contrasts))
-            self.best_bias = float(self.bias_voltages[best])
-            self.best_contrast = float(contrasts[best])
-            print(
-                f"Max parity contrast at bias {self.best_bias:.4f} V, "
-                f"std(|signal|) = {self.best_contrast:.4e}"
-            )
-
-            # --- 4. Free-running ramp, same length as the constant-bias tries ---
-            # Free-running, not gated: the Presto trigger is deasserted for this acquisition
-            # (external_trigger=False), so a gated ramp would sit at its burst start level and
-            # the stream would record a static bias instead of a swept one.
-            bias.sawtooth(
-                vpp=self.ramp_vpp,
-                freq_hz=self.ramp_freq_hz,
-                offset_v=self.ramp_offset_v,
-                symmetry_pct=self.ramp_symmetry_pct,
-                gated=False,
-            )
-            self._ramp_stream = self._make_timestream(
-                ts_samples,
-                external_trigger=False,
-                notes="Free-running sawtooth bias, matching the constant-bias tries",
-            )
-            self._ramp_stream.attach(bias=bias)
-            self.ramp_file = self._ramp_stream.run(**run_kwargs)
+            self.fold()
 
         # Saved after the bias is de-energised, so a failure here cannot leave it applied.
         return self.save(save_filename=save_filename)
+
+    def fold(
+        self,
+        stream: Optional[TimeStream] = None,
+        *,
+        period_s: Optional[float] = None,
+        n_periods: Optional[int] = None,
+        tone: int = 0,
+    ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+        """Block-average the acquisition into a single ramp period.
+
+        Thin wrapper over :func:`~daq.analysis.folding.fold_timestream` that knows this
+        measurement's ramp period and sample rate, so the usual call is a bare ``qct.fold()``.
+        :meth:`run` calls it once; call it again to re-fold on a different period (say, to
+        check the ramp really ran at the frequency it was told to) or on a stream reloaded
+        from :attr:`qc_file`. Either way the result is stored on :attr:`time_ms` and
+        :attr:`avg_iq`, replacing what was there.
+
+        By default the fold uses the ramp's own period, ``1 / ramp_freq_hz``, at the *tuned*
+        sample rate -- not the record divided by :attr:`num_periods`. Tuning can shift ``df``
+        slightly, and a period window off by a sample smears the average across blocks instead
+        of dropping a leftover.
+
+        The number of blocks actually averaged lands on :attr:`num_periods_folded`, which is
+        what the ``sqrt(N)`` noise reduction is over. It is normally :attr:`num_periods` but
+        falls short whenever the record does not divide evenly, so the saved record says what
+        the average was really taken over rather than what was asked for.
+
+        :param stream: Time stream to fold. Must expose ``df`` (the tuned sample rate) and
+            ``signal`` -- i.e. a :class:`~daq.measurements.timestream.TimeStream`. Defaults to
+            :attr:`qc_stream`, this measurement's own acquisition. To fold a bare array, call
+            :func:`~daq.analysis.folding.fold_timestream` directly with an explicit ``fs``.
+        :param period_s: Fold on this period in seconds instead of the ramp's.
+        :param n_periods: Fold on the record divided into this many periods instead. Mutually
+            exclusive with *period_s*.
+        :param tone: Which tone to fold; the acquisition is single-tone, so ``0``.
+        :raises RuntimeError: If no stream is available -- :meth:`load` restores the folded
+            trace but not the raw record, so pass *stream* after loading.
+        :raises TypeError: If *stream* carries no ``df``.
+        :raises ValueError: If both *period_s* and *n_periods* are given, or the record is
+            too short to hold one period.
+        :returns: ``(time_ms, avg_iq)``, as :func:`~daq.analysis.folding.fold_timestream`.
+
+        """
+        if stream is None:
+            stream = self._qc_stream
+        if stream is None:
+            raise RuntimeError(
+                "No time stream to fold. Run the measurement first, or pass a stream "
+                "reloaded from qc_file: qct.fold(TimeStream.load(qct.qc_file))."
+            )
+        # No fallback to the *requested* sampling_frequency. The whole point of folding on
+        # `stream.df` is that the hardware tunes the rate away from what was asked for, so
+        # quietly substituting the untuned value for an input that does not carry one would
+        # reintroduce exactly the smearing this default exists to avoid.
+        fs = getattr(stream, "df", None)
+        if fs is None:
+            raise TypeError(
+                f"fold() needs a time stream carrying its tuned sample rate as .df, got "
+                f"{type(stream).__name__}. For a bare array of samples call "
+                "daq.analysis.fold_timestream(array, fs, period_s=...) directly, with the "
+                "rate the data was actually taken at."
+            )
+        if period_s is None and n_periods is None:
+            period_s = 1.0 / self.ramp_freq_hz
+
+        self.time_ms, self.avg_iq = fold_timestream(
+            stream,
+            fs,
+            period_s=period_s,
+            n_periods=n_periods,
+            tone=tone,
+        )
+        # fold_timestream computes the block count and discards it. Recover it from the window
+        # it produced, so the record carries the averaging actually achieved: the requested
+        # num_periods over-states it whenever the record does not divide evenly.
+        n_samples = np.asarray(stream.signal).shape[0]
+        self.num_periods_folded = int(n_samples // self.avg_iq.shape[1])
+        return self.time_ms, self.avg_iq
 
     def save(self, save_filename: Optional[str] = None) -> str:
         """Write this measurement's HDF5 file and MongoDB record.
@@ -653,12 +478,10 @@ class QCTrace(Base):
     def load(cls, load_filename: str) -> "QCTrace":
         """Rebuild a measurement from its saved HDF5 file.
 
-        The derived products -- the fitted ``fr``, the folded QC trace and the
-        contrast-versus-bias curve -- are restored, along with the paths of the constituent
-        acquisitions. The constituent objects themselves are not: load them from those paths
-        with :meth:`Sweep.load <daq.measurements.sweep.Sweep.load>` and
-        :meth:`TimeStream.load <daq.measurements.timestream.TimeStream.load>` when you need
-        the raw records.
+        The folded trace is restored, along with the path of the raw acquisition. The time
+        stream itself is not: load it from :attr:`qc_file` with
+        :meth:`TimeStream.load <daq.measurements.timestream.TimeStream.load>` when you need the
+        raw record (or want to :meth:`fold` it again).
 
         :param load_filename: Path of the HDF5 file to load.
         :returns: The reconstructed measurement.
@@ -668,7 +491,7 @@ class QCTrace(Base):
             attrs = h5f.attrs
 
             self = cls(
-                freq_center=float(attrs["freq_center"]),  # type: ignore
+                readout_freq=float(attrs["readout_freq"]),  # type: ignore
                 amp=float(attrs["amp"]),  # type: ignore
                 output_port=int(attrs["output_port"]),  # type: ignore
                 input_port=int(attrs["input_port"]),  # type: ignore
@@ -678,13 +501,6 @@ class QCTrace(Base):
                 ramp_symmetry_pct=float(attrs["ramp_symmetry_pct"]),  # type: ignore
                 sampling_frequency=float(attrs["sampling_frequency"]),  # type: ignore
                 num_periods=int(attrs["num_periods"]),  # type: ignore
-                bias_voltages=h5f["bias_voltages"][()],  # type: ignore
-                v_min=float(attrs["v_min"]),  # type: ignore
-                v_max=float(attrs["v_max"]),  # type: ignore
-                ts_duration_s=float(attrs["ts_duration_s"]),  # type: ignore
-                freq_span=float(attrs["freq_span"]),  # type: ignore
-                sweep_df=float(attrs["sweep_df"]),  # type: ignore
-                sweep_num_averages=int(attrs["sweep_num_averages"]),  # type: ignore
                 discard_start_ms=float(attrs["discard_start_ms"]),  # type: ignore
                 dither=bool(attrs["dither"]),  # type: ignore
                 device=attrs.get("device", None),
@@ -694,20 +510,14 @@ class QCTrace(Base):
 
             # The stored routing describes the run that produced this file, so it is restored
             # onto the record but *not* as a caller-supplied override: re-running a loaded
-            # measurement reads the generator in front of you now. Files written before the
-            # routing was configurable carry no dataset; those runs gated port 1, which is
-            # what their hardcoded external_trigger=True meant.
-            self.trigger_states = resolve_trigger_states(
-                h5f["trigger_states"][()] if "trigger_states" in h5f else True  # type: ignore
-            )
+            # measurement reads the generator in front of you now.
+            if "trigger_states" in h5f:
+                self.trigger_states = resolve_trigger_states(h5f["trigger_states"][()])  # type: ignore
 
-            self.fr = float(attrs["fr"]) if "fr" in attrs else None
-            self.fr_err = float(attrs["fr_err"]) if "fr_err" in attrs else None
-            self.best_bias = float(attrs["best_bias"]) if "best_bias" in attrs else None
-            self.best_contrast = float(attrs["best_contrast"]) if "best_contrast" in attrs else None
-            for name in ("sweep_file", "qc_file", "best_bias_file", "ramp_file"):
-                setattr(self, name, attrs.get(name, None))
-            for name in ("time_ms", "avg_iq", "parity_contrast"):
+            self.qc_file = attrs.get("qc_file", None)
+            if "num_periods_folded" in attrs:
+                self.num_periods_folded = int(attrs["num_periods_folded"])  # type: ignore
+            for name in ("time_ms", "avg_iq"):
                 if name in h5f:
                     setattr(self, name, h5f[name][()])  # type: ignore
 
@@ -716,15 +526,11 @@ class QCTrace(Base):
     # ------------------------------------------------------------------ analysis
 
     def analyze(self, raw: bool = True, title: Optional[str] = None):
-        """Plot the bias hunt and the block-averaged QC trace.
+        """Plot the block-averaged QC trace over one ramp period.
 
-        The top panel shows the parity contrast against gate bias, with the winning bias
-        marked. The lower two show the folded QC trace's I and Q over one ramp period, drawn
-        by :func:`~daq.analysis.plotting.plot_qc_trace`.
-
-        :param raw: Overlay one un-averaged period of the gated-ramp stream on the folded
-            trace, to show what the averaging bought. Only possible right after :meth:`run`,
-            since :meth:`load` does not restore the raw stream.
+        :param raw: Overlay one un-averaged period of the acquisition on the folded trace, to
+            show what the averaging bought. Only possible right after :meth:`run`, since
+            :meth:`load` does not restore the raw stream.
         :param title: Figure title. Defaults to naming the device and the readout frequency.
         :raises RuntimeError: If the measurement has not been run or loaded.
         :returns: The created figure.
@@ -732,45 +538,18 @@ class QCTrace(Base):
         """
         if self.avg_iq is None or self.time_ms is None:
             raise RuntimeError("No QC trace available. Run or load the measurement first.")
-        if self.parity_contrast is None:
-            raise RuntimeError("No bias hunt available. Run or load the measurement first.")
 
         import matplotlib.pyplot as plt
 
         from ..analysis.plotting import plot_qc_trace
 
-        fig = plt.figure(figsize=(8, 9), tight_layout=True)
-        ax_bias = fig.add_subplot(3, 1, 1)
-        ax_i = fig.add_subplot(3, 1, 2)
-        ax_q = fig.add_subplot(3, 1, 3, sharex=ax_i)
-
-        # Sort by voltage so a random draw still reads as a curve rather than a zigzag.
-        order = np.argsort(self.bias_voltages)
-        ax_bias.plot(
-            np.asarray(self.bias_voltages)[order],
-            np.asarray(self.parity_contrast)[order],
-            ".-",
-            color="tab:green",
-        )
-        if self.best_bias is not None:
-            ax_bias.axvline(
-                self.best_bias,
-                color="tab:red",
-                ls="--",
-                lw=1.0,
-                label=f"best bias {self.best_bias:.4f} V",
-            )
-            ax_bias.legend(loc="best", fontsize=8)
-        ax_bias.set_xlabel("Gate bias [V]")
-        ax_bias.set_ylabel(r"Parity contrast std($|S|$) [FS]")
-        ax_bias.grid(True, alpha=0.3)
+        fig, (ax_i, ax_q) = plt.subplots(2, 1, figsize=(8, 6), sharex=True, tight_layout=True)
 
         if title is None:
             parts = ["QC trace (block-averaged)"]
             if self.device is not None:
                 parts.append(str(self.device))
-            if self.fr is not None:
-                parts.append(f"{self.fr / 1e9:.6f} GHz")
+            parts.append(f"{self.readout_freq / 1e9:.6f} GHz")
             title = " -- ".join(parts)
 
         plot_qc_trace(
