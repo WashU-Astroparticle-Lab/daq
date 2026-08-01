@@ -14,6 +14,12 @@ contrast. Its failure modes are the mirror image of ``QCTrace``'s:
   invented voltage on somebody's device.
 - the contrast curve, the winner and the constituent file paths survive the HDF5 round trip.
 
+The averaged spectrum and its parity fit are checked against a *known* answer rather than
+against themselves: the stand-in stream is a genuine random-telegraph process switching at
+``GAMMA_P``, built from exponential dwell times rather than hand-shaped to match the model, so
+``fit_psd`` has to recover a number it was never told. The averaging, the mean subtraction, the
+use of the tuned rate and the invalidation of a stale fit are each pinned separately.
+
 Requires ``presto`` to be importable (``BiasHunt`` imports it transitively); no hardware and no
 network. The database calls are stubbed so the round-trip check does not sit through MongoDB's
 server-selection timeout. Run from the repository root::
@@ -31,11 +37,16 @@ except ImportError:
     print("SKIP: presto is not installed; BiasHunt cannot be imported without it")
     sys.exit(0)
 
-import numpy as np
+import matplotlib
 
-import daq._base as base_mod
-import daq.measurements._gate_bias as gate_bias_mod
-from daq.measurements.bias_hunt import BiasHunt
+matplotlib.use("Agg")  # the analyze() checks below must not need a display
+import matplotlib.pyplot  # noqa: E402
+import numpy as np  # noqa: E402
+
+import daq._base as base_mod  # noqa: E402
+import daq.measurements._gate_bias as gate_bias_mod  # noqa: E402
+from daq.analysis.noise import compute_psd  # noqa: E402
+from daq.measurements.bias_hunt import BiasHunt  # noqa: E402
 
 base_mod.get_next_number = lambda: "00000001"
 base_mod.insert_measurement = lambda document: "offline"
@@ -51,13 +62,18 @@ def check(label, condition, detail=""):
 # ---------------------------------------------------------------- stand-ins
 
 FS = 5e4
+#: Parity-switching rate of the synthetic response, in hertz. The spectrum checks below fit
+#: for this number, so the fit is pinned against a known answer rather than against itself.
+GAMMA_P = 120.0
 
 
 class FakeTimeStream:
-    """Records what each try asked for, with a contrast set by the bias it was taken at.
+    """A genuine random-telegraph response whose contrast depends on the bias it sits at.
 
-    The magnitude spread peaks at ``PEAK_V``, so the hunt has an unambiguous winner and the
-    ranking can be checked against a known answer rather than against itself.
+    The signal switches between two magnitudes at :data:`GAMMA_P`, so its PSD really is the
+    Lorentzian the parity model describes, and ``std(|signal|)`` really does measure the
+    switching amplitude. The amplitude peaks at ``PEAK_V``, giving the hunt an unambiguous
+    winner. Both the ranking and the spectral fit are therefore checked against known answers.
     """
 
     instances = []
@@ -71,7 +87,12 @@ class FakeTimeStream:
         voltage = float(kwargs["notes"].split("Constant bias ")[1].split(" V")[0])
         spread = np.exp(-(((voltage - self.PEAK_V) / 0.3) ** 2))
         rng = np.random.default_rng(abs(hash(kwargs["notes"])) % 2**32)
-        self.signal = ((1.0 + spread * rng.standard_normal(n)) + 0j).reshape(n, 1)
+        # Switch with probability Gamma/fs per sample -> exponential dwell times, i.e. a real
+        # telegraph process rather than a spectrum hand-built to match the model.
+        telegraph = np.where(np.cumsum(rng.random(n) < GAMMA_P / self.df) % 2 == 0, 1.0, -1.0)
+        level = 1.0 + 0.02 * spread * telegraph
+        noise = 0.002 * rng.standard_normal(n)  # readout noise -> the white floor
+        self.signal = ((level + noise) + 0j).reshape(n, 1)
         FakeTimeStream.instances.append(self)
 
     def attach(self, **instruments):
@@ -113,7 +134,10 @@ def make(**kwargs):
         v_min=0.0,
         v_max=2.0,
         n_bias_try=8,
-        ts_duration_s=0.01,
+        # Long enough that the telegraph switches ~GAMMA_P * ts_duration_s = 120 times, so
+        # std(|signal|) measures the switching amplitude rather than the luck of a record that
+        # happened to contain one transition.
+        ts_duration_s=1.0,
         sampling_frequency=FS,
         discard_start_ms=0.0,
         seed=7,
@@ -283,6 +307,129 @@ check(
     rerun.best_bias_stream is None,
     f"streams={len(rerun.bias_streams)}, previous contrast had {len(first_contrast)}",
 )
+
+# ---------------------------------------------------------------- averaged spectrum
+
+# A record long enough to resolve the corner: 2 s at 50 kHz gives 0.5 Hz resolution against a
+# GAMMA_P/pi ~ 38 Hz corner, so there is real spectrum on both sides of it.
+spec = make(ts_duration_s=2.0, n_bias_try=6)
+spec_streams = run_hunt(spec)
+
+check("no spectrum before average_psd()", spec.psd_avg is None and spec.fit_results is None)
+
+f, psd = spec.average_psd()
+n_samples = spec_streams[0].signal.shape[0]
+check(
+    "the frequency axis is the rfft axis of one try", f.shape == (n_samples // 2 + 1,), str(f.shape)
+)
+check("one spectrum per try was averaged", spec.psd_n_averaged == 6, str(spec.psd_n_averaged))
+check("the tuned rate is used, not the requested one", spec.psd_fs == spec_streams[0].df)
+check("the quantity is recorded", spec.psd_quantity == "abs")
+check(
+    "the average really is the mean of the per-try spectra",
+    np.allclose(
+        psd,
+        np.mean(
+            [
+                compute_psd(np.abs(s.signal[:, 0]) - np.abs(s.signal[:, 0]).mean(), s.df)[1]
+                for s in spec_streams
+            ],
+            axis=0,
+        ),
+    ),
+)
+check(
+    "averaging is not just the first try",
+    not np.allclose(
+        psd,
+        compute_psd(
+            np.abs(spec_streams[0].signal[:, 0]) - np.abs(spec_streams[0].signal[:, 0]).mean(),
+            spec_streams[0].df,
+        )[1],
+    ),
+)
+
+# The point of the whole exercise: does the fit return the rate that was put in?
+res = spec.fit_psd()
+check("the fit converges", res["success"], str(res.get("success")))
+check(
+    "the fit recovers the true parity rate",
+    abs(res["gamma_p"] - GAMMA_P) < 5 * res["gamma_p_err"],
+    f"fitted {res['gamma_p']:.1f} +/- {res['gamma_p_err']:.1f} Hz vs true {GAMMA_P} Hz",
+)
+check(
+    "and the corner that follows from it",
+    np.isclose(res["f_corner"], res["gamma_p"] / np.pi, rtol=1e-6),
+    f"{res['f_corner']:.2f} vs {res['gamma_p'] / np.pi:.2f} Hz",
+)
+check(
+    "the model describes the data",
+    res["resid_dex_rms"] < 0.3,
+    f"resid_dex_rms = {res['resid_dex_rms']:.3f} dex",
+)
+check("f_bw is held at the tuned rate", res["f_bw"] == spec.psd_fs)
+
+# Averaging fewer streams must give a noisier answer, not a different one -- and the two must
+# agree, since they are the same process at different statistics.
+single = spec.average_psd([spec.best_bias_stream])[1]
+check("re-averaging invalidates the stale fit", spec.fit_results is None)
+res_one = spec.fit_psd()
+check(
+    "a single try recovers the same rate, less precisely",
+    abs(res_one["gamma_p"] - GAMMA_P) < 5 * res_one["gamma_p_err"]
+    and res_one["gamma_p_err"] > res["gamma_p_err"],
+    f"{res_one['gamma_p']:.1f} +/- {res_one['gamma_p_err']:.1f} vs "
+    f"{res['gamma_p']:.1f} +/- {res['gamma_p_err']:.1f} Hz",
+)
+
+# The spectrum is of the FLUCTUATION: the operating point it sits on is not parity signal,
+# and leaving it in would put the whole DC level into the lowest bins.
+series = BiasHunt._parity_series(spec_streams[0], "abs")
+check(
+    "the mean is removed before the spectrum",
+    abs(series.mean()) < 1e-12 * np.abs(spec_streams[0].signal).mean(),
+    f"residual mean {series.mean():.3e}",
+)
+for quantity in ("real", "imag"):
+    spec.average_psd(quantity=quantity)
+    check(f"quantity={quantity!r} is accepted", spec.psd_quantity == quantity)
+try:
+    spec.average_psd(quantity="magnitude")
+    check("an unknown quantity is rejected", False, "accepted")
+except ValueError:
+    check("an unknown quantity is rejected", True)
+
+# Failure modes that must not silently produce a wrong spectrum.
+try:
+    make().average_psd()
+    check("no streams raises", False, "returned a spectrum")
+except RuntimeError as exc:
+    check("no streams raises", "No time streams" in str(exc))
+
+short = make(ts_duration_s=0.02)
+run_hunt(short)
+try:
+    spec.average_psd(list(spec_streams) + list(short.bias_streams))
+    check("mismatched record lengths raise", False, "averaged anyway")
+except ValueError as exc:
+    check("mismatched record lengths raise", "different numbers of samples" in str(exc))
+
+# ---------------------------------------------------------------- analyze
+
+matplotlib.pyplot.close("all")
+fig = spec.analyze()
+check("analyze() draws contrast and spectrum", len(fig.axes) == 2, f"{len(fig.axes)} axes")
+fig = spec.analyze(psd=False)
+check("analyze(psd=False) draws the contrast alone", len(fig.axes) == 1, f"{len(fig.axes)} axes")
+
+# A loaded measurement has no streams. The contrast curve is still worth seeing, so the
+# spectrum panel is skipped rather than the whole plot raising.
+stripped = make()
+stripped.parity_contrast = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
+stripped.best_bias = float(stripped.bias_voltages[-1])
+fig = stripped.analyze()
+check("analyze() on a stream-less measurement degrades to one panel", len(fig.axes) == 1)
+matplotlib.pyplot.close("all")
 
 # ---------------------------------------------------------------- persistence
 
