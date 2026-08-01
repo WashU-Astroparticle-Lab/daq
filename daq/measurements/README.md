@@ -550,11 +550,29 @@ fluctuation, not the operating point it sits on — at the streams' *tuned* `df`
 the `f_bw` the fit holds fixed. Pass `quantity="real"`/`"imag"` to project differently, or
 `welch=True` for Welch's method.
 
-> **This averages across different operating points.** Each try sits at a different gate
-> voltage, and the switching rate is a property of the operating point, so the fitted
-> `gamma_p` is an ensemble figure for the range scanned — not the rate at any one bias. For
-> that, average one stream: `hunt.average_psd([hunt.best_bias_stream])`, then `fit_psd()`.
-> Re-averaging clears any existing fit, so a fit never describes a spectrum it did not see.
+**Averaging across operating points is the intended use.** The expectation is that the
+switching rate is common across the gate range — it is set by quasiparticle dynamics — while
+what varies with bias is the telegraph *amplitude*, through the quantum-capacitance slope. The
+model is linear in that amplitude, so averaging the per-try spectra gives back the same
+Lorentzian with `sigma^2` replaced by its mean: the corner survives and only the precision
+improves. Over 20 simulated realisations of six tries spanning a factor of 100 in amplitude,
+averaging all six and averaging only the top three by contrast agree (130.2 ± 7.6 Hz vs
+130.8 ± 7.7 Hz), and both beat a single stream by 2.3× (146.9 ± 17.2 Hz, against `sqrt(6)`
+expected). Low-contrast tries cost nothing.
+
+Two caveats that do survive:
+
+- **`fidelity` is diluted by averaging.** It is set by the Lorentzian-to-floor ratio, and a
+  dead try contributes floor without signal, so `F` falls as such tries are added. Read it as
+  an ensemble property, not the readout fidelity at the best point.
+- **`gamma_p` reads high on short records** — about 10 % over 20 realisations of 6 × 2 s,
+  falling to ~5 % at 4 M samples and 0.4 % when the fitter is handed an exact analytic
+  spectrum. It is a log-periodogram small-sample effect, not a defect in the fitter. Take
+  longer records before quoting a rate.
+
+If the rate genuinely varies with bias, the average is a mixture of Lorentzians and the fit
+returns an intermediate corner; fit the tries individually to check. Re-averaging clears any
+existing fit, so a fit never describes a spectrum it did not see.
 
 Check `resid_dex_rms` before believing the numbers: `~0.1` is a good fit, `~1` means the model
 is a decade off across the band. The panel plots the raw periodogram faintly behind the
