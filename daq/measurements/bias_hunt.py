@@ -7,8 +7,9 @@ by the spread of the readout magnitude.
 
 from __future__ import annotations
 
+import warnings
 from contextlib import ExitStack
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy as np
@@ -153,9 +154,25 @@ class BiasHunt(GateBiasMeasurement):
         self.best_bias_file = None
         """Path of the winning try's HDF5 file."""
 
-        # Constituent acquisitions, kept off the saved record (Base skips underscore-prefixed
-        # attributes) and exposed through read-only properties.
+        self.fit_results = None
+        """Parity-model fit of :attr:`psd_avg`, from :meth:`fit_psd`.
+
+        Not written to HDF5 or MongoDB -- ``Base`` skips ``fit_results`` by name, and this one
+        holds a live ``iminuit`` object besides. Like
+        :class:`~daq.measurements.sweep_power.SweepPower`'s per-amplitude fits it lives on the
+        object only.
+        """
+
+        # Constituent acquisitions and the spectrum derived from them, kept off the saved
+        # record (Base skips underscore-prefixed attributes) and exposed through read-only
+        # properties. The spectrum is computed by analyze(), i.e. after run() has already
+        # saved, so a public attribute here would only ever reach the file as None.
         self._bias_streams: List[TimeStream] = []
+        self._psd_freqs = None
+        self._psd_avg = None
+        self._psd_fs = None
+        self._psd_quantity = None
+        self._psd_n_averaged = None
 
     def _reset_results(self) -> None:
         """Drop every result of a previous run, so a failed re-run leaves nothing stale.
@@ -171,6 +188,13 @@ class BiasHunt(GateBiasMeasurement):
         self.bias_files = None
         self.best_bias_file = None
         self._bias_streams = []
+        # The spectrum and its fit are derived from the streams, so they go stale with them.
+        self._psd_freqs = None
+        self._psd_avg = None
+        self._psd_fs = None
+        self._psd_quantity = None
+        self._psd_n_averaged = None
+        self.fit_results = None
 
     # ------------------------------------------------------------------ constituent objects
 
@@ -198,6 +222,55 @@ class BiasHunt(GateBiasMeasurement):
             return None
         return self._bias_streams[int(np.nanargmax(self.parity_contrast))]
 
+    @property
+    def psd_freqs(self) -> Optional[npt.NDArray[np.floating]]:
+        """Frequency axis of :attr:`psd_avg` in hertz, or ``None`` before
+        :meth:`average_psd`.
+
+        :returns: The frequency axis.
+
+        """
+        return self._psd_freqs
+
+    @property
+    def psd_avg(self) -> Optional[npt.NDArray[np.floating]]:
+        """Noise PSD averaged over the tries, or ``None`` before :meth:`average_psd`.
+
+        :returns: The averaged PSD.
+
+        """
+        return self._psd_avg
+
+    @property
+    def psd_fs(self) -> Optional[float]:
+        """Tuned sample rate :attr:`psd_avg` was computed at.
+
+        This is the ``f_bw`` :meth:`fit_psd` holds fixed -- the *tuned* rate the hardware
+        settled on, not the requested :attr:`sampling_frequency`.
+
+        :returns: The sample rate in hertz, or ``None`` before :meth:`average_psd`.
+
+        """
+        return self._psd_fs
+
+    @property
+    def psd_quantity(self) -> Optional[str]:
+        """Which projection of the readout :attr:`psd_avg` is the spectrum of.
+
+        :returns: ``"abs"``, ``"real"`` or ``"imag"``; ``None`` before :meth:`average_psd`.
+
+        """
+        return self._psd_quantity
+
+    @property
+    def psd_n_averaged(self) -> Optional[int]:
+        """How many tries went into :attr:`psd_avg`.
+
+        :returns: The number of spectra averaged, or ``None`` before :meth:`average_psd`.
+
+        """
+        return self._psd_n_averaged
+
     # ------------------------------------------------------------------ helpers
 
     @staticmethod
@@ -209,6 +282,182 @@ class BiasHunt(GateBiasMeasurement):
 
         """
         return float(np.std(np.abs(np.asarray(stream.signal)[:, 0])))
+
+    @staticmethod
+    def _parity_series(stream: TimeStream, quantity: str = "abs") -> npt.NDArray[np.floating]:
+        """Return the real-valued series whose spectrum is the parity spectrum.
+
+        :param stream: A run single-tone time stream.
+        :param quantity: ``"abs"``, ``"real"`` or ``"imag"`` -- which projection of the
+            complex readout to take. ``"abs"`` matches :meth:`parity_contrast_of`.
+        :raises ValueError: If *quantity* is not one of the three.
+        :returns: The mean-subtracted series, i.e. the fluctuation about the operating point.
+
+        """
+        signal = np.asarray(stream.signal)[:, 0]
+        if quantity == "abs":
+            series = np.abs(signal)
+        elif quantity == "real":
+            series = np.real(signal)
+        elif quantity == "imag":
+            series = np.imag(signal)
+        else:
+            raise ValueError(f"quantity must be 'abs', 'real' or 'imag', got {quantity!r}")
+        # The parity signal is the *fluctuation*, not the operating point it sits on. For the
+        # bare periodogram a constant offset lands entirely in the f=0 bin (which the fit drops
+        # anyway), so this is cosmetic there -- but it is load-bearing on the Welch path when
+        # the caller passes detrend=False.
+        return series - series.mean()
+
+    # ------------------------------------------------------------------ noise spectrum
+
+    def average_psd(
+        self,
+        streams: Optional[Sequence[TimeStream]] = None,
+        *,
+        quantity: str = "abs",
+        welch: bool = False,
+        nperseg: Optional[int] = None,
+        noverlap: Optional[int] = None,
+    ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+        """Average the noise PSD over every constant-bias try.
+
+        One PSD per try, averaged. Each try is short, so its own periodogram is noisy; the
+        mean over :attr:`n_bias_try` of them beats that scatter down by ``sqrt(n_bias_try)``
+        and leaves a spectrum worth fitting.
+
+        **Averaging across operating points is the intended use, not a compromise.** The
+        expectation is that the switching rate is common across the gate range -- it is set by
+        quasiparticle dynamics -- while what varies with bias is the *amplitude* of the
+        telegraph, through the quantum-capacitance slope. The model is linear in that
+        amplitude, so the average of the per-try spectra is the same Lorentzian with
+        ``sigma^2`` replaced by its mean: the corner, and hence ``gamma_p``, survives intact
+        and only the precision improves.
+
+        That is borne out numerically. Over 20 independent realisations of six tries whose
+        telegraph amplitudes span a factor of 100, averaging all six and averaging only the
+        top three by contrast give statistically identical rates (130.2 +/- 7.6 Hz against
+        130.8 +/- 7.7 Hz), while a single stream is 2.3x less precise (146.9 +/- 17.2 Hz,
+        against ``sqrt(6) = 2.4`` expected). Low-contrast tries cost nothing and are worth
+        keeping in.
+
+        Two things the average does *not* give you:
+
+        * The fitted ``fidelity`` is diluted. It comes from the ratio of the Lorentzian to the
+          white floor, and a try with no telegraph contributes floor without signal -- so ``F``
+          falls as such tries are added (0.994 for the best stream alone against 0.966 for all
+          eight, in the same simulation). Read it as a property of the ensemble, not as the
+          readout fidelity at the best point.
+        * If the rate genuinely does vary with bias, the average is a mixture of Lorentzians
+          and the fit returns some intermediate corner. Fitting the tries individually and
+          comparing is the way to check that premise.
+
+        For either, run this on one stream::
+
+            hunt.average_psd([hunt.best_bias_stream])
+
+        The result is stored on :attr:`psd_freqs` / :attr:`psd_avg` and reused by
+        :meth:`fit_psd` and :meth:`analyze`.
+
+        :param streams: Streams to average over. Defaults to every try (:attr:`bias_streams`).
+        :param quantity: Which projection of the complex readout to take the spectrum of --
+            ``"abs"`` (default, matching the contrast metric), ``"real"`` or ``"imag"``.
+        :param welch: Use Welch's method instead of the bare periodogram. Trades frequency
+            resolution for variance, on top of the averaging across tries.
+        :param nperseg: Welch segment length. Ignored unless *welch*.
+        :param noverlap: Welch segment overlap. Ignored unless *welch*.
+        :raises RuntimeError: If no streams are available -- :meth:`load` restores the derived
+            record but not the raw acquisitions, so reload them from :attr:`bias_files` and
+            pass them in.
+        :raises ValueError: If the streams disagree on record length, so their frequency axes
+            cannot be averaged together.
+        :returns: ``(f, psd)`` -- frequencies in Hz and the averaged PSD.
+
+        """
+        from ..analysis.noise import compute_psd
+
+        if streams is None:
+            streams = self._bias_streams
+        streams = [s for s in streams if s is not None]
+        if not streams:
+            raise RuntimeError(
+                "No time streams to take a spectrum of. Run the measurement first, or -- if "
+                "this measurement was loaded -- reload the acquisitions and pass them in: "
+                "hunt.average_psd([TimeStream.load(p) for p in hunt.bias_files])."
+            )
+
+        lengths = {np.asarray(s.signal).shape[0] for s in streams}
+        if len(lengths) > 1:
+            raise ValueError(
+                f"The tries hold different numbers of samples ({sorted(lengths)}), so their "
+                "PSDs sit on different frequency axes and cannot be averaged. Fit them "
+                "individually instead."
+            )
+
+        # The tuned rate, not the requested sampling_frequency: run() lets the hardware refine
+        # df, and the frequency axis (and the f_bw the fit holds fixed) follow the tuned value.
+        rates = {float(s.df) for s in streams}
+        if len(rates) > 1:
+            warnings.warn(
+                f"The tries were taken at different tuned sample rates ({sorted(rates)} Hz), "
+                "so their frequency axes do not line up exactly. Averaging them anyway on the "
+                "first stream's axis; the spread is normally a tuning artefact of order 1 Hz.",
+                stacklevel=2,
+            )
+        self._psd_fs = float(streams[0].df)
+
+        psd_sum = None
+        for stream in streams:
+            f, psd = compute_psd(
+                self._parity_series(stream, quantity),
+                self._psd_fs,
+                welch=welch,
+                nperseg=nperseg,
+                noverlap=noverlap,
+            )
+            psd_sum = psd if psd_sum is None else psd_sum + psd
+
+        self._psd_freqs = f
+        self._psd_avg = psd_sum / len(streams)
+        self._psd_quantity = quantity
+        self._psd_n_averaged = len(streams)
+        # A spectrum this fit did not see is not a spectrum this fit describes.
+        self.fit_results = None
+        return self._psd_freqs, self._psd_avg
+
+    def fit_psd(self, **kwargs) -> dict:
+        """Fit the averaged PSD to the random-telegraph parity model.
+
+        Runs :meth:`average_psd` first when it has not been run. The sampling bandwidth
+        ``f_bw`` is held fixed at the tuned sample rate the streams were taken at, as
+        :func:`~daq.analysis.noise.fit_parity_psd` expects.
+
+        The fitted ``gamma_p`` is an ensemble rate over the gate range scanned, for the reason
+        given in :meth:`average_psd`. Check ``resid_dex_rms`` before believing any of it --
+        ``~0.1`` is a good fit, ``~1`` means the model is a decade off across the band.
+
+        The result lives on the object only (as :attr:`fit_results`); like
+        :class:`~daq.measurements.sweep_power.SweepPower`'s per-amplitude fits it is **not**
+        written to HDF5 or MongoDB, since it is derived from streams the saved record does not
+        contain and is cheap to recompute.
+
+        :param kwargs: Passed through to :func:`~daq.analysis.noise.fit_parity_psd` --
+            ``fit_onef=True`` for a ``1/f``-like low-frequency rise, ``n_bins``,
+            ``bin_weighting``, and so on.
+        :raises RuntimeError: If no streams are available; see :meth:`average_psd`.
+        :returns: The ``fit_results`` dict from
+            :func:`~daq.analysis.noise.fit_parity_psd`.
+
+        """
+        from ..analysis.noise import fit_parity_psd
+
+        if self._psd_avg is None:
+            self.average_psd()
+
+        self.fit_results = fit_parity_psd(
+            self._psd_freqs, self._psd_avg, f_bw=self._psd_fs, **kwargs
+        )
+        return self.fit_results
 
     # ------------------------------------------------------------------ acquisition
 
@@ -364,10 +613,35 @@ class BiasHunt(GateBiasMeasurement):
 
     # ------------------------------------------------------------------ analysis
 
-    def analyze(self, title: Optional[str] = None):
-        """Plot the parity contrast against gate bias, with the winner marked.
+    def analyze(
+        self,
+        psd: bool = True,
+        fit: bool = True,
+        title: Optional[str] = None,
+        **fit_kwargs,
+    ):
+        """Plot the bias hunt, and the averaged noise spectrum with its parity fit.
 
-        :param title: Axis title. Defaults to naming the device and the readout frequency.
+        The upper panel is the search result: parity contrast against gate bias, sorted by
+        voltage so a random draw reads as a curve, with the winner marked. The lower panel is
+        the PSD averaged over every try (:meth:`average_psd`) on log-log axes, overlaid with
+        the random-telegraph fit (:meth:`fit_psd`) and annotated with the fitted rate, corner
+        and fidelity.
+
+        Both derived products are computed lazily here if they have not been already, and
+        reused if they have -- so ``analyze()`` after an explicit ``fit_psd(fit_onef=True)``
+        draws that fit rather than refitting with the defaults.
+
+        The spectrum panel needs the raw acquisitions, which :meth:`load` does not restore. On
+        a loaded measurement it is skipped with a note saying how to get it back, rather than
+        raising -- the contrast curve is still worth seeing.
+
+        :param psd: Draw the averaged-spectrum panel. ``False`` gives the contrast curve alone.
+        :param fit: Overlay the parity-model fit on the spectrum. Ignored when *psd* is
+            ``False``. A fit that raises is reported on the panel instead of aborting the plot.
+        :param title: Figure title. Defaults to naming the device and the readout frequency.
+        :param fit_kwargs: Passed to :meth:`fit_psd` when the fit is computed here (e.g.
+            ``fit_onef=True``). Ignored if a fit already exists.
         :raises RuntimeError: If the measurement has not been run or loaded.
         :returns: The created figure.
 
@@ -377,7 +651,19 @@ class BiasHunt(GateBiasMeasurement):
 
         import matplotlib.pyplot as plt
 
-        fig, ax = plt.subplots(figsize=(8, 4), tight_layout=True)
+        show_psd = psd and bool(self._bias_streams)
+        if psd and not show_psd:
+            print(
+                "INFO: no raw acquisitions on this object, so the spectrum panel is skipped. "
+                "Reload them and pass them in to get it: "
+                "hunt.average_psd([TimeStream.load(p) for p in hunt.bias_files])."
+            )
+
+        if show_psd:
+            fig, (ax, ax_psd) = plt.subplots(2, 1, figsize=(8, 8), tight_layout=True)
+        else:
+            fig, ax = plt.subplots(figsize=(8, 4), tight_layout=True)
+            ax_psd = None
 
         # Sort by voltage so a random draw still reads as a curve rather than a zigzag.
         order = np.argsort(self.bias_voltages)
@@ -406,7 +692,83 @@ class BiasHunt(GateBiasMeasurement):
                 parts.append(str(self.device))
             parts.append(f"{self.readout_freq / 1e9:.6f} GHz")
             title = " -- ".join(parts)
-        ax.set_title(title)
+        if show_psd:
+            fig.suptitle(title)
+        else:
+            ax.set_title(title)
+
+        if show_psd:
+            self._draw_psd(ax_psd, fit=fit, fit_kwargs=fit_kwargs)
 
         plt.show()
         return fig
+
+    def _draw_psd(self, ax, *, fit: bool, fit_kwargs: dict) -> None:
+        """Draw the averaged spectrum and, optionally, its parity fit.
+
+        :param ax: Axis to draw into.
+        :param fit: Whether to overlay the parity-model fit.
+        :param fit_kwargs: Extra arguments for :meth:`fit_psd`, used only if no fit exists.
+
+        """
+        if self._psd_avg is None:
+            self.average_psd()
+
+        # The DC bin is not plottable on a log frequency axis, and carries no parity
+        # information -- it is the operating point, which _parity_series already removed.
+        keep = np.asarray(self._psd_freqs) > 0
+        n = self._psd_n_averaged
+        ax.loglog(
+            np.asarray(self._psd_freqs)[keep],
+            np.asarray(self._psd_avg)[keep],
+            lw=0.5,
+            color="tab:blue",
+            alpha=0.25,
+            label=f"periodogram, mean of {n} {'try' if n == 1 else 'tries'}",
+        )
+
+        if fit:
+            try:
+                if self.fit_results is None:
+                    self.fit_psd(**fit_kwargs)
+                res = self.fit_results
+                # The log-binned points are what the fit actually saw. Without them the panel
+                # shows a smooth model over a periodogram scattering across ten decades, which
+                # reads as a bad fit even when it is a good one.
+                ax.loglog(
+                    res["f_binned"],
+                    res["psd_binned"],
+                    "o",
+                    ms=3.5,
+                    color="tab:blue",
+                    label=f"log-binned ({res['n_bins']} bins, fit to these)",
+                )
+                ax.loglog(
+                    np.asarray(self._psd_freqs)[keep],
+                    np.asarray(res["model"])[keep],
+                    color="tab:red",
+                    lw=1.8,
+                    label=(
+                        rf"$\Gamma_p$ = {res['gamma_p']:.3g} $\pm$ {res['gamma_p_err']:.2g} Hz"
+                        "\n"
+                        rf"$f_c$ = {res['f_corner']:.3g} Hz,  $F$ = {res['fidelity']:.3f}"
+                        "\n"
+                        rf"resid = {res['resid_dex_rms']:.2f} dex"
+                    ),
+                )
+                ax.axvline(res["f_corner"], color="tab:red", ls=":", lw=1.0)
+                # Frame on the binned points: the periodogram's low-power outliers drag the
+                # y-range over ten decades and flatten everything of interest into a line.
+                lo = float(np.min(res["psd_binned"]))
+                hi = float(np.max(res["psd_binned"]))
+                ax.set_ylim(lo / 30.0, hi * 30.0)
+            except Exception as err:
+                # A failed fit must not cost the spectrum: the data is the point, the model is
+                # an overlay, and a spectrum this model does not describe is itself a result.
+                print(f"WARN: the parity fit failed, showing the spectrum alone: {err}")
+                ax.set_title("parity fit failed", fontsize=8, color="tab:red")
+
+        ax.set_xlabel("Frequency [Hz]")
+        ax.set_ylabel(rf"PSD of ${self.psd_quantity}(S)$ [FS$^2$/Hz]")
+        ax.grid(True, alpha=0.3, which="both")
+        ax.legend(loc="best", fontsize=8)
