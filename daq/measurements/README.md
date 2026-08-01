@@ -523,13 +523,53 @@ hunt = BiasHunt(
     device="B260416-NG-D1_dev3",
 )
 hunt.run()                                  # opens the 33220A itself
-hunt.analyze()                              # parity contrast vs gate bias, winner marked
+hunt.analyze()                              # contrast vs bias, above the fitted noise spectrum
 
 hunt.best_bias, hunt.best_contrast          # the operating point
-hunt.best_bias_stream                       # feed to compute_psd / fit_parity_psd
+hunt.best_bias_stream                       # the winning acquisition
+hunt.fit_results["gamma_p"]                 # parity-switching rate from the fitted spectrum
 ```
 
 As with `QCTrace`, `run()` takes the bias generator as its only positional argument.
+
+**The averaged spectrum.** `analyze()`'s lower panel is the noise PSD averaged over every try,
+fitted to the random-telegraph parity model. Each try is short, so its own periodogram is
+noisy; the mean over `n_bias_try` of them beats that scatter down by `sqrt(n_bias_try)` and
+leaves something worth fitting. Both steps are lazy and cached, and can be driven directly:
+
+```python
+f, psd = hunt.average_psd()                 # -> hunt.psd_freqs, hunt.psd_avg
+res    = hunt.fit_psd(fit_onef=True)        # kwargs go to fit_parity_psd
+res["gamma_p"], res["f_corner"], res["fidelity"], res["resid_dex_rms"]
+
+hunt.analyze()                              # reuses that fit rather than refitting
+```
+
+The spectrum is taken of the **mean-subtracted** `|signal|` — the parity signal is the
+fluctuation, not the operating point it sits on — at the streams' *tuned* `df`, which is also
+the `f_bw` the fit holds fixed. Pass `quantity="real"`/`"imag"` to project differently, or
+`welch=True` for Welch's method.
+
+> **This averages across different operating points.** Each try sits at a different gate
+> voltage, and the switching rate is a property of the operating point, so the fitted
+> `gamma_p` is an ensemble figure for the range scanned — not the rate at any one bias. For
+> that, average one stream: `hunt.average_psd([hunt.best_bias_stream])`, then `fit_psd()`.
+> Re-averaging clears any existing fit, so a fit never describes a spectrum it did not see.
+
+Check `resid_dex_rms` before believing the numbers: `~0.1` is a good fit, `~1` means the model
+is a decade off across the band. The panel plots the raw periodogram faintly behind the
+log-binned points the fit actually used, since a bare periodogram scatters over ten decades and
+reads as a bad fit even when it is a good one.
+
+The fit lives on the object only — like `SweepPower`'s per-amplitude fits it is **not** written
+to HDF5 or MongoDB, since it derives from streams the saved record does not contain. After a
+`load()` the spectrum panel is skipped (with a note) rather than raising; reload the
+acquisitions to get it back:
+
+```python
+hunt.average_psd([TimeStream.load(p) for p in hunt.bias_files])
+hunt.analyze()
+```
 
 **Records**: every try saves its own HDF5 + MongoDB record with `attach(bias=...)` applied.
 `BiasHunt` saves one further `bias_hunt` record with `parity_contrast`, `best_bias`,
@@ -537,7 +577,9 @@ As with `QCTrace`, `run()` takes the bias generator as its only positional argum
 `best_bias_stream` are read-only properties; `load()` restores the derived record but not the
 streams — reload them from `bias_files`.
 
-**Analysis**: parity contrast versus gate bias, sorted by voltage, with the winner marked.
+**Analysis**: parity contrast versus gate bias (sorted by voltage, winner marked), above the
+averaged noise spectrum with its parity fit. `analyze(psd=False)` gives the contrast curve
+alone; `analyze(fit=False)` the spectrum without the model.
 
 ---
 
@@ -604,7 +646,8 @@ Each measurement class provides an `analyze()` method for visualization:
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
 - **QCTrace**: the block-averaged I/Q QC trace over one ramp period
-- **BiasHunt**: parity contrast vs. gate bias, with the winner marked
+- **BiasHunt**: parity contrast vs. gate bias with the winner marked, above the averaged noise
+  PSD and its random-telegraph fit
 
 ---
 
