@@ -453,34 +453,48 @@ slightly away from what you asked for, and dividing the record by `n_periods` ca
 window a sample short of the true period, which smears the average across blocks instead of
 dropping a leftover. `period_s=1 / RAMP_HZ` with `fs=qc.df` always gives the physical period.
 
-### The packaged routine
+### The packaged routines
 
-`QCTrace` runs the whole bench sequence — locating sweep, gated-ramp QC trace, a hunt for the
-gate bias with the largest parity contrast, and a stream under a free-running ramp — and saves
-the folded trace as its own record:
+`QCTrace` packages exactly the block above — gated ramp, whole-period acquisition, fold — and
+saves the folded trace as its own record. `BiasHunt` is its companion: constant biases, ranked
+by parity contrast. Neither locates the resonance, so run a fitted `Sweep` first and hand both
+its `fr`:
 
 ```python
-from daq import QCTrace, power_dbm_to_amp
+from daq import BiasHunt, QCTrace, Sweep, power_dbm_to_amp
+
+amp = power_dbm_to_amp(2.8, -110 + 78)          # device power + attenuation
+
+sw = Sweep(freq_center=2.8e9, freq_span=0.7e6, df=5e3, num_averages=50,
+           amp=amp, output_port=1, input_port=1, device="my_device", auto_fit=True)
+sw.run()
+fr = sw.fit_results["fr"]
 
 qct = QCTrace(
-    freq_center=2.8e9,
-    amp=power_dbm_to_amp(2.8, -110 + 78),      # device power + attenuation
-    output_port=1, input_port=1,
+    readout_freq=fr, amp=amp, output_port=1, input_port=1,
     ramp_vpp=2.0, ramp_freq_hz=500,
     sampling_frequency=5e4, num_periods=200,
-    n_bias_try=20, ts_duration_s=5.0,
     device="my_device", filter="VBFZ-2575-S+, ZX60-83LN-S+",
 )
 qct.run()                                       # opens the 33220A itself
-qct.analyze()                                   # contrast vs bias + folded I/Q
-
+qct.analyze()                                   # the folded I/Q trace
 qct.time_ms, qct.avg_iq                         # the QC trace
-qct.best_bias, qct.best_bias_stream             # winning gate bias and its stream
+
+hunt = BiasHunt(
+    readout_freq=fr, amp=amp, output_port=1, input_port=1,
+    v_min=0.0, v_max=2.0, n_bias_try=20, ts_duration_s=5.0,
+    device="my_device",
+)
+hunt.run()
+hunt.analyze()                                  # contrast vs gate bias
+hunt.best_bias, hunt.best_bias_stream           # winning gate bias and its stream
 ```
 
-Feed `qct.best_bias_stream` to `compute_psd` / `fit_parity_psd` for the parity spectrum at the
-best operating point. See the `QCTrace` entry in `CLAUDE.md` for the full parameter set and what
-lands in HDF5 and MongoDB.
+Feed `hunt.best_bias_stream` to `compute_psd` / `fit_parity_psd` for the parity spectrum at the
+best operating point. `QCTrace.fold()` re-folds on demand — on a different period, or on a
+stream reloaded from `qct.qc_file` — so `fold_timestream` need not be called by hand for a
+packaged run. See the `QCTrace` and `BiasHunt` entries in `CLAUDE.md` for the full parameter
+sets and what lands in HDF5 and MongoDB.
 
 ---
 

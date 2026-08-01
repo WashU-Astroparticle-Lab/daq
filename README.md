@@ -86,7 +86,7 @@ cached on first use, `reload_settings()` picks up changes.
 
 ```
 daq/
-├── measurements/   Sweep, TimeStream, SweepPower, SweepFreqAndDC, TwoTonePower, QCTrace
+├── measurements/   Sweep, TimeStream, SweepPower, SweepFreqAndDC, TwoTonePower, QCTrace, BiasHunt
 ├── analysis/       resonator fits, noise PSDs, folding, plotting, Mattis-Bardeen
 ├── instruments/    VISA drivers: Agilent33220A (gate bias), DC2200 (LED)
 ├── db/             MongoDB logging and querying
@@ -109,12 +109,12 @@ There is no CI. `tests/` is an offline verification suite: no hardware, no VISA 
 MongoDB. Each script prints one PASS/FAIL line per check and exits non-zero on failure.
 
 ```bash
-python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_resonator.py && python tests/test_qc_trace.py
+python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_resonator.py && python tests/test_qc_trace.py && python tests/test_bias_hunt.py
 ```
 
 They are standalone scripts, not pytest suites — run them as scripts. Extend them when
-touching the instruments layer, `TimeStream.run()`, `QCTrace`'s trigger routing, or the
-resonator fitting adapter.
+touching the instruments layer, `TimeStream.run()`, `QCTrace`'s trigger routing, `BiasHunt`'s
+ranking, or the resonator fitting adapter.
 
 ## Conventions
 

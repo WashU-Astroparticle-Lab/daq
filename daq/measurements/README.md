@@ -356,70 +356,83 @@ tt.analyze(quantity="quadrature", linecut=True)
 ### 6. QCTrace (`qc_trace.py`)
 
 **Purpose**: Quantum-capacitance (charge-parity / quasiparticle-tunnelling) trace on one
-device. Unlike the classes above it drives no hardware of its own — it composes a `Sweep`,
-several `TimeStream`s and an `Agilent33220A` gate-bias source, because the four steps and their
-ordering *are* the measurement.
+device — a gated gate-voltage ramp, block-averaged into a single ramp period. It drives no
+Presto hardware of its own: it composes one `TimeStream` and an `Agilent33220A` gate-bias
+source, because the bias state the acquisition runs under *is* the measurement.
 
-**Sequence** (run in order by `run()`):
-1. A `Sweep` with auto-fit to locate `fr`; every later step reads out there. Raises
-   `RuntimeError` if the fit yields no usable `fr` (the sweep's own file is still saved).
-2. The **QC trace** — a gated sawtooth on the gate plus an externally-triggered `TimeStream`
-   spanning `num_periods` whole ramp periods, folded into one period by `fold_timestream`.
-3. A **bias hunt** — one constant-bias `TimeStream` per entry of `bias_voltages`, keeping the
-   largest parity contrast `std(|signal|)`.
-4. One `TimeStream` under a **free-running** ramp, the same length as the tries.
+`run()` puts the generator into a **gated** sawtooth, acquires an externally-triggered
+`TimeStream` spanning `num_periods` whole ramp periods, and folds it into one period.
+Uncorrelated noise falls by `sqrt(num_periods)`; what remains is the device's response to one
+sweep of the gate voltage.
+
+**It does not locate the resonance.** Read out where a fitted `Sweep` says to:
+
+```python
+sw = Sweep(freq_center=2.8e9, freq_span=0.7e6, df=5e3, num_averages=50,
+           amp=amp, output_port=1, input_port=1, device="my_device", auto_fit=True)
+sw.run()
+qct = QCTrace(readout_freq=sw.fit_results["fr"], ...)
+```
 
 **Key Parameters**:
-- `freq_center`: Centre frequency of the locating sweep (Hz)
-- `amp`: Drive amplitude (fraction of full scale; use `power_dbm_to_amp` to convert from dBm),
-  shared by the sweep and every time stream
+- `readout_freq`: readout frequency (Hz), normally a fitted `fr`
+- `amp`: Drive amplitude (fraction of full scale; use `power_dbm_to_amp` to convert from dBm)
 - `output_port` / `input_port`: DAC output / ADC input port
 - `ramp_vpp`, `ramp_freq_hz`, `ramp_offset_v`, `ramp_symmetry_pct`: gate sawtooth shape
 - `sampling_frequency`, `num_periods`: time-stream sample rate (Hz) and periods averaged
-- `n_bias_try` / `bias_voltages`: number of random constant-bias tries, or explicit voltages
-  to scan (e.g. a `numpy.linspace`) instead of sampling
-- `v_min` / `v_max`, `seed`: bounds and seed for the random bias draw
-- `ts_duration_s`: length (s) of each constant-bias try and of the ramp stream
-- `trigger_states`: which Presto digital output ports gate the QC-trace step. `None` (default)
+- `trigger_states`: which Presto digital output ports gate the acquisition. `None` (default)
   takes the port from the bias generator's own `trigger_port`; pass presto states (`[1]`,
   `[0, 1]`, or `True` for port 1) to override it for one measurement
 - `device` (required for DB), `filter`, `notes`
 
-**Trigger routing**: only step 2 is gated, and by default it gates whichever port the bias
-generator says it is wired to — `Agilent33220A.trigger_port`, port 1 in the lab's default
-setup, overridable per instrument or via `DAQ_FGEN_TRIGGER_PORT`. Rewiring the rig therefore
-needs no change to the measurement, and the generator is consulted on *every* run, so fixing a
-port and re-running the same object gates the new one. This matters because getting it wrong is
-silent: an ungated ramp sits at its burst start level and step 2 records a static bias rather
-than a swept one. The resolved states are validated before the first acquisition — a routing
-that gates no port raises, and an explicit one that leaves the generator's own port unasserted
-warns — printed at the start of the run, and saved with the record (`trigger_states` in HDF5
-and MongoDB), so a stored measurement pins down which port was gated. `load()` restores that
+**Trigger routing**: the acquisition is gated, by default on whichever port the bias generator
+says it is wired to — `Agilent33220A.trigger_port`, port 1 in the lab's default setup,
+overridable per instrument or via `DAQ_FGEN_TRIGGER_PORT`. Rewiring the rig therefore needs no
+change to the measurement, and the generator is consulted on *every* run, so fixing a port and
+re-running the same object gates the new one. This matters because getting it wrong is silent:
+an ungated ramp sits at its burst start level and the acquisition records a static bias rather
+than a swept one. The resolved states are validated before the acquisition — a routing that
+gates no port raises, and an explicit one that leaves the generator's own port unasserted warns
+— printed at the start of the run, and saved with the record (`trigger_states` in HDF5 and
+MongoDB), so a stored measurement pins down which port was gated. `load()` restores that
 routing for inspection but does not pin it: re-running a loaded measurement re-reads the
-generator in hand. Files written before the parameter existed load as port 1, which is what the
-old hardcoded `external_trigger=True` meant.
+generator in hand.
 
 **Usage Example**:
 ```python
 from daq import QCTrace, power_dbm_to_amp
 
 qct = QCTrace(
-    freq_center=2.8e9,
+    readout_freq=fr,                        # from a fitted Sweep
     amp=power_dbm_to_amp(2.8, -110 + 78),   # device power + attenuation
     output_port=1, input_port=1,
     ramp_vpp=2.0, ramp_freq_hz=500,
     sampling_frequency=5e4, num_periods=200,
-    n_bias_try=20, ts_duration_s=5.0,
     device="B260416-NG-D1_dev3",
     filter="VBFZ-2575-S+, ZX60-83LN-S+ and ZX60-63GLN+ warm amp",
 )
 qct.run()                       # opens the 33220A itself; or run(bias=<open instrument>)
-qct.analyze()                   # parity contrast vs bias, above the folded I/Q trace
+qct.analyze()                   # the folded I/Q trace over one ramp period
 ```
 
 Note `run()` takes the **bias generator** as its only positional argument, not
 `presto_address`; the Presto connection parameters are keyword-only
 (`run(presto_address=...)`).
+
+**Folding**: `run()` calls `fold()` once. It is a method rather than a bare
+`fold_timestream` call because it already knows the ramp period and the tuned sample rate, so
+the usual invocation is empty:
+
+```python
+qct.fold()                                   # period_s = 1 / ramp_freq_hz, at the tuned df
+qct.fold(n_periods=200)                      # or divide the record instead
+qct.fold(TimeStream.load(qct.qc_file))       # re-fold a stream loaded back from disk
+```
+
+Each call replaces `time_ms`/`avg_iq`. The default — the ramp's own period at the *tuned* `df`
+— beats dividing the record by `num_periods`: `TimeStream.run` tunes `df` slightly away from
+what was asked for, and a window a sample short of the true period smears the average across
+blocks instead of dropping a leftover.
 
 **Routing the gate on a differently-wired rig** — nothing about the measurement changes, so
 tell the instrument, not the measurement:
@@ -428,7 +441,7 @@ tell the instrument, not the measurement:
 from daq import Agilent33220A, QCTrace
 
 with Agilent33220A(trigger_port=3) as bias:      # or export DAQ_FGEN_TRIGGER_PORT=3
-    qct = QCTrace(freq_center=2.8e9, amp=amp, output_port=1, input_port=1, device="my_device")
+    qct = QCTrace(readout_freq=fr, amp=amp, output_port=1, input_port=1, device="my_device")
     qct.run(bias=bias)      # "QC trace: gating the ramp on Presto digital output port 3"
 ```
 
@@ -437,16 +450,72 @@ The generator is re-read on every run, so a port corrected mid-session (`bias.tr
 pin the routing to the measurement instead, pass `QCTrace(..., trigger_states=[0, 0, 1])`;
 that overrides the generator, and warns if it leaves the generator's own port unasserted.
 
-**Records**: every step saves its own HDF5 + MongoDB record via the normal path with
-`attach(bias=...)` applied, so each raw acquisition stays individually loadable. `QCTrace` saves
-one further `qc_trace` record with the derived products (`fr`, `time_ms`/`avg_iq`,
-`parity_contrast`, `best_bias`) and the constituent file paths (`sweep_file`, `qc_file`,
-`best_bias_file`, `ramp_file`), plus the sweep's fit (`fit_fr`/`fit_Qi`/…). The constituent
-objects hang off read-only properties (`sweep`, `qc_stream`, `bias_streams`,
-`best_bias_stream`, `ramp_stream`); `load()` restores the derived record but not those objects.
+**Records**: the `TimeStream` saves its own HDF5 + MongoDB record via the normal path with
+`attach(bias=...)` applied, so the raw acquisition stays individually loadable. `QCTrace` saves
+one further `qc_trace` record with the folded trace (`time_ms`/`avg_iq`), the resolved
+`trigger_states` and the raw acquisition's path (`qc_file`). The stream hangs off a read-only
+`qc_stream` property; `load()` restores the derived record but not the stream.
 
-**Analysis**: parity contrast versus gate bias with the winner marked, above the folded I/Q
-trace over one ramp period.
+**Analysis**: the folded I/Q trace over one ramp period, optionally with one un-averaged period
+overlaid (`analyze(raw=True)`) to show what the averaging bought.
+
+---
+
+### 7. BiasHunt (`bias_hunt.py`)
+
+**Purpose**: find the gate bias with the largest charge-parity contrast — the operating point
+to take parity spectra at. The companion to `QCTrace`, and its exact inverse: where `QCTrace`
+sweeps the gate under a gated ramp, `BiasHunt` parks it at a series of constant voltages with
+**nothing gated**.
+
+`run()` writes each entry of `bias_voltages` to the generator with `Agilent33220A.constant` and
+records one `ts_duration_s` `TimeStream` per voltage at `readout_freq`. Parity switching moves
+the resonator between two frequencies, so a two-level-telegraph response shows up as a spread
+in the readout magnitude: `std(|signal|)` ranks the candidates. Like `QCTrace`, it does **not**
+locate the resonance — pass `readout_freq` from a fitted `Sweep`.
+
+Every acquisition is ungated. The bias is a DC level already written over SCPI, so there is
+nothing for a trigger to start, and asserting one would gate whatever else is wired to that
+port for the whole hunt.
+
+**Key Parameters**:
+- `readout_freq`, `amp`, `output_port` / `input_port`: as `QCTrace`
+- `v_min` / `v_max`, `n_bias_try`, `seed`: bounds, count and seed for the random bias draw
+- `bias_voltages`: explicit voltages to try (e.g. a `numpy.linspace`) instead of a draw
+- `ts_duration_s`, `sampling_frequency`: length (s) and sample rate (Hz) of each try
+- `device` (required for DB), `filter`, `notes`
+
+There is **no default gate range**: omitting `v_min`/`v_max` without `bias_voltages` raises
+rather than putting an invented voltage on a device. The draw happens in `__init__`, so the
+object pins down exactly what will be measured before any hardware is touched.
+
+**Usage Example**:
+```python
+from daq import BiasHunt
+
+hunt = BiasHunt(
+    readout_freq=fr,                        # from a fitted Sweep
+    amp=amp, output_port=1, input_port=1,
+    v_min=0.0, v_max=2.0, n_bias_try=20,    # or bias_voltages=np.linspace(0, 2, 20)
+    ts_duration_s=5.0, sampling_frequency=5e4,
+    device="B260416-NG-D1_dev3",
+)
+hunt.run()                                  # opens the 33220A itself
+hunt.analyze()                              # parity contrast vs gate bias, winner marked
+
+hunt.best_bias, hunt.best_contrast          # the operating point
+hunt.best_bias_stream                       # feed to compute_psd / fit_parity_psd
+```
+
+As with `QCTrace`, `run()` takes the bias generator as its only positional argument.
+
+**Records**: every try saves its own HDF5 + MongoDB record with `attach(bias=...)` applied.
+`BiasHunt` saves one further `bias_hunt` record with `parity_contrast`, `best_bias`,
+`best_contrast`, `best_bias_file` and every try's path in `bias_files`. `bias_streams` and
+`best_bias_stream` are read-only properties; `load()` restores the derived record but not the
+streams — reload them from `bias_files`.
+
+**Analysis**: parity contrast versus gate bias, sorted by voltage, with the winner marked.
 
 ---
 
@@ -512,7 +581,8 @@ Each measurement class provides an `analyze()` method for visualization:
 - **SweepPower**: 2D heatmap with fitted `fr`/`Qi` vs. drive power
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
-- **QCTrace**: parity contrast vs. gate bias, above the block-averaged I/Q QC trace
+- **QCTrace**: the block-averaged I/Q QC trace over one ramp period
+- **BiasHunt**: parity contrast vs. gate bias, with the winner marked
 
 ---
 
