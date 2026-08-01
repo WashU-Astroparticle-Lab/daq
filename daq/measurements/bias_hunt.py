@@ -50,10 +50,11 @@ class BiasHunt(GateBiasMeasurement):
         :func:`~daq.calibrations.power_dbm_to_amp`.
     :param output_port: Presto output port.
     :param input_port: Presto input port.
-    :param v_min: Lower bound of the random bias draw in volts. Required unless
-        *bias_voltages* is given.
-    :param v_max: Upper bound of the random bias draw in volts. Required unless
-        *bias_voltages* is given.
+    :param v_min: Lower bound of the random bias draw in volts. Required when *bias_voltages*
+        is not given, and **ignored** when it is -- the attribute then reports the span of the
+        list you passed.
+    :param v_max: Upper bound of the random bias draw in volts. Required when *bias_voltages*
+        is not given, and **ignored** when it is.
     :param n_bias_try: Number of constant-bias tries to draw. Ignored when *bias_voltages* is
         given.
     :param bias_voltages: Explicit bias voltages to try, instead of a random draw.
@@ -156,6 +157,21 @@ class BiasHunt(GateBiasMeasurement):
         # attributes) and exposed through read-only properties.
         self._bias_streams: List[TimeStream] = []
 
+    def _reset_results(self) -> None:
+        """Drop every result of a previous run, so a failed re-run leaves nothing stale.
+
+        :attr:`parity_contrast` and :attr:`bias_streams` are read together -- by
+        :attr:`best_bias_stream` and by :meth:`analyze` -- so they must never be left
+        describing different runs.
+
+        """
+        self.parity_contrast = None
+        self.best_bias = None
+        self.best_contrast = None
+        self.bias_files = None
+        self.best_bias_file = None
+        self._bias_streams = []
+
     # ------------------------------------------------------------------ constituent objects
 
     @property
@@ -236,6 +252,13 @@ class BiasHunt(GateBiasMeasurement):
             ext_ref_clk=ext_ref_clk,
         )
 
+        # Clear every result up front, not just the streams. A try that raises part-way through
+        # a *re-run* would otherwise leave the previous run's parity_contrast beside this run's
+        # shorter _bias_streams, and best_bias_stream indexes one by the argmax of the other --
+        # an IndexError at best, and at worst a new stream silently reported with an old
+        # contrast and an old bias voltage.
+        self._reset_results()
+
         with ExitStack() as stack:
             if bias is None:
                 bias = stack.enter_context(Agilent33220A())
@@ -247,7 +270,6 @@ class BiasHunt(GateBiasMeasurement):
 
             ts_samples = self._stream_samples(self.ts_duration_s)
             contrasts = np.full(self.n_bias_try, np.nan)
-            self._bias_streams = []
             paths: List[str] = []
             for ii, voltage in enumerate(self.bias_voltages):
                 bias.constant(float(voltage))

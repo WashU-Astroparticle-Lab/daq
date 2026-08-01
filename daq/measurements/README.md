@@ -429,10 +429,25 @@ qct.fold(n_periods=200)                      # or divide the record instead
 qct.fold(TimeStream.load(qct.qc_file))       # re-fold a stream loaded back from disk
 ```
 
-Each call replaces `time_ms`/`avg_iq`. The default — the ramp's own period at the *tuned* `df`
-— beats dividing the record by `num_periods`: `TimeStream.run` tunes `df` slightly away from
-what was asked for, and a window a sample short of the true period smears the average across
-blocks instead of dropping a leftover.
+Each call replaces `time_ms`/`avg_iq` and sets `num_periods_folded`, the number of blocks
+actually averaged — the `N` in the `sqrt(N)` noise reduction. That is normally `num_periods`,
+but falls short whenever the record does not divide evenly, and the difference is not
+recoverable from the file otherwise.
+
+The default — the ramp's own period at the *tuned* `df` — beats dividing the record by
+`num_periods`: `TimeStream.run` tunes `df` slightly away from what was asked for, and a window
+a sample short of the true period smears the average across blocks instead of dropping a
+leftover. For the same reason `fold()` insists on an object carrying `df` and raises `TypeError`
+on a bare array rather than falling back to the requested `sampling_frequency`; fold an array
+with `fold_timestream(array, fs, period_s=...)` and an explicit rate.
+
+> **Pick a sample rate that divides evenly by the ramp rate.** Folding cuts the record into
+> `round(period_s * fs)`-sample blocks, an integer. If one period is a fractional number of
+> samples, every block starts a fraction of a sample later than the last and the error
+> accumulates: at `sampling_frequency=5e4` with `ramp_freq_hz=300` (166.67 samples per period) a
+> sharp feature loses about 90 % of its contrast over 200 periods, and nothing about the folded
+> trace says so. `__init__` warns when the ratio is not integral. 500 Hz, 250 Hz and 100 Hz all
+> divide 50 kHz exactly; 300 Hz does not.
 
 **Routing the gate on a differently-wired rig** — nothing about the measurement changes, so
 tell the instrument, not the measurement:
@@ -452,9 +467,10 @@ that overrides the generator, and warns if it leaves the generator's own port un
 
 **Records**: the `TimeStream` saves its own HDF5 + MongoDB record via the normal path with
 `attach(bias=...)` applied, so the raw acquisition stays individually loadable. `QCTrace` saves
-one further `qc_trace` record with the folded trace (`time_ms`/`avg_iq`), the resolved
-`trigger_states` and the raw acquisition's path (`qc_file`). The stream hangs off a read-only
-`qc_stream` property; `load()` restores the derived record but not the stream.
+one further `qc_trace` record with the folded trace (`time_ms`/`avg_iq`), the blocks actually
+averaged (`num_periods_folded`), the resolved `trigger_states` and the raw acquisition's path
+(`qc_file`). The stream hangs off a read-only `qc_stream` property; `load()` restores the
+derived record but not the stream.
 
 **Analysis**: the folded I/Q trace over one ramp period, optionally with one un-averaged period
 overlaid (`analyze(raw=True)`) to show what the averaging bought.
@@ -486,8 +502,14 @@ port for the whole hunt.
 - `device` (required for DB), `filter`, `notes`
 
 There is **no default gate range**: omitting `v_min`/`v_max` without `bias_voltages` raises
-rather than putting an invented voltage on a device. The draw happens in `__init__`, so the
-object pins down exactly what will be measured before any hardware is touched.
+rather than putting an invented voltage on a device. Pass `bias_voltages` and they are ignored
+— the attributes then report that list's span. The draw happens in `__init__`, so the object
+pins down exactly what will be measured before any hardware is touched.
+
+Every result is cleared at the top of `run()`. A re-run that fails part-way therefore leaves
+nothing stale: `best_bias_stream` reads `parity_contrast` and `bias_streams` together, and a
+contrast curve left over from a previous run would index the new (shorter) stream list by the
+old argmax — reporting a new acquisition under an old bias voltage.
 
 **Usage Example**:
 ```python

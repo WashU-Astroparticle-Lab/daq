@@ -221,6 +221,69 @@ check(
     np.allclose(hunt.parity_contrast, [np.std(np.abs(ts.signal[:, 0])) for ts in streams]),
 )
 
+# ---------------------------------------------------------------- bias safety
+
+# The gate is never left energised. A bias left on an unattended device is the one failure here
+# that outlives the session.
+safe_bias = FakeBias()
+safe_bias.output = True
+run_hunt(make(), safe_bias)
+check("a caller-supplied generator is de-energised on success", safe_bias.output is False)
+
+failing_bias = FakeBias()
+failing_bias.output = True
+failing_bias.constant = lambda v: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    run_hunt(make(), failing_bias)
+    check("an exception mid-hunt still de-energises the gate", False, "no exception raised")
+except RuntimeError:
+    check("an exception mid-hunt still de-energises the gate", failing_bias.output is False)
+
+# ---------------------------------------------------------------- stale results
+
+# A hunt that fails part-way through a RE-RUN must not leave the previous run's results beside
+# this run's shorter stream list: best_bias_stream indexes one by the argmax of the other, so a
+# stale parity_contrast either raises IndexError or reports a new stream under an old voltage.
+rerun = make()
+run_hunt(rerun, FakeBias())
+first_contrast = np.array(rerun.parity_contrast)
+
+
+def fail_after(bias, n):
+    """Let *n* tries through, then raise."""
+    seen = []
+
+    def constant(voltage):
+        seen.append(voltage)
+        if len(seen) > n:
+            raise RuntimeError("boom")
+        bias.calls.append(("constant", voltage))
+
+    bias.constant = constant
+    return bias
+
+
+try:
+    run_hunt(rerun, fail_after(FakeBias(), 2))
+    check("a failed re-run raises", False, "no exception raised")
+except RuntimeError:
+    check("a failed re-run raises", True)
+
+check(
+    "a failed re-run leaves no stale contrast curve",
+    rerun.parity_contrast is None,
+    f"still holds {None if rerun.parity_contrast is None else len(rerun.parity_contrast)} entries",
+)
+check(
+    "and no stale winner",
+    rerun.best_bias is None and rerun.best_bias_file is None and rerun.bias_files is None,
+)
+check(
+    "so best_bias_stream is silent rather than wrong",
+    rerun.best_bias_stream is None,
+    f"streams={len(rerun.bias_streams)}, previous contrast had {len(first_contrast)}",
+)
+
 # ---------------------------------------------------------------- persistence
 
 with tempfile.TemporaryDirectory() as tmp:

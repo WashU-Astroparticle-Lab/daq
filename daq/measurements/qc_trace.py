@@ -148,6 +148,7 @@ class QCTrace(GateBiasMeasurement):
         self.ramp_offset_v = ramp_vpp / 2.0 if ramp_offset_v is None else ramp_offset_v
         self.ramp_symmetry_pct = ramp_symmetry_pct
         self.num_periods = num_periods
+        self._warn_if_period_not_integral()
 
         # Which digital output ports gate the acquisition. An explicit routing is resolved
         # here, so a bad one raises before the hardware is touched; None defers to run(), where
@@ -168,6 +169,13 @@ class QCTrace(GateBiasMeasurement):
         """Time axis of one ramp period in milliseconds."""
         self.avg_iq = None
         """Block-averaged QC trace, shape ``(2, n_samples)``; row 0 is I, row 1 is Q."""
+        self.num_periods_folded = None
+        """Blocks :meth:`fold` actually averaged -- the ``N`` in the ``sqrt(N)`` noise gain.
+
+        Normally :attr:`num_periods`, but lower whenever the record does not divide evenly
+        into whole periods. Recorded separately because the requested count over-states the
+        averaging in that case, and the difference is not recoverable from the saved file.
+        """
         self.qc_file = None
         """Path of the gated-ramp time stream's HDF5 file."""
 
@@ -187,6 +195,42 @@ class QCTrace(GateBiasMeasurement):
         return self._qc_stream
 
     # ------------------------------------------------------------------ helpers
+
+    def _warn_if_period_not_integral(self) -> None:
+        """Warn when one ramp period is not a whole number of samples.
+
+        Folding cuts the record into blocks of ``round(period_s * fs)`` samples -- an integer.
+        When the true period is fractional, every block starts a fraction of a sample later
+        than the last and the error accumulates over :attr:`num_periods`, so a feature sharp
+        on the scale of the drift is averaged away rather than reinforced. At 50 kHz with a
+        300 Hz ramp (166.67 samples per period) a sharp feature loses about 90 % of its
+        contrast over 200 periods, and nothing about the resulting trace says so.
+
+        Warned rather than refused: a slow, smooth QC trace tolerates the drift, and the user
+        may know that. The cure is to pick a ``sampling_frequency`` that is a whole multiple of
+        ``ramp_freq_hz``.
+
+        This uses the *requested* sample rate, which is the one the caller can act on;
+        ``TimeStream.run`` tunes it slightly, so the realised drift differs a little. That
+        tuning is small and cannot rescue a ratio that is far from integral.
+
+        """
+        samples_per_period = self.sampling_frequency / self.ramp_freq_hz
+        drift = abs(samples_per_period - round(samples_per_period))
+        if drift <= 1e-6 * samples_per_period:
+            return
+        warnings.warn(
+            f"sampling_frequency={self.sampling_frequency:g} Hz is not a whole multiple of "
+            f"ramp_freq_hz={self.ramp_freq_hz:g} Hz: one ramp period is "
+            f"{samples_per_period:.4f} samples, so each folded block starts {drift:.4f} "
+            f"samples later than the last and drifts {drift * self.num_periods:.1f} samples "
+            f"({100 * drift * self.num_periods / samples_per_period:.0f} % of a period) over "
+            f"{self.num_periods} periods. Features sharper than that are averaged away, and "
+            "the folded trace gives no sign of it. Pick a sampling_frequency that divides "
+            f"evenly by the ramp rate (e.g. {round(samples_per_period) * self.ramp_freq_hz:g} "
+            "Hz).",
+            stacklevel=3,
+        )
 
     @staticmethod
     def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
@@ -364,14 +408,22 @@ class QCTrace(GateBiasMeasurement):
         slightly, and a period window off by a sample smears the average across blocks instead
         of dropping a leftover.
 
-        :param stream: Time stream to fold. Defaults to :attr:`qc_stream`, this measurement's
-            own acquisition.
+        The number of blocks actually averaged lands on :attr:`num_periods_folded`, which is
+        what the ``sqrt(N)`` noise reduction is over. It is normally :attr:`num_periods` but
+        falls short whenever the record does not divide evenly, so the saved record says what
+        the average was really taken over rather than what was asked for.
+
+        :param stream: Time stream to fold. Must expose ``df`` (the tuned sample rate) and
+            ``signal`` -- i.e. a :class:`~daq.measurements.timestream.TimeStream`. Defaults to
+            :attr:`qc_stream`, this measurement's own acquisition. To fold a bare array, call
+            :func:`~daq.analysis.folding.fold_timestream` directly with an explicit ``fs``.
         :param period_s: Fold on this period in seconds instead of the ramp's.
         :param n_periods: Fold on the record divided into this many periods instead. Mutually
             exclusive with *period_s*.
         :param tone: Which tone to fold; the acquisition is single-tone, so ``0``.
         :raises RuntimeError: If no stream is available -- :meth:`load` restores the folded
             trace but not the raw record, so pass *stream* after loading.
+        :raises TypeError: If *stream* carries no ``df``.
         :raises ValueError: If both *period_s* and *n_periods* are given, or the record is
             too short to hold one period.
         :returns: ``(time_ms, avg_iq)``, as :func:`~daq.analysis.folding.fold_timestream`.
@@ -384,16 +436,33 @@ class QCTrace(GateBiasMeasurement):
                 "No time stream to fold. Run the measurement first, or pass a stream "
                 "reloaded from qc_file: qct.fold(TimeStream.load(qct.qc_file))."
             )
+        # No fallback to the *requested* sampling_frequency. The whole point of folding on
+        # `stream.df` is that the hardware tunes the rate away from what was asked for, so
+        # quietly substituting the untuned value for an input that does not carry one would
+        # reintroduce exactly the smearing this default exists to avoid.
+        fs = getattr(stream, "df", None)
+        if fs is None:
+            raise TypeError(
+                f"fold() needs a time stream carrying its tuned sample rate as .df, got "
+                f"{type(stream).__name__}. For a bare array of samples call "
+                "daq.analysis.fold_timestream(array, fs, period_s=...) directly, with the "
+                "rate the data was actually taken at."
+            )
         if period_s is None and n_periods is None:
             period_s = 1.0 / self.ramp_freq_hz
 
         self.time_ms, self.avg_iq = fold_timestream(
             stream,
-            getattr(stream, "df", self.sampling_frequency),
+            fs,
             period_s=period_s,
             n_periods=n_periods,
             tone=tone,
         )
+        # fold_timestream computes the block count and discards it. Recover it from the window
+        # it produced, so the record carries the averaging actually achieved: the requested
+        # num_periods over-states it whenever the record does not divide evenly.
+        n_samples = np.asarray(stream.signal).shape[0]
+        self.num_periods_folded = int(n_samples // self.avg_iq.shape[1])
         return self.time_ms, self.avg_iq
 
     def save(self, save_filename: Optional[str] = None) -> str:
@@ -446,6 +515,8 @@ class QCTrace(GateBiasMeasurement):
                 self.trigger_states = resolve_trigger_states(h5f["trigger_states"][()])  # type: ignore
 
             self.qc_file = attrs.get("qc_file", None)
+            if "num_periods_folded" in attrs:
+                self.num_periods_folded = int(attrs["num_periods_folded"])  # type: ignore
             for name in ("time_ms", "avg_iq"):
                 if name in h5f:
                     setattr(self, name, h5f[name][()])  # type: ignore

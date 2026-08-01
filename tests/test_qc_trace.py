@@ -229,19 +229,63 @@ check("nothing was acquired before the routing failed", not FakeTimeStream.insta
 
 # 6. The ramp is gated, since a free-running one would not line up with the blocks.
 bias = FakeBias(trigger_port=1)
+bias.output = True
 run_with(make(), bias)
 check("the sawtooth is gated", bias.calls == [("sawtooth", True)], str(bias.calls))
+
+# 7. The gate is never left energised -- on the happy path or on the way out of a failure.
+# A bias left on an unattended device is the one failure here that outlives the session.
+check("a caller-supplied generator is de-energised on success", bias.output is False)
+
+failing = make()
+failing_bias = FakeBias(trigger_port=1)
+failing_bias.output = True
+failing_bias.samples_for_periods = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+try:
+    failing.run(bias=failing_bias)
+    check("an exception mid-run still de-energises the gate", False, "no exception raised")
+except RuntimeError:
+    check("an exception mid-run still de-energises the gate", failing_bias.output is False)
+
+# ---------------------------------------------------------------- drift warning
+
+# A ramp rate that does not divide the sample rate makes every folded block start a fraction of
+# a sample later than the last, and the drift accumulates: the trace comes out smeared with
+# nothing to show for it. Warn at construction, where the caller can still change the numbers.
+with warnings.catch_warnings(record=True) as drift:
+    warnings.simplefilter("always")
+    make(ramp_freq_hz=300.0)  # 50 kHz / 300 Hz = 166.67 samples per period
+check(
+    "a non-integral ramp period warns",
+    any("whole multiple" in str(w.message) for w in drift),
+    str([str(w.message)[:60] for w in drift]),
+)
+with warnings.catch_warnings(record=True) as clean:
+    warnings.simplefilter("always")
+    make(ramp_freq_hz=250.0)  # 200 samples per period, exactly
+check("an integral ramp period does not warn", not clean, str([str(w.message)[:40] for w in clean]))
 
 # ---------------------------------------------------------------- folding
 
 # run() folds on the ramp's own period at the TUNED sample rate. Tune df away from what was
 # asked for: dividing the record by num_periods would then land a sample short of the physical
 # period and smear the average across blocks.
-FakeTimeStream.tuned_df = FS + 100.0
+#
+# The offset has to be big enough to CHANGE the window, or the check cannot fail: at
+# RAMP_HZ = 500, round(50100 / 500) == round(50000 / 500) == 100, so a tune of +100 Hz is
+# indistinguishable from no tuning at all. +300 Hz gives 101 samples against the requested
+# rate's 100, so folding at the wrong rate is caught here.
+FakeTimeStream.tuned_df = FS + 300.0
 qct = make()
 run_with(qct, FakeBias(trigger_port=1))
 FakeTimeStream.tuned_df = FS
 expected = int(round(qct.qc_stream.df / RAMP_HZ))
+requested = int(round(FS / RAMP_HZ))
+check(
+    "the tuned rate is distinguishable from the requested one",
+    expected != requested,
+    f"tuned {expected} vs requested {requested} samples per period",
+)
 check(
     "run() folds one period at the tuned rate",
     qct.avg_iq is not None and qct.avg_iq.shape == (2, expected),
@@ -271,6 +315,25 @@ qct.fold()
 check("fold() returns to the ramp period", qct.avg_iq.shape == (2, expected))
 t_ms, avg = qct.fold(qct.qc_stream)
 check("fold() accepts an explicit stream", avg.shape == (2, expected) and t_ms.shape[0] == expected)
+
+# A bare array carries no tuned rate. Silently substituting the *requested* sampling_frequency
+# would fold at the wrong rate -- exactly what folding on stream.df exists to prevent -- so this
+# must raise rather than guess.
+try:
+    qct.fold(np.zeros(4096, dtype=complex))
+    check("fold() refuses an array with no tuned rate", False, "folded anyway")
+except TypeError as exc:
+    check("fold() refuses an array with no tuned rate", "tuned sample rate" in str(exc))
+
+# The blocks actually averaged, not the blocks requested: the sqrt(N) noise gain is over the
+# former, and nothing else in the saved record reveals the difference.
+qct.fold()
+n_samples = qct.qc_stream.signal.shape[0]
+check(
+    "num_periods_folded counts the blocks actually averaged",
+    qct.num_periods_folded == n_samples // expected,
+    f"{qct.num_periods_folded} vs {n_samples // expected} (requested {N_PERIODS})",
+)
 
 for kwargs in ({"period_s": 1e-3, "n_periods": 5},):
     try:
