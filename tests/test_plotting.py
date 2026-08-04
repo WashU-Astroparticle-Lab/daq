@@ -60,6 +60,12 @@ _spec.loader.exec_module(plotting)
 _readout_env = plotting._readout_env
 _to_basis = plotting._to_basis
 
+_nspec = importlib.util.spec_from_file_location(f"{_PKG}.noise", _ANALYSIS_DIR / "noise.py")
+noise = importlib.util.module_from_spec(_nspec)
+sys.modules[_nspec.name] = noise
+_nspec.loader.exec_module(noise)
+from_elec_to_reson = noise.from_elec_to_reson
+
 
 # ------------------------------------------------- synthetic notch resonator
 
@@ -216,6 +222,129 @@ try:
     check("a non-positive readout_freq raises", False)
 except ValueError:
     check("a non-positive readout_freq raises", True)
+
+
+# ------------------------------------------------- 8. from_elec_to_reson, the other consumer
+
+
+class FakeSweep:
+    """The attributes ``from_elec_to_reson`` reads off a fitted Sweep."""
+
+    freq_arr = FREQ_ARR
+    resp_arr = s21_raw(FREQ_ARR)
+    fit_results = dict(FIT, Qc_dia_corr=ABSQC, Qi_dia_corr=2.0e4)
+
+
+SW = FakeSweep()
+
+
+def reson(ts, readout_freq):
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        return from_elec_to_reson(ts, SW, readout_freq)
+
+
+ts_det = s21_raw(FR + 300e3)
+tsz_good, _, _ = reson(ts_det, FR + 300e3)
+check(
+    "from_elec_to_reson lands on the ring with readout_freq",
+    off_ring(tsz_good) < 1e-9,
+    f"off by {off_ring(tsz_good):.1e} radii",
+)
+check(
+    "from_elec_to_reson agrees with plot_iq_comparison's projection",
+    np.allclose(tsz_good, to_resonator(ts_det, FR + 300e3)),
+    "the two consumers now share one implementation",
+)
+
+# ------------------------------------------------- 9. omitting it mixes dissipation into frequency
+
+# Fluctuations placed purely along the *frequency* (arc / imaginary) axis. Under the wrong
+# normalization the tsz plane is rotated by theta, mixing the two axes. The leak is NOT
+# symmetric: rad = Re/q but arc = Im/(-2q), so rad_bad = cos(theta)*rad - 2*sin(theta)*arc and
+# the dissipation channel picks up 4*sin^2(theta) of the frequency channel's power, while the
+# frequency channel picks up only sin^2(theta)/4 of the dissipation channel's. Second order in
+# theta, but multiplied by the ratio of the two -- which is the whole point of separating them.
+THETA = 2 * np.pi * 300e3 * TAU
+rng = np.random.default_rng(0)
+base = s21_raw(FR + 300e3)[0]
+env_at = float(A)  # |env| is flat in frequency; only its phase moves
+# Build a cloud whose resonator-basis fluctuation is purely imaginary.
+pure_arc = np.exp(1j * PHI0) * 1j * rng.normal(scale=1e-3, size=20_000)
+ts_cloud = (base / env_true(FR + 300e3)[0] + pure_arc) * env_true(FR + 300e3)[0]
+
+_, rad_good, arc_good = reson(ts_cloud, FR + 300e3)
+_, rad_bad, arc_bad = reson(ts_cloud, None)
+
+leak = np.var(rad_bad - rad_bad.mean()) / np.var(arc_good - arc_good.mean())
+check(
+    "omitting readout_freq leaks frequency noise into dissipation as 4*sin^2(theta)",
+    np.isclose(leak, 4 * np.sin(THETA) ** 2, rtol=0.05),
+    f"leak {leak:.3e} vs 4sin^2(theta) {4 * np.sin(THETA) ** 2:.3e} "
+    f"(theta = {np.degrees(THETA):.2f} deg)",
+)
+# The reverse direction, to pin the asymmetry rather than just one side of it.
+pure_rad = np.exp(1j * PHI0) * rng.normal(scale=1e-3, size=20_000)
+ts_rad = (base / env_true(FR + 300e3)[0] + pure_rad) * env_true(FR + 300e3)[0]
+_, rr_good, aa_good = reson(ts_rad, FR + 300e3)
+_, rr_bad, aa_bad = reson(ts_rad, None)
+leak_rev = np.var(aa_bad - aa_bad.mean()) / np.var(rr_good - rr_good.mean())
+check(
+    "the reverse leak is sin^2(theta)/4 -- the mixing is asymmetric",
+    np.isclose(leak_rev, np.sin(THETA) ** 2 / 4, rtol=0.05),
+    f"leak {leak_rev:.3e} vs sin^2(theta)/4 {np.sin(THETA) ** 2 / 4:.3e}, "
+    f"a factor {leak / leak_rev:.0f} apart",
+)
+check(
+    "the true dissipation axis carried no power to begin with",
+    np.var(rad_good - rad_good.mean()) < 1e-12 * np.var(arc_good - arc_good.mean()),
+    "so the leak above is entirely the mis-normalization",
+)
+
+# ------------------------------------------------- 10. plot_iq_comparison wires it to ts AND qc
+
+try:
+    import matplotlib
+
+    matplotlib.use("Agg")
+except ImportError:
+    check(
+        "plot_iq_comparison passes the readout term to both ts and qc", True, "SKIP: no matplotlib"
+    )
+else:
+    calls = []
+    real_to_basis = plotting._to_basis
+
+    def spy(z, env, phi0, basis):
+        calls.append(np.asarray(env))
+        return real_to_basis(z, env, phi0, basis)
+
+    class FakePort:
+        fitresults = SW.fit_results
+        z_data_sim = s21_raw(FREQ_ARR) / env_true(FREQ_ARR)
+
+    resonator_mod = sys.modules[f"{_PKG}.resonator"]
+    real_fit_notch = getattr(resonator_mod, "fit_notch", None)
+    plotting._to_basis = spy
+    resonator_mod.fit_notch = lambda *a, **k: FakePort()
+    try:
+        plotting.plot_iq_comparison(
+            ts_det, SW, qc=ts_det, basis="resonator", readout_freq=FR + 300e3
+        )
+    finally:
+        plotting._to_basis = real_to_basis
+        if real_fit_notch is not None:
+            resonator_mod.fit_notch = real_fit_notch
+
+    expected = _readout_env(SW.fit_results, FREQ_ARR, FR + 300e3, "resonator")
+    check(
+        "plot_iq_comparison passes the readout term to both ts and qc",
+        len(calls) == 3
+        and calls[0].size == FREQ_ARR.size  # sweep trace: the full array
+        and np.isclose(calls[1], expected)  # cloud: the scalar at f_ro
+        and np.isclose(calls[2], expected),  # QC points: the same scalar
+        f"{len(calls)} projections: array for the trace, f_ro scalar for ts and qc",
+    )
 
 
 print(f"\n{sum(results)}/{len(results)} checks passed")
