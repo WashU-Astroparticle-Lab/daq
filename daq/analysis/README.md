@@ -7,6 +7,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Resonator fitting](#resonator-fitting)
 - [Noise PSD](#noise-psd)
 - [Parity PSD fit (random-telegraph model)](#parity-psd-fit-random-telegraph-model)
+- [Plotting a PSD](#plotting-a-psd)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
 - [Folding a periodically-driven time stream (QC trace)](#folding-a-periodically-driven-time-stream-qc-trace)
@@ -98,10 +99,19 @@ The `nperseg`, `noverlap`, `window`, and `detrend` parameters are only used when
 
 ### Plotting the PSD
 
+`plot_psd` draws it on log-log axes and fits it in one call — see [Plotting a PSD](#plotting-a-psd):
+
 ```python
-import matplotlib.pyplot as plt
+from daq.analysis import plot_psd
 
 f, psd = compute_psd(signal, fs)
+axes, fits = plot_psd(f, psd, labels=("|S|", ""), units="V$^2$/Hz", f_bw=fs)
+```
+
+By hand, if you want the axes to yourself:
+
+```python
+import matplotlib.pyplot as plt
 
 plt.figure()
 plt.loglog(f[1:], psd[1:])  # skip DC bin
@@ -193,6 +203,8 @@ for ch, r in enumerate(results):
 
 ### Plotting the fit
 
+`plot_psd` does the fit and the overlay together, including the y-framing described below — see [Plotting a PSD](#plotting-a-psd). By hand:
+
 ```python
 import matplotlib.pyplot as plt
 
@@ -261,6 +273,44 @@ for ch, r in enumerate(results):
 
 ---
 
+## Plotting a PSD
+
+`plot_psd` is the drawing half of everything above: it takes the `(f, psd_a, psd_b)` that `averaged_psd_timestream`, `averaged_psd_cleaned` or a hand-rolled `compute_psd` produce, draws them on log-log axes, and fits each panel with `fit_parity_psd`.
+
+The two channels mean different things in different bases, and `basis` is what names them:
+
+| `basis` | `psd_a` | `psd_b` | units |
+|---|---|---|---|
+| `"resonator"` (default) | dissipation (radial) | frequency (arc-length) | `1/Hz` |
+| `"electronic"` | I (real) | Q (imaginary) | `FS²/Hz` |
+
+```python
+from daq.analysis import averaged_psd_timestream, plot_psd
+
+f, psd_diss, psd_freq, streams = averaged_psd_timestream(..., sweeps=sweeps)
+
+axes, fits = plot_psd(
+    f, psd_diss, psd_freq,
+    basis="resonator",
+    f_bw=streams[0].df,        # the *tuned* rate, not the requested one
+    fit_onef=True,             # forwarded to fit_parity_psd, for both panels
+    title="Averaged noise, resonator basis",
+)
+print(fits["b"]["gamma_p"])    # keyed "a" / "b"; here "b" is the frequency channel
+```
+
+Three things it does that a hand-rolled `loglog` does not:
+
+- **Each panel is fit from its own array.** Nothing is read off a measurement object — a stored `fit_results` describes only whichever single channel was last computed, so overlaying it on both panels compares a spectrum against a model of a different spectrum.
+- **It frames the y-axis on the log-binned points**, not the raw periodogram. A bare periodogram scatters over ten decades, and framing on it flattens everything of interest into a line so that a good fit reads as a bad one.
+- **A failed fit costs the fit, not the spectrum.** The panel is drawn and labelled, and that channel's entry in `fits` is `None`.
+
+Pass `labels` / `units` for a projection that is neither basis (`BiasHunt`'s magnitude spectrum, say), a 2-D array for one PSD per row (one row per tone), `psd_b=None` for a single panel, `f_bw` to hold the sampling bandwidth at the tuned rate, and `ax` to draw into axes you already have. `fits` follows `fit_parity_psd`'s own convention: a dict for 1-D input, a list of dicts for 2-D.
+
+Note `f_bw` defaults to `2 * f[-1]`, which is exact to within one frequency bin — it only sets the height of the white floor, so the inference is harmless, but pass the stream's `df` when you have it.
+
+---
+
 ## Averaged PSD from repeated TimeStreams
 
 `averaged_psd_timestream` wraps `TimeStream` for the common "take data, then show averaged PSD" workflow. It builds a multi-tone `TimeStream` with the configuration you provide, runs it `num_averages` times (e.g. 100), computes a per-tone PSD for every acquisition, and returns the PSDs averaged across acquisitions. Averaging is done as a running mean, so the raw time streams are not all held in memory at once. Each `run()` still writes its own HDF5 file and MongoDB document, just like running the measurement by hand.
@@ -300,7 +350,15 @@ f, psd_diss, psd_freq, streams = averaged_psd_timestream(
 # psd_diss.shape == psd_freq.shape == (len(frs), len(f))
 ```
 
-Plot the averaged dissipation and frequency PSDs per tone:
+Plot the averaged dissipation and frequency PSDs per tone with [`plot_psd`](#plotting-a-psd), which takes the 2-D arrays directly (one row per tone) and fits each row:
+
+```python
+from daq.analysis import plot_psd
+
+axes, fits = plot_psd(f, psd_diss, psd_freq, basis="resonator", f_bw=streams[0].df)
+```
+
+By hand, without the fits:
 
 ```python
 import matplotlib.pyplot as plt

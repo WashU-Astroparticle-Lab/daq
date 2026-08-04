@@ -23,7 +23,7 @@ from .mattis_bardeen import (
     MB_fitter,
 )
 from .folding import fold_timestream
-from .plotting import plot_iq_comparison, plot_qc_trace
+from .plotting import plot_iq_comparison, plot_psd, plot_qc_trace
 from .resonator import (
     ResonatorFitError,
     environmental_term,
@@ -46,6 +46,7 @@ __all__ = [
     "parity_psd_model",
     "remove_correlated_noise",
     "plot_iq_comparison",
+    "plot_psd",
     "plot_qc_trace",
     "signed_log10",
     "n_qp",

@@ -347,5 +347,139 @@ else:
     )
 
 
+# ------------------------------------------------- plot_psd: labels, panels, per-panel fits
+#
+# plot_psd exists because the two PSD channels mean different things in different bases
+# (dissipation/frequency against I/Q), and because a fit drawn over a panel must come from
+# that panel's own array. Reading a stored fit off a measurement object is what these checks
+# rule out: it describes whichever single channel was last computed, so overlaying it on both
+# panels compares a spectrum against a model of a different spectrum.
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt  # noqa: E402
+
+F_BW_PSD = 5000.0
+F_PSD = np.arange(0.0, 2501.0)  # includes the f = 0 bin, which the plot must drop
+GAMMA_A, GAMMA_B = 50.0, 500.0
+PSD_A = noise.parity_psd_model(F_PSD, fidelity=0.9, gamma_p=GAMMA_A, f_bw=F_BW_PSD)
+PSD_B = noise.parity_psd_model(F_PSD, fidelity=0.9, gamma_p=GAMMA_B, f_bw=F_BW_PSD)
+
+try:
+    import iminuit  # noqa: F401
+
+    _HAVE_IMINUIT = True
+except ImportError:  # pragma: no cover - depends on the workstation
+    _HAVE_IMINUIT = False
+    print("SKIP  plot_psd fit checks (iminuit not installed)")
+
+axes, fits = plotting.plot_psd(F_PSD, PSD_A, PSD_B, basis="resonator", f_bw=F_BW_PSD, fit=False)
+check(
+    "plot_psd labels the resonator basis dissipation / frequency",
+    [a.get_ylabel() for a in axes] == ["Dissipation PSD [1/Hz]", "Frequency PSD [1/Hz]"],
+    f"{[a.get_ylabel() for a in axes]}",
+)
+check(
+    "plot_psd drops the f = 0 bin, which no log axis can show",
+    all(np.min(line.get_xdata()) > 0 for a in axes for line in a.get_lines()),
+)
+check("plot_psd with fit=False returns no fits", fits == {"a": None, "b": None})
+plt.close("all")
+
+axes, _ = plotting.plot_psd(F_PSD, PSD_A, PSD_B, basis="electronic", f_bw=F_BW_PSD, fit=False)
+check(
+    "plot_psd labels the electronic basis I / Q",
+    [a.get_ylabel() for a in axes] == ["I PSD [FS$^2$/Hz]", "Q PSD [FS$^2$/Hz]"],
+    f"{[a.get_ylabel() for a in axes]}",
+)
+plt.close("all")
+
+axes, _ = plotting.plot_psd(
+    F_PSD, PSD_A, PSD_B, labels=("|S|", "phase"), units="a.u.$^2$/Hz", f_bw=F_BW_PSD, fit=False
+)
+check(
+    "plot_psd honours a labels / units override",
+    [a.get_ylabel() for a in axes] == ["|S| PSD [a.u.$^2$/Hz]", "phase PSD [a.u.$^2$/Hz]"],
+)
+plt.close("all")
+
+axes, fits = plotting.plot_psd(F_PSD, PSD_A, None, f_bw=F_BW_PSD, fit=False)
+check("plot_psd draws one panel when psd_b is None", len(axes) == 1 and fits["b"] is None)
+plt.close("all")
+
+if _HAVE_IMINUIT:
+    axes, fits = plotting.plot_psd(F_PSD, PSD_A, PSD_B, f_bw=F_BW_PSD)
+    check(
+        "plot_psd fits each panel from its own array",
+        np.isclose(fits["a"]["gamma_p"], GAMMA_A, rtol=0.05)
+        and np.isclose(fits["b"]["gamma_p"], GAMMA_B, rtol=0.05),
+        f"gamma_p = {fits['a']['gamma_p']:.1f} / {fits['b']['gamma_p']:.1f} Hz "
+        f"against {GAMMA_A} / {GAMMA_B}",
+    )
+    # The load-bearing property: the panel's fit is what fitting that panel's array gives.
+    # A fit lifted off a measurement object would pass none of this.
+    direct = noise.fit_parity_psd(F_PSD, PSD_B, f_bw=F_BW_PSD)
+    check(
+        "plot_psd's panel fit equals a direct fit of the same array",
+        np.isclose(fits["b"]["gamma_p"], direct["gamma_p"], rtol=1e-9),
+        f"{fits['b']['gamma_p']:.6f} against {direct['gamma_p']:.6f}",
+    )
+    check(
+        "plot_psd frames the y-axis on the binned points, not the raw scatter",
+        all(
+            np.isclose(a.get_ylim()[0], np.min(r["psd_binned"]) / 30.0)
+            for a, r in zip(axes, (fits["a"], fits["b"]))
+        ),
+    )
+    plt.close("all")
+
+    # f_bw only sets the white floor; inferring it as 2 * f[-1] is one bin off at most.
+    _, fits_inferred = plotting.plot_psd(F_PSD, PSD_A, None)
+    check(
+        "plot_psd infers f_bw from the frequency axis",
+        np.isclose(fits_inferred["a"]["gamma_p"], fits["a"]["gamma_p"], rtol=1e-3),
+    )
+    plt.close("all")
+
+    # 2-D input: one PSD per row, and fit_parity_psd's own dict/list convention is kept.
+    stacked = np.vstack([PSD_A, PSD_B])
+    _, fits_2d = plotting.plot_psd(F_PSD, stacked, None, f_bw=F_BW_PSD)
+    check(
+        "plot_psd fits a 2-D channel row by row",
+        isinstance(fits_2d["a"], list)
+        and len(fits_2d["a"]) == 2
+        and np.isclose(fits_2d["a"][0]["gamma_p"], GAMMA_A, rtol=0.05)
+        and np.isclose(fits_2d["a"][1]["gamma_p"], GAMMA_B, rtol=0.05),
+    )
+    plt.close("all")
+
+    # A fit that raises must not cost the spectrum.
+    real_fit = noise.fit_parity_psd
+    noise.fit_parity_psd = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom"))
+    try:
+        axes_bad, fits_bad = plotting.plot_psd(F_PSD, PSD_A, None, f_bw=F_BW_PSD)
+    finally:
+        noise.fit_parity_psd = real_fit
+    check(
+        "plot_psd survives a failed fit and still draws the spectrum",
+        fits_bad["a"] is None and len(axes_bad[0].get_lines()) >= 1,
+    )
+    plt.close("all")
+
+# Validation: every one of these is a silent-wrong-plot if it slips through.
+for label, kwargs in (
+    ("both channels None", dict(psd_a=None, psd_b=None)),
+    ("an unknown basis", dict(psd_a=PSD_A, basis="fractional")),
+    ("a PSD whose length differs from f", dict(psd_a=PSD_A[:-1])),
+    ("the wrong number of axes in ax", dict(psd_a=PSD_A, psd_b=PSD_B, ax=(plt.subplots()[1],))),
+):
+    try:
+        plotting.plot_psd(F_PSD, fit=False, **kwargs)
+        check(f"plot_psd rejects {label}", False)
+    except ValueError:
+        check(f"plot_psd rejects {label}", True)
+    plt.close("all")
+
 print(f"\n{sum(results)}/{len(results)} checks passed")
 sys.exit(0 if all(results) else 1)
