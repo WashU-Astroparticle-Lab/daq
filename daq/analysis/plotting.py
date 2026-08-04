@@ -3,7 +3,8 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Literal, Optional, Tuple
+import warnings
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -27,8 +28,9 @@ def _to_basis(
     :param z: Complex response to transform (sweep trace, time-stream, or a
         single calibration point).
     :param env: Environmental term evaluated at the same frequencies as *z* --
-        the full array for the sweep trace, or the scalar value at ``fr`` for a
-        time-stream taken on resonance.
+        the full array for the sweep trace, or the scalar value at the single
+        frequency a time stream or a set of QC points was acquired at. See
+        :func:`_readout_env` for why that frequency, and not ``fr``.
     :param phi0: Impedance-mismatch rotation angle from the resonator fit.
     :param basis: One of ``"electronic"`` (raw I/Q), ``"fractional"``
         (environment removed), or ``"resonator"`` (recentred on the resonance
@@ -42,6 +44,84 @@ def _to_basis(
     if basis == "resonator":
         return (z / env - 1) / np.exp(1j * phi0) + 1
     raise ValueError(f"basis must be one of 'electronic', 'fractional', 'resonator'; got {basis!r}")
+
+
+def _readout_env(
+    fit: Dict[str, Any],
+    freq_arr: npt.NDArray[np.floating],
+    readout_freq: Optional[float],
+    basis: Basis,
+) -> complex:
+    """Return the environmental term at the frequency a single-frequency dataset was taken at.
+
+    The sweep trace is normalized point by point, each frequency by its own environmental
+    term. A time stream and its folded QC points are all at *one* frequency, so they need
+    that term evaluated **there**.
+
+    Evaluating it at ``fr`` instead is not a harmless approximation, because the term carries
+    the cable delay, ``env(f) = a e^{i alpha} e^{-2 pi i f tau}``. Dividing data taken at
+    ``f_ro`` by ``env(fr)`` leaves ``S21 * exp(-2 pi i (f_ro - fr) tau)``: a rigid rotation of
+    the cloud about the origin, which moves it **off** the fitted circle rather than along it.
+    Since the subsequent resonator-basis map is an isometry, the displacement survives at
+    roughly ``2 pi (f_ro - fr) tau``, to be compared against the circle's radius
+    ``Ql / (2 |Qc|)``. On a shallow dip that ratio easily exceeds one and the cloud lands
+    nowhere near the ring, which reads as a broken measurement rather than a mis-normalization.
+
+    The term is rebuilt analytically from the fit's own scalars rather than interpolated out
+    of ``environmental_term``, so it is exact and stays valid for a *f_ro* outside the swept
+    span. This is the same construction :func:`~daq.analysis.resonator.fit_notch` uses to
+    build that array, so the two are consistent by definition.
+
+    :param fit: A :func:`~daq.analysis.resonator.fit_notch` ``fitresults`` mapping.
+    :param freq_arr: The sweep frequencies, used only for the on-resonance fallback.
+    :param readout_freq: Frequency in hertz the single-frequency data was acquired at.
+        ``None`` falls back to ``fr``, i.e. assumes the data was taken on resonance.
+    :param basis: The display basis, so the fallback stays quiet where it cannot matter.
+    :raises ValueError: If *readout_freq* is not positive.
+    :returns: The complex environmental term to divide the single-frequency data by.
+
+    """
+    from .resonator import environmental_term
+
+    fr = float(fit["fr"])
+
+    if readout_freq is None:
+        # Only worth warning about where the term is actually divided out: the electronic
+        # basis returns the raw data untouched, so the choice cannot affect the plot.
+        if basis != "electronic":
+            tau = float(fit["environmental_delay"])
+            dip = float(fit["Ql"]) / float(fit["absQc"])
+            sensitivity = (
+                f" For this fit (tau = {tau * 1e9:.1f} ns, dip depth Ql/|Qc| = {dip:.3f}) "
+                f"that is {4 * np.pi * 1e5 * tau / dip:.2f} ring radii per 100 kHz of "
+                "detuning."
+                if dip > 0
+                else ""
+            )
+            warnings.warn(
+                "plot_iq_comparison is normalizing the time stream (and any QC points) by "
+                f"the environmental term at fr = {fr / 1e9:.6f} GHz, which assumes they were "
+                "acquired on resonance. Pass readout_freq=<acquisition frequency in Hz> to "
+                "normalize at the frequency actually used. Data taken off resonance instead "
+                "keeps an uncorrected cable-delay phase 2*pi*(f_ro - fr)*tau, which rotates "
+                "the cloud about the origin and off the fitted circle rather than along it."
+                + sensitivity,
+                stacklevel=3,
+            )
+        env = np.asarray(fit["environmental_term"])
+        return complex(env[int(np.argmin(np.abs(np.asarray(freq_arr) - fr)))])
+
+    if readout_freq <= 0:
+        raise ValueError(f"readout_freq must be positive, got {readout_freq}")
+
+    return complex(
+        environmental_term(
+            np.array([float(readout_freq)]),
+            fit["environmental_amp_norm"],
+            fit["environmental_alpha"],
+            fit["environmental_delay"],
+        )[0]
+    )
 
 
 def _add_kde_contours(
@@ -188,6 +268,7 @@ def plot_iq_comparison(
     qc: Optional[npt.NDArray[np.complexfloating]] = None,
     *,
     basis: Basis = "electronic",
+    readout_freq: Optional[float] = None,
     freq_shift: Optional[float] = None,
     density: Density = "scatter",
     fcrop: Optional[Tuple[float, float]] = None,
@@ -220,15 +301,28 @@ def plot_iq_comparison(
     fit.
 
     :param ts: Complex time-stream data in the electronic (raw I/Q) basis. Any
-        shape; it is flattened for the density plot.
+        shape; it is flattened for the density plot. Taken at a single
+        frequency -- pass it as *readout_freq* whenever it is not ``fr``.
     :param sw: A :class:`~daq.measurements.sweep.Sweep` that has been run,
         providing populated ``freq_arr`` and ``resp_arr``. The resonator fit is
         performed internally, so ``sw`` need not be fitted beforehand.
     :param qc: Optional complex "QC trace" calibration points (electronic
-        basis) drawn as red circles. Skipped when ``None``.
+        basis) drawn as red circles. Skipped when ``None``. Assumed to come
+        from the same acquisition as *ts*, hence the same *readout_freq*.
     :param basis: Display basis passed to :func:`_to_basis`. One of
         ``"electronic"``, ``"fractional"``, ``"resonator"``. Defaults to
         ``"electronic"``.
+    :param readout_freq: Frequency in hertz that *ts* and *qc* were acquired
+        at -- ``TimeStream.lo_freq`` for a zero-IF stream, or
+        ``QCTrace.readout_freq``. Used to evaluate the environmental term at
+        that frequency rather than at ``fr``, which is what keeps the cloud on
+        the fitted circle: the term carries the cable delay, so normalizing
+        off-resonance data at ``fr`` leaves a phase ``2*pi*(f_ro - fr)*tau``
+        that rotates the cloud about the origin. The displacement is about
+        ``2*pi*(f_ro - fr)*tau`` against a circle of radius ``Ql/(2|Qc|)``, so
+        on a shallow dip a few hundred kHz of detuning is enough to put the
+        cloud entirely off the ring. ``None`` (the default) assumes the data
+        was taken on resonance and warns in the normalizing bases.
     :param freq_shift: Detuning in Hz for the ``fr ± freq_shift`` marker
         diamonds. Defaults to ``400e3``. When ``None``, these markers are not
         drawn.
@@ -265,8 +359,9 @@ def plot_iq_comparison(
     :param show: When ``True``, call :func:`matplotlib.pyplot.show`. Defaults to
         ``False``.
     :returns: The matplotlib axis the data was drawn on.
-    :raises ValueError: If *basis* or *density* is not recognised, or *sw* has
-        no ``freq_arr``/``resp_arr`` (i.e. has not been run).
+    :raises ValueError: If *basis* or *density* is not recognised, *readout_freq*
+        is not positive, or *sw* has no ``freq_arr``/``resp_arr`` (i.e. has not
+        been run).
     """
     import matplotlib.pyplot as plt
 
@@ -298,12 +393,16 @@ def plot_iq_comparison(
     phi0 = fit["phi0"]
     fr = fit["fr"]
     fr_idx = int(np.argmin(np.abs(freq_arr - fr)))
-    env_fr = env[fr_idx]
+
+    # The sweep trace spans frequencies and is normalized point by point; the time stream and
+    # the QC points sit at one frequency and are normalized by the term evaluated there. See
+    # _readout_env for why using fr for the latter throws the cloud off the circle.
+    env_ro = _readout_env(fit, freq_arr, readout_freq, basis)
 
     # --- Project everything into the requested basis ---
     swz = _to_basis(np.asarray(port.z_data_sim), env, phi0, basis)
-    tsz = _to_basis(np.asarray(ts), env_fr, phi0, basis)
-    qcz = None if qc is None else _to_basis(np.asarray(qc), env_fr, phi0, basis)
+    tsz = _to_basis(np.asarray(ts), env_ro, phi0, basis)
+    qcz = None if qc is None else _to_basis(np.asarray(qc), env_ro, phi0, basis)
 
     if ax is None:
         _, ax = plt.subplots(figsize=(4, 3))
