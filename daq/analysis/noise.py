@@ -589,7 +589,11 @@ def fit_parity_psd(
     return fit_results
 
 
-def from_elec_to_reson(ts: npt.NDArray[np.complexfloating], sw: Sweep) -> tuple[
+def from_elec_to_reson(
+    ts: npt.NDArray[np.complexfloating],
+    sw: Sweep,
+    readout_freq: Optional[float] = None,
+) -> tuple[
     npt.NDArray[np.complexfloating],
     npt.NDArray[np.floating],
     npt.NDArray[np.floating],
@@ -599,18 +603,52 @@ def from_elec_to_reson(ts: npt.NDArray[np.complexfloating], sw: Sweep) -> tuple[
     Uses the fitted sweep parameters to remove environmental effects and
     project the complex time-stream onto the resonator coordinate system.
 
+    The sweep spans frequencies and is normalized point by point; *ts* sits at a **single**
+    frequency and needs the environmental term evaluated there, which is what *readout_freq*
+    supplies. The term carries the cable delay, so normalizing data taken at ``f_ro`` by
+    ``env(fr)`` leaves a rigid rotation by ``theta = 2*pi*(f_ro - fr)*tau``.
+
+    Here that rotation **mixes the two returned axes**, and not symmetrically. Because
+    ``rad = Re(tsz)/q`` while ``arc = Im(tsz)/(-2q)``, rotating the fluctuation vectors gives
+
+    .. code-block:: text
+
+        rad_bad = cos(theta) * rad  -  2 * sin(theta) * arc
+        arc_bad = cos(theta) * arc  +  sin(theta) / 2 * rad
+
+    so the **dissipation** channel picks up ``4 sin^2(theta)`` of the frequency channel's
+    power while the frequency channel picks up only ``sin^2(theta)/4`` of the dissipation
+    channel's -- a factor of 16 apart. Both are second order in ``theta``, but each is
+    multiplied by the *ratio* of the two noise powers, and the point of splitting them is
+    usually that one dominates. With frequency noise 20 dB above dissipation noise, a
+    ``theta`` of 0.094 rad (300 kHz at ``tau`` = 50 ns) contaminates the dissipation PSD with
+    ``4 sin^2(theta) * 100 ~ 3.5`` times its own power -- i.e. it reads about 4.5x high. Pass
+    *readout_freq* whenever the stream is not on resonance.
+
     :param ts: Complex time-stream data (USB output of a :class:`TimeStream`
         measurement).
     :param sw: A :class:`~daq.measurements.sweep.Sweep` instance whose
         ``fit_results`` provide the calibration parameters.
+    :param readout_freq: Frequency in hertz *ts* was acquired at --
+        ``TimeStream.signal_freqs[i]`` for tone *i* (``lo_freq`` only when that tone's IF is
+        zero). ``None`` (the default) assumes the stream was taken on resonance and warns.
+    :raises ValueError: If *readout_freq* is not positive and finite.
     :returns: ``(tsz, rad, arc)`` where *tsz* is the complex resonator-basis
         coordinate, *rad* is the dissipation (radial) response, and *arc* is
         the frequency (arc-length) response.
     """
-    fr_fit_idx = np.argmin(np.abs(sw.freq_arr - sw.fit_results["fr"]))
-    tsz = (ts / sw.fit_results["environmental_term"][fr_fit_idx] - 1) / np.exp(
-        1j * sw.fit_results["phi0"]
-    ) + 1
+    from .resonator import readout_environmental_term
+
+    env_ro = readout_environmental_term(
+        sw.fit_results,
+        readout_freq,
+        freq_arr=np.asarray(sw.freq_arr),
+        caller="from_elec_to_reson",
+        remedy="Pass readout_freq=<acquisition frequency in Hz>",
+        # from_elec_to_reson -> readout_environmental_term -> warn.
+        stacklevel=3,
+    )
+    tsz = (ts / env_ro - 1) / np.exp(1j * sw.fit_results["phi0"]) + 1
 
     q_ratio = sw.fit_results["Qc_dia_corr"] ** 2 / sw.fit_results["Qi_dia_corr"]
     rad = tsz.real / q_ratio
@@ -883,7 +921,12 @@ def averaged_psd_timestream(
             rad_rows = []
             arc_rows = []
             for ch in range(n_tones):
-                _, rad, arc = from_elec_to_reson(ts.signal[:, ch], sweeps[ch])
+                # The stream knows each tone's physical frequency, so there is nothing for a
+                # caller to get wrong here: signal_freqs already accounts for the per-tone
+                # sideband choice, and equals lo_freq only when that tone's IF is zero.
+                _, rad, arc = from_elec_to_reson(
+                    ts.signal[:, ch], sweeps[ch], float(ts.signal_freqs[ch])
+                )
                 rad_rows.append(rad)
                 arc_rows.append(arc)
             a = np.asarray(rad_rows)
@@ -1077,6 +1120,7 @@ def averaged_psd_cleaned(
     noverlap: Optional[int] = None,
     window: str = "hann",
     detrend: str | bool = "constant",
+    readout_freqs: Optional[Sequence[float]] = None,
 ) -> tuple[
     npt.NDArray[np.floating],
     npt.NDArray[np.floating],
@@ -1106,6 +1150,13 @@ def averaged_psd_cleaned(
     :param sweeps: Optional sequence of fitted :class:`Sweep` objects, one per signal
         tone. When given, PSDs are in the resonator (dissipation / frequency) basis;
         otherwise the raw I / Q PSDs are returned.
+    :param readout_freqs: Frequencies in hertz the signal tones were acquired at, one per
+        signal tone, aligned with the last axis of *cleaned*. This is exactly the ``freqs``
+        :func:`clean_correlated_streams` already returns alongside *cleaned*, so the usual
+        call passes it straight through. Used only with *sweeps*, to normalize each tone by
+        the environmental term at its own frequency rather than at ``fr`` -- which otherwise
+        mixes the dissipation and frequency axes (see :func:`from_elec_to_reson`). ``None``
+        assumes every tone sat on its resonance and warns.
     :param welch: Forwarded to :func:`compute_psd` (Welch's method when ``True``).
     :param nperseg: Forwarded to :func:`compute_psd` (Welch only).
     :param noverlap: Forwarded to :func:`compute_psd` (Welch only).
@@ -1132,6 +1183,13 @@ def averaged_psd_cleaned(
         raise ValueError(
             f"sweeps must provide one Sweep per signal tone ({len(sweeps)} != {n_signal})"
         )
+    if readout_freqs is not None and len(readout_freqs) != n_signal:
+        # A short or misaligned list would silently normalize tones at each other's
+        # frequencies, which is the very error this argument exists to prevent.
+        raise ValueError(
+            "readout_freqs must provide one frequency per signal tone "
+            f"({len(readout_freqs)} != {n_signal})"
+        )
 
     f: Optional[npt.NDArray[np.floating]] = None
     psd_a_sum: Optional[npt.NDArray[np.floating]] = None
@@ -1142,7 +1200,11 @@ def averaged_psd_cleaned(
             rad_rows = []
             arc_rows = []
             for ch in range(n_signal):
-                _, rad, arc = from_elec_to_reson(cleaned[t, :, ch], sweeps[ch])
+                _, rad, arc = from_elec_to_reson(
+                    cleaned[t, :, ch],
+                    sweeps[ch],
+                    None if readout_freqs is None else float(readout_freqs[ch]),
+                )
                 rad_rows.append(rad)
                 arc_rows.append(arc)
             a = np.asarray(rad_rows)

@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import warnings
 from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, Tuple
 
 import numpy as np
@@ -52,75 +51,41 @@ def _readout_env(
     readout_freq: Optional[float],
     basis: Basis,
 ) -> complex:
-    """Return the environmental term at the frequency a single-frequency dataset was taken at.
+    """Return the environmental term at the frequency the cloud and QC points were taken at.
+
+    Thin adapter over :func:`~daq.analysis.resonator.readout_environmental_term`, which owns
+    the reasoning and the fallback warning. Kept as a separate function only to bind this
+    plot's vocabulary (a display *basis*) to that general one.
 
     The sweep trace is normalized point by point, each frequency by its own environmental
-    term. A time stream and its folded QC points are all at *one* frequency, so they need
-    that term evaluated **there**.
-
-    Evaluating it at ``fr`` instead is not a harmless approximation, because the term carries
-    the cable delay, ``env(f) = a e^{i alpha} e^{-2 pi i f tau}``. Dividing data taken at
-    ``f_ro`` by ``env(fr)`` leaves ``S21 * exp(-2 pi i (f_ro - fr) tau)``: a rigid rotation of
-    the cloud about the origin, which moves it **off** the fitted circle rather than along it.
-    Since the subsequent resonator-basis map is an isometry, the displacement survives at
-    roughly ``2 pi (f_ro - fr) tau``, to be compared against the circle's radius
-    ``Ql / (2 |Qc|)``. On a shallow dip that ratio easily exceeds one and the cloud lands
-    nowhere near the ring, which reads as a broken measurement rather than a mis-normalization.
-
-    The term is rebuilt analytically from the fit's own scalars rather than interpolated out
-    of ``environmental_term``, so it is exact and stays valid for a *f_ro* outside the swept
-    span. This is the same construction :func:`~daq.analysis.resonator.fit_notch` uses to
-    build that array, so the two are consistent by definition.
+    term; the cloud and its QC points sit at *one* frequency and need it evaluated there.
+    Using ``fr`` instead leaves the cable-delay phase ``2 pi (f_ro - fr) tau`` uncorrected,
+    rotating them rigidly about the origin -- **off** the fitted circle rather than along it,
+    by roughly ``2 pi (f_ro - fr) tau`` against a circle of radius ``Ql / (2 |Qc|)``.
 
     :param fit: A :func:`~daq.analysis.resonator.fit_notch` ``fitresults`` mapping.
     :param freq_arr: The sweep frequencies, used only for the on-resonance fallback.
     :param readout_freq: Frequency in hertz the single-frequency data was acquired at.
         ``None`` falls back to ``fr``, i.e. assumes the data was taken on resonance.
-    :param basis: The display basis, so the fallback stays quiet where it cannot matter.
-    :raises ValueError: If *readout_freq* is not positive.
+    :param basis: The display basis. The electronic basis returns the data untouched, so the
+        fallback cannot affect the plot and stays quiet there.
+    :raises ValueError: If *readout_freq* is not positive and finite.
     :returns: The complex environmental term to divide the single-frequency data by.
 
     """
-    from .resonator import environmental_term
+    from .resonator import readout_environmental_term
 
-    fr = float(fit["fr"])
-
-    if readout_freq is None:
-        # Only worth warning about where the term is actually divided out: the electronic
-        # basis returns the raw data untouched, so the choice cannot affect the plot.
-        if basis != "electronic":
-            tau = float(fit["environmental_delay"])
-            dip = float(fit["Ql"]) / float(fit["absQc"])
-            sensitivity = (
-                f" For this fit (tau = {tau * 1e9:.1f} ns, dip depth Ql/|Qc| = {dip:.3f}) "
-                f"that is {4 * np.pi * 1e5 * tau / dip:.2f} ring radii per 100 kHz of "
-                "detuning."
-                if dip > 0
-                else ""
-            )
-            warnings.warn(
-                "plot_iq_comparison is normalizing the time stream (and any QC points) by "
-                f"the environmental term at fr = {fr / 1e9:.6f} GHz, which assumes they were "
-                "acquired on resonance. Pass readout_freq=<acquisition frequency in Hz> to "
-                "normalize at the frequency actually used. Data taken off resonance instead "
-                "keeps an uncorrected cable-delay phase 2*pi*(f_ro - fr)*tau, which rotates "
-                "the cloud about the origin and off the fitted circle rather than along it."
-                + sensitivity,
-                stacklevel=3,
-            )
-        env = np.asarray(fit["environmental_term"])
-        return complex(env[int(np.argmin(np.abs(np.asarray(freq_arr) - fr)))])
-
-    if readout_freq <= 0:
-        raise ValueError(f"readout_freq must be positive, got {readout_freq}")
-
-    return complex(
-        environmental_term(
-            np.array([float(readout_freq)]),
-            fit["environmental_amp_norm"],
-            fit["environmental_alpha"],
-            fit["environmental_delay"],
-        )[0]
+    return readout_environmental_term(
+        fit,
+        readout_freq,
+        freq_arr=freq_arr,
+        # The electronic basis returns z untouched, so the choice cannot matter there.
+        warn=basis != "electronic",
+        caller="plot_iq_comparison",
+        remedy="Pass readout_freq=<acquisition frequency in Hz>",
+        # plot_iq_comparison -> _readout_env -> readout_environmental_term -> warn, so 4
+        # lands on the user's call. Update this if the chain gains or loses a hop.
+        stacklevel=4,
     )
 
 
@@ -313,8 +278,9 @@ def plot_iq_comparison(
         ``"electronic"``, ``"fractional"``, ``"resonator"``. Defaults to
         ``"electronic"``.
     :param readout_freq: Frequency in hertz that *ts* and *qc* were acquired
-        at -- ``TimeStream.lo_freq`` for a zero-IF stream, or
-        ``QCTrace.readout_freq``. Used to evaluate the environmental term at
+        at -- ``TimeStream.signal_freqs[i]`` for tone *i* (``lo_freq`` only
+        when that tone's IF is zero), or ``QCTrace.readout_freq``. Used to
+        evaluate the environmental term at
         that frequency rather than at ``fr``, which is what keeps the cloud on
         the fitted circle: the term carries the cable delay, so normalizing
         off-resonance data at ``fr`` leaves a phase ``2*pi*(f_ro - fr)*tau``
@@ -374,6 +340,12 @@ def plot_iq_comparison(
         )
     if sw.freq_arr is None or sw.resp_arr is None:
         raise ValueError("sw must have freq_arr and resp_arr populated; run the sweep first")
+    if readout_freq is not None:
+        # Validated up front rather than where it is used, so a bad frequency does not cost a
+        # full resonator fit first. Matches GateBiasMeasurement._init_readout.
+        from .resonator import validate_readout_freq
+
+        validate_readout_freq(readout_freq)
 
     freq_arr = np.asarray(sw.freq_arr)
     resp_arr = np.asarray(sw.resp_arr)

@@ -515,7 +515,7 @@ ts = TimeStream.load("00000043-Resonator_A-timestream.h5")
 ax = plot_iq_comparison(
     ts.signal[:, 0],
     sw,
-    readout_freq=ts.lo_freq,   # the frequency the stream was taken at -- see below
+    readout_freq=ts.signal_freqs[0],   # tone 0's physical frequency -- see below
     basis="resonator",
     device="Resonator_A",
     power_dbm=-95,
@@ -524,7 +524,7 @@ ax = plot_iq_comparison(
 
 ### `readout_freq`: pass it whenever the stream is off resonance
 
-The sweep spans frequencies and is normalized point by point, each frequency by its own environmental term. A time stream and its folded QC points sit at a **single** frequency, so they need that term evaluated *there* — which is what `readout_freq` is for (`TimeStream.lo_freq` for a zero-IF stream, or `QCTrace.readout_freq`).
+The sweep spans frequencies and is normalized point by point, each frequency by its own environmental term. A time stream and its folded QC points sit at a **single** frequency, so they need that term evaluated *there* — which is what `readout_freq` is for. Use **`TimeStream.signal_freqs[i]`** for tone *i*: it already accounts for that tone's USB/LSB choice, and equals `lo_freq` only when the tone's IF is zero. Passing `lo_freq` for a tone at a 250 MHz IF leaves ~78 rad of uncorrected rotation. For a `QCTrace`, use `QCTrace.readout_freq` (its stream is zero-IF by construction).
 
 This is not a refinement, because the environmental term carries the cable delay, `env(f) = a·e^{iα}·e^{-2πifτ}`. Dividing data taken at `f_ro` by `env(fr)` leaves
 
@@ -535,10 +535,10 @@ S21 · exp(-2πi(f_ro - fr)τ)
 — a rigid rotation of the cloud about the origin, which moves it **off** the fitted circle rather than along it. The displacement is about `2π·(f_ro - fr)·τ` against a circle of radius `Ql/(2|Qc|)`, so in ring radii:
 
 ```
-displacement / radius ≈ 4π·Δ·τ·|Qc| / Ql = 4π·Δ·τ / dip_depth
+displacement / radius ≈ 4π·Δ·τ·|Qc| / Ql        (valid while 2π·Δ·τ ≪ 1)
 ```
 
-With `Δ = 300 kHz`, `τ = 50 ns` and a 10 %-deep dip that is **1.8 ring radii** — the cloud lands nowhere near the ring and reads as a broken measurement. On a deep dip the same detuning moves it by under a fifth of a radius. Detuning by itself can never take you off the circle (the circle *is* the locus over detuning), so a cloud that sits off the ring is a normalization mismatch, not physics.
+With `Δ = 300 kHz`, `τ = 50 ns` and a circle diameter `Ql/|Qc|` of 0.1 that is **≈1.9 ring radii** by the formula (1.84 once the `|S21|` factor the formula drops is kept) — the cloud lands nowhere near the ring and reads as a broken measurement. On a deep dip the same detuning moves it by under a fifth of a radius. Detuning by itself can never take you off the circle (the circle *is* the locus over detuning), so a cloud that sits off the ring is a normalization mismatch, not physics.
 
 Check your own sensitivity from the fit:
 
@@ -548,10 +548,10 @@ import numpy as np
 
 fit = fit_notch(sw.freq_arr, sw.resp_arr).fitresults
 tau = fit["environmental_delay"]
-dip = fit["Ql"] / fit["absQc"]
-delta = ts.lo_freq - fit["fr"]
+dip = fit["Ql"] / fit["absQc"]   # circle diameter
+delta = ts.signal_freqs[0] - fit["fr"]
 
-print(f"detuning {delta/1e3:.1f} kHz, tau {tau*1e9:.1f} ns, dip {dip:.3f}")
+print(f"detuning {delta/1e3:.1f} kHz, tau {tau*1e9:.1f} ns, diameter {dip:.3f}")
 print(f"-> {4*np.pi*abs(delta)*tau/dip:.2f} ring radii if readout_freq is omitted")
 ```
 
@@ -581,7 +581,7 @@ ax = plot_iq_comparison(
     ts.signal[:, 0],
     sw,
     qc=qc_trace,              # optional complex calibration points (red circles)
-    readout_freq=ts.lo_freq,  # applies to the cloud and the QC points alike
+    readout_freq=ts.signal_freqs[0],  # applies to the cloud and the QC points alike
     basis="fractional",
     density="hexbin",
     freq_shift=200e3,         # fr ± 200 kHz marker diamonds

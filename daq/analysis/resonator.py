@@ -35,6 +35,7 @@ consumers divide by ``environmental_term`` alone and ignore ``environmental_base
 validating only the normalization identity would let a non-zero baseline through.
 """
 
+import warnings
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple
 
@@ -45,6 +46,7 @@ __all__ = [
     "ResonatorFitError",
     "environmental_term",
     "fit_notch",
+    "readout_environmental_term",
     "resonator_tools_available",
 ]
 
@@ -116,6 +118,120 @@ def environmental_term(
     """
     freq_arr = np.asarray(freq_arr, dtype=float)
     return amp_norm * np.exp(1j * alpha) * np.exp(-2j * np.pi * freq_arr * delay)
+
+
+def readout_environmental_term(
+    fit: Dict[str, Any],
+    readout_freq: Optional[float],
+    *,
+    freq_arr: Optional[npt.NDArray[np.float64]] = None,
+    warn: bool = True,
+    caller: str = "This basis transformation",
+    remedy: str = "Pass readout_freq=<acquisition frequency in Hz>",
+    stacklevel: int = 3,
+) -> complex:
+    """Return the environmental term at the frequency single-frequency data was taken at.
+
+    A frequency sweep is normalized point by point, each frequency by its own environmental
+    term. A time stream, its folded QC points and anything else acquired at a *fixed* tone are
+    all at **one** frequency, and need that term evaluated **there**.
+
+    Evaluating it at ``fr`` instead is not a harmless approximation, because the term carries
+    the cable delay, ``env(f) = a e^{i alpha} e^{-2 pi i f tau}``. Dividing data taken at
+    ``f_ro`` by ``env(fr)`` leaves ``S21 * exp(-2 pi i (f_ro - fr) tau)`` -- a rigid rotation
+    about the origin, by ``theta = 2 pi (f_ro - fr) tau``. What that costs depends on the
+    consumer:
+
+    - Plotting a cloud against the fitted circle, it is a *position* error of order ``theta``
+      against a circle of radius ``Ql / (2 |Qc|)``, so on a shallow resonance a few hundred
+      kHz is enough to put the cloud entirely off the ring.
+    - Splitting fluctuations into dissipation and frequency response, it mixes the two axes,
+      and asymmetrically: the dissipation channel picks up ``4 sin^2(theta)`` of the frequency
+      channel's power while the frequency channel picks up only ``sin^2(theta)/4`` of the
+      dissipation channel's (see :func:`~daq.analysis.noise.from_elec_to_reson` for why they
+      differ by 16). Second order in ``theta``, but multiplied by the *ratio* of the two noise
+      powers -- so when frequency noise dominates dissipation noise by 20 dB, a ``theta`` of
+      0.094 rad makes the dissipation spectrum read about 4.5x high.
+
+    The term is rebuilt analytically from the fit's own scalars rather than interpolated out
+    of ``environmental_term``, so it is exact and stays valid for an *f_ro* outside the swept
+    span. This is the same construction :func:`fit_notch` uses to build that array, so the two
+    are consistent by definition.
+
+    :param fit: A :func:`fit_notch` ``fitresults`` mapping.
+    :param readout_freq: Frequency in hertz the single-frequency data was acquired at.
+        ``None`` falls back to ``fr``, i.e. assumes the data was taken on resonance.
+    :param freq_arr: Sweep frequencies. When given, the ``None`` fallback reproduces the
+        historical grid-snapped value read out of ``environmental_term``; otherwise the
+        fallback is evaluated analytically at ``fr``.
+    :param warn: Whether to warn on the ``None`` fallback. Pass ``False`` where the term
+        cannot affect the result (e.g. a display basis that never divides it out).
+    :param caller: Name of the calling operation, for the warning text.
+    :param remedy: How the caller's user supplies the frequency, for the warning text.
+    :param stacklevel: ``warnings.warn`` stack level. The default assumes one wrapper between
+        this function and the user's call site; raise it if the chain is deeper.
+    :raises ValueError: If *readout_freq* is not positive and finite.
+    :returns: The complex environmental term to divide the single-frequency data by.
+
+    """
+    fr = float(fit["fr"])
+
+    if readout_freq is None:
+        if warn:
+            tau = float(fit["environmental_delay"])
+            absqc = float(fit["absQc"])
+            # Circle diameter in the normalized bases. Called the dip depth loosely, but the
+            # two coincide only at phi0 = 0, so the message says diameter.
+            diameter = float(fit["Ql"]) / absqc if absqc else float("nan")
+            sensitivity = (
+                f" For this fit (tau = {tau * 1e9:.1f} ns, circle diameter Ql/|Qc| = "
+                f"{diameter:.3f}) that is {4 * np.pi * 1e5 * tau / diameter:.2f} ring radii "
+                "per 100 kHz of detuning, while 2*pi*Delta*tau stays well below 1."
+                if np.isfinite(diameter) and diameter > 0
+                else ""
+            )
+            warnings.warn(
+                f"{caller} is normalizing single-frequency data by the environmental term at "
+                f"fr = {fr / 1e9:.6f} GHz, which assumes it was acquired on resonance. "
+                f"{remedy} to normalize at the frequency actually used. Data taken off "
+                "resonance instead keeps an uncorrected cable-delay phase "
+                "2*pi*(f_ro - fr)*tau, which rotates it rigidly about the origin."
+                + sensitivity,
+                stacklevel=stacklevel,
+            )
+        if freq_arr is not None:
+            env = np.asarray(fit["environmental_term"])
+            return complex(env[int(np.argmin(np.abs(np.asarray(freq_arr) - fr)))])
+        readout_freq = fr
+
+    validate_readout_freq(readout_freq)
+
+    return complex(
+        environmental_term(
+            np.array([float(readout_freq)]),
+            fit["environmental_amp_norm"],
+            fit["environmental_alpha"],
+            fit["environmental_delay"],
+        )[0]
+    )
+
+
+def validate_readout_freq(readout_freq: float, name: str = "readout_freq") -> float:
+    """Validate an acquisition frequency.
+
+    ``nan`` is rejected explicitly: it passes a bare ``<= 0`` test and then silently poisons
+    every downstream value with ``nan`` rather than failing where the mistake was made.
+
+    :param readout_freq: Frequency in hertz.
+    :param name: Parameter name, for the error message.
+    :raises ValueError: If *readout_freq* is not positive and finite.
+    :returns: The validated frequency as a float.
+
+    """
+    value = float(readout_freq)
+    if not np.isfinite(value) or value <= 0:
+        raise ValueError(f"{name} must be positive and finite, got {readout_freq!r}")
+    return value
 
 
 def _crop_mask(
