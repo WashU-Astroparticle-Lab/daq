@@ -21,6 +21,7 @@ conda activate presto
 |---|---|
 | **`presto` Python API manual** | https://www.intermod.pro/manuals/presto/index.html |
 | **Presto spec sheet (hardware)** | https://intermod.pro/res/docs/presto_spec_sheet.pdf |
+| **`presto` package source** | your env's `site-packages/presto/*.py` |
 
 Our hardware is a **Presto-8**. The rules:
 
@@ -36,9 +37,22 @@ Our hardware is a **Presto-8**. The rules:
    constants** — things the documents do not cover. Cite `file:line` when you do.
 4. **If neither document settles a hardware-timing claim, say so and mark it unverified.**
    Do not promote an inference to a fact because it is plausible.
+5. **When in doubt, look it up — do not guess.** All three references are cheap to read and
+   the failures they prevent are silent ones. An answer marked "unverified" is fine; a
+   plausible guess presented as a fact is not.
 
 The spec sheet is a scanned-layout PDF: `WebFetch` cannot read it, but the `Read` tool can
 (pass `pages`). Do not conclude it is unavailable.
+
+**On an analysis machine with no `presto` install** (the offline test suites skip there, and
+`import daq` fails), unpack the wheel instead of guessing — the source is a plain zip:
+
+```bash
+mkdir -p ~/.local/share/presto-source/2.17.1 && cd $_ && unzip -o /path/to/intermod_presto-*.whl
+```
+
+The notes under *Established behaviour* below were written against **2.16.0**; check
+`presto/version.py` before treating one as current.
 
 Page map for the API manual (relative to `https://www.intermod.pro/manuals/presto/`):
 
@@ -134,6 +148,21 @@ Provenance is marked because it determines how much weight a claim carries.
 - **`CLK_T` is configuration-dependent**, not a fixed board constant: 2.5 ns (`CLK_F` 400 MHz)
   when `adc_fsample` is `G3_2`, otherwise 2 ns (500 MHz). Any timing figure quoted in clock
   counts — e.g. the 24-bit trigger-width ceiling — moves with it. (source)
+- **`Sweep`'s explicit DAC config and `TimeStream`'s automatic one agree.** The sweep classes
+  pass `recommended_dac_config(freq_center)`; `TimeStream` passes bare `DC_PARAMS`
+  (`dac_mode=Mixed`, no `dac_fsample`), which is the manual's documented *automatic* path
+  since API 2.12.0. They are not two different configurations: `hardware.py:995` routes the
+  automatic path through `utils.compatible_dac_configs()`, whose candidate list
+  (`G6`/`G8`/`G10` × `Mixed02`/`Mixed04`/`Mixed42`) and `spur_score` are **identical** to
+  `utils.recommended_dac_config`'s — the code is duplicated verbatim — and `hardware.py:1832`
+  takes the top-scored entry the same way. So the two select the same `(dac_mode,
+  dac_fsample)` at the same frequency, and a `Sweep` and a `TimeStream` a few hundred kHz
+  apart cannot land on different DAC settings (the score is a spur-distance measure on a
+  MHz-to-GHz scale). **This was checked because a gain/phase mismatch between the two would
+  present exactly as a time-stream cloud sitting off a fitted resonance circle** — it is not
+  that. One real difference remains: `_autoconfig` *intersects* candidates across ports
+  sharing a DAC tile (`hardware.py:1821`), so a multi-port acquisition can be pushed onto a
+  compromise config that a single-port one would not choose. (source, 2.17.1)
 
 ## Commands
 
