@@ -172,6 +172,11 @@ The first term is the Lorentzian of the parity-switching process; the second is 
 
 The fit is done in **log-log space**, the natural representation of a PSD. A periodogram is linearly spaced in frequency, so nearly all of its points sit in the top decade; a plain linear-units fit is therefore steered by high-frequency structure. To avoid that, `fit_parity_psd` first averages the spectrum onto `n_bins` logarithmically-spaced frequency bins (default 60 — geometric-mean frequency, linear-mean power per bin, which is unbiased for the underlying spectrum) so every decade is represented equally, then minimizes the residual of `log10(PSD)` against `log10(model)`. The `f = 0` DC bin (and any non-positive frequency) is always excluded, since a log axis needs `f > 0`.
 
+For a constant-bias readout stream, `TimeStream` wires this up for you — `ts.parity_psd()` takes
+the spectrum of the mean-subtracted projection at the tuned `df`, `ts.fit_parity()` fits it with
+`f_bw` already right, and `ts.analyze()` draws both when the attached generator says the gate was
+held at DC. The rest of this section is the underlying pair, for a projection of your own.
+
 The function takes the `(f, psd)` output of `compute_psd` directly:
 
 ```python
@@ -511,6 +516,21 @@ slightly away from what you asked for, and dividing the record by `n_periods` ca
 window a sample short of the true period, which smears the average across blocks instead of
 dropping a leftover. `period_s=1 / RAMP_HZ` with `fs=qc.df` always gives the physical period.
 
+### The stream folds itself
+
+Because the example above calls `qc.attach(bias=bias)`, the stream carries the ramp frequency —
+so it can do all of this on its own, on the tuned `df` and the attached period:
+
+```python
+time_ms, avg_iq = qc.fold()      # same result as fold_timestream(qc, qc.df, period_s=1 / 500)
+qc.analyze()                     # folds and plots it: qc.bias_mode == 'sawtooth'
+```
+
+That works on a reloaded file too (`TimeStream.load(path).analyze()`), since `load()` restores
+the attached settings. Reach for `fold_timestream` directly when there is no attached generator
+to read the period off, when folding a bare array, or when folding on a period other than the
+ramp's — `qc.fold(period_s=...)` also takes an override.
+
 ### The packaged routines
 
 `QCTrace` packages exactly the block above — gated ramp, whole-period acquisition, fold — and
@@ -548,8 +568,10 @@ hunt.analyze()                                  # contrast vs gate bias
 hunt.best_bias, hunt.best_bias_stream           # winning gate bias and its stream
 ```
 
-Feed `hunt.best_bias_stream` to `compute_psd` / `fit_parity_psd` for the parity spectrum at the
-best operating point. `QCTrace.fold()` re-folds on demand — on a different period, or on a
+For the parity spectrum at the best operating point, `hunt.best_bias_stream.analyze()` draws it
+with the fit (that stream's `bias_mode` is `'constant'`), and `.parity_psd()` / `.fit_parity()`
+give the arrays; `hunt.average_psd()` averages every try instead, which is what beats the
+single-record scatter down. `QCTrace.fold()` re-folds on demand — on a different period, or on a
 stream reloaded from `qct.qc_file` — so `fold_timestream` need not be called by hand for a
 packaged run. See the `QCTrace` and `BiasHunt` entries in `CLAUDE.md` for the full parameter
 sets and what lands in HDF5 and MongoDB.
