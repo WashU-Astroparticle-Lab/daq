@@ -36,14 +36,31 @@ DEFAULT_BIAS_PREFIX = "bias"
 #: Reconstructions :meth:`TimeStream.analyze` can run, beyond ``"auto"``.
 ANALYZE_MODES = ("raw", "sawtooth", "constant")
 
+#: Projection of the complex readout the parity reconstructions run on by default. The
+#: maximal-separation axis: parity moves the resonator between two points of the IQ plane, and
+#: a fixed axis sees only the ``cos(angle)`` of the line joining them -- for a separation that
+#: is mostly a phase shift, almost none of it. See :data:`daq.analysis.parity.PROJECTIONS`.
+DEFAULT_QUANTITY = "proj"
+
 #: Axis labels for the projections of the complex readout the parity spectrum can be taken of.
-_QUANTITY_LABELS = {"abs": r"$|S|$", "real": r"$\mathrm{Re}(S)$", "imag": r"$\mathrm{Im}(S)$"}
+_QUANTITY_LABELS = {
+    "proj": r"$S_\parallel$",
+    "abs": r"$|S|$",
+    "real": r"$\mathrm{Re}(S)$",
+    "imag": r"$\mathrm{Im}(S)$",
+}
+
+#: Most individual switching events to draw as tick marks on a reconstructed trace. Past this
+#: the marks merge into a solid band that hides the trace they annotate; the reconstructed
+#: level curve still shows where the flips are, and the count is reported either way.
+_MAX_FLIP_MARKS = 400
 
 __all__ = [
     "ANALYZE_MODES",
     "BIAS_FUNCTION_SUFFIX",
     "BoolAny",
     "DEFAULT_BIAS_PREFIX",
+    "DEFAULT_QUANTITY",
     "FloatAny",
     "MAX_TRIGGER_PORTS",
     "TimeStream",
@@ -688,45 +705,62 @@ class TimeStream(Base):
                 )
         return fold_timestream(self, self.df, period_s=period_s, n_periods=n_periods, tone=tone)
 
-    def _projection(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+    def _projection(
+        self, tone: int = 0, quantity: str = DEFAULT_QUANTITY
+    ) -> npt.NDArray[np.floating]:
         """Return a real projection of the complex readout, as recorded.
 
         :param tone: Which tone to project.
-        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :param quantity: One of :data:`~daq.analysis.parity.PROJECTIONS`.
         :raises RuntimeError: If there is no data.
-        :raises ValueError: If *quantity* is not one of the three.
+        :raises ValueError: If *quantity* is not a known projection.
         :returns: The projected series, operating point included.
 
         """
+        from ..analysis.parity import project_readout
+
         if self.signal is None:
             raise RuntimeError("No data available. Run or load the measurement first.")
-        signal = np.asarray(self.signal)[:, tone]
-        if quantity == "abs":
-            return np.abs(signal)
-        if quantity == "real":
-            return np.real(signal)
-        if quantity == "imag":
-            return np.imag(signal)
-        raise ValueError(f"quantity must be 'abs', 'real' or 'imag', got {quantity!r}")
+        return project_readout(np.asarray(self.signal)[:, tone], quantity)
 
-    def _parity_series(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+    def _parity_series(
+        self, tone: int = 0, quantity: str = DEFAULT_QUANTITY
+    ) -> npt.NDArray[np.floating]:
         """Return the real-valued series whose spectrum is the parity spectrum.
 
         :param tone: Which tone to project.
-        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :param quantity: One of :data:`~daq.analysis.parity.PROJECTIONS`.
         :raises RuntimeError: If there is no data.
-        :raises ValueError: If *quantity* is not one of the three.
+        :raises ValueError: If *quantity* is not a known projection.
         :returns: The mean-subtracted series -- the fluctuation, not the operating point.
 
         """
         series = self._projection(tone=tone, quantity=quantity)
         return series - series.mean()
 
+    def _tones(self, tone: Optional[int]) -> List[int]:
+        """Resolve a *tone* argument to the list of tones to work on.
+
+        :param tone: A tone index, or ``None`` for every tone.
+        :raises RuntimeError: If there is no data.
+        :raises IndexError: If *tone* is out of range.
+        :returns: The tone indices, in order.
+
+        """
+        if self.signal is None:
+            raise RuntimeError("No data available. Run or load the measurement first.")
+        n_tones = int(np.asarray(self.signal).shape[1])
+        if tone is None:
+            return list(range(n_tones))
+        if not -n_tones <= tone < n_tones:
+            raise IndexError(f"tone {tone} is out of range for a {n_tones}-tone stream")
+        return [tone % n_tones]
+
     def parity_psd(
         self,
         *,
-        tone: int = 0,
-        quantity: str = "abs",
+        tone: Optional[int] = None,
+        quantity: str = DEFAULT_QUANTITY,
         welch: bool = False,
         nperseg: Optional[int] = None,
         noverlap: Optional[int] = None,
@@ -739,55 +773,67 @@ class TimeStream(Base):
         than the one that was asked for. ``"abs"`` matches the metric
         :class:`~daq.measurements.bias_hunt.BiasHunt` ranks its tries by.
 
+        Every tone is spectrated by default, one row per tone -- a multi-tone parity
+        acquisition is normally a signal tone beside a reference, and taking only the first
+        would quietly answer a question nobody asked.
+
         One stream's periodogram is noisy; ``BiasHunt.average_psd`` averages over the tries to
         beat that down before fitting.
 
-        :param tone: Which tone to take the spectrum of.
+        :param tone: Which tone to take the spectrum of. ``None`` (default) takes every tone.
         :param quantity: Projection of the complex readout -- ``"abs"``, ``"real"`` or
             ``"imag"``.
         :param welch: Use Welch's method instead of the bare periodogram.
         :param nperseg: Welch segment length. Ignored unless *welch*.
         :param noverlap: Welch segment overlap. Ignored unless *welch*.
-        :returns: ``(f, psd)`` -- frequencies in Hz and the PSD in ``FS^2/Hz``.
+        :returns: ``(f, psd)`` -- frequencies in Hz and the PSD in ``FS^2/Hz``. ``psd`` is 1-D
+            for a single tone (whether named or because the stream has one) and 2-D, one row
+            per tone, otherwise -- following
+            :func:`~daq.analysis.noise.fit_parity_psd`'s dict-versus-list convention.
 
         """
         from ..analysis.noise import compute_psd
 
-        return compute_psd(
-            self._parity_series(tone=tone, quantity=quantity),
+        tones = self._tones(tone)
+        series = np.vstack([self._parity_series(tone=ii, quantity=quantity) for ii in tones])
+        f, psd = compute_psd(
+            series if len(tones) > 1 else series[0],
             self.df,
             welch=welch,
             nperseg=nperseg,
             noverlap=noverlap,
         )
+        return f, psd
 
     def fit_parity(
         self,
         *,
-        tone: int = 0,
-        quantity: str = "abs",
+        tone: Optional[int] = None,
+        quantity: str = DEFAULT_QUANTITY,
         welch: bool = False,
         nperseg: Optional[int] = None,
         noverlap: Optional[int] = None,
         **fit_kwargs: Any,
-    ) -> dict:
+    ) -> Any:
         """Fit this stream's noise spectrum to the random-telegraph parity model.
 
         The sampling bandwidth is held at the tuned :attr:`df`, as
         :func:`~daq.analysis.noise.fit_parity_psd` expects. Check ``resid_dex_rms`` before
         believing the result -- ``~0.1`` is a good fit, ``~1`` means the model is a decade off
-        across the band.
+        across the band. Worth checking too against ``gamma_p_flips`` from
+        :meth:`reconstruct_parity`, which measures the same rate in the time domain and knows
+        nothing about this model.
 
         The result is stored on :attr:`fit_results` and reused by :meth:`analyze`.
 
-        :param tone: Which tone to fit.
+        :param tone: Which tone to fit. ``None`` (default) fits every tone.
         :param quantity: Projection of the complex readout to fit.
         :param welch: Use Welch's method for the spectrum.
         :param nperseg: Welch segment length. Ignored unless *welch*.
         :param noverlap: Welch segment overlap. Ignored unless *welch*.
         :param fit_kwargs: Passed to :func:`~daq.analysis.noise.fit_parity_psd` --
             ``fit_onef=True`` for a ``1/f``-like low-frequency rise, ``n_bins``, and so on.
-        :returns: The ``fit_results`` dict.
+        :returns: The ``fit_results`` dict for a single tone, or a list of them, one per tone.
 
         """
         from ..analysis.noise import fit_parity_psd
@@ -797,6 +843,75 @@ class TimeStream(Base):
         )
         self.fit_results = fit_parity_psd(f, psd, f_bw=self.df, **fit_kwargs)
         return self.fit_results
+
+    def reconstruct_parity(
+        self,
+        *,
+        tone: Optional[int] = None,
+        ramped: Optional[bool] = None,
+        bursts: bool = True,
+        burst_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Recover the parity-flip times of this acquisition, via ``qpd``.
+
+        The time-domain counterpart of :meth:`fit_parity`: where that fits a switching rate out
+        of the spectrum, this recovers the individual tunnelling events. The method is
+        :mod:`qpd.reconstruction`'s -- a blind two-blob emission model and a two-state HMM
+        decode -- reached through :mod:`daq.analysis.parity`; this measurement supplies the
+        trace, the tuned sample rate, and which reconstruction the bias calls for, and passes
+        every algorithm parameter through on ``qpd``'s own defaults.
+
+        Which reconstruction follows :attr:`bias_mode`, since it is the same distinction:
+        a **constant** gate holds ``n_g`` fixed and gives two stationary blobs, a **sawtooth**
+        sweeps it so the branches move, cross blind and reset with the ramp. Pass *ramped* to
+        override.
+
+        **Check ``degenerate`` and ``contrast`` on the result before using it** -- a model that
+        latched onto noise fails quietly, and its fidelity estimate stays high while it does.
+        The rate it reports (``rate_hz``) is worth comparing against the fitted ``gamma_p``
+        from :meth:`fit_parity`: the two share no machinery, so agreement is evidence and
+        disagreement means one of them is wrong.
+
+        :param tone: Which tone to reconstruct. ``None`` (default) reconstructs every tone.
+        :param ramped: Force the swept-gate (``True``) or fixed-gate (``False``)
+            reconstruction. ``None`` takes it from :attr:`bias_mode`.
+        :param bursts: Also cluster the flip train into rapid-switching bursts
+            (:func:`~daq.analysis.parity.detect_bursts`), using the reconstruction's own rate
+            as the Poisson background.
+        :param burst_kwargs: Passed to that call (``max_gap``, ``min_flips``,
+            ``max_p_value``); ``qpd``'s defaults otherwise. Note its ``max_p_value`` default is
+            ``None``, i.e. every cluster is returned with its p-value rather than filtered --
+            see :func:`~daq.analysis.parity.detect_bursts`.
+        :param kwargs: Passed to the ``qpd`` reconstruction routine.
+        :raises ImportError: If ``qpd`` is not installed.
+        :returns: ``qpd``'s result for a single tone, or a list of them, one per tone. Each
+            carries a ``bursts`` list and a ``tone`` index attached by this method.
+
+        """
+        from ..analysis.parity import detect_bursts, reconstruct_parity
+
+        if ramped is None:
+            ramped = self.bias_mode == "sawtooth"
+
+        results = []
+        for index in self._tones(tone):
+            signal = np.asarray(self.signal)[:, index]
+            result = reconstruct_parity(signal, self.df, ramped=ramped, **kwargs)
+            found = []
+            # A burst hunt over a degenerate model would be a hunt through noise crossings,
+            # and it would find plenty.
+            if bursts and not getattr(result, "degenerate", False):
+                found = detect_bursts(
+                    result.flip_times,
+                    getattr(result, "rate_hz", 0.0),
+                    signal.shape[0] / self.df,
+                    **(burst_kwargs or {}),
+                )
+            result.bursts = found
+            result.tone = index
+            results.append(result)
+        return results[0] if len(results) == 1 else results
 
     # ------------------------------------------------------------------ analysis
 
@@ -837,11 +952,12 @@ class TimeStream(Base):
         show_iq: bool = True,
         *,
         mode: Optional[str] = None,
-        tone: int = 0,
+        tone: Optional[int] = None,
         period_s: Optional[float] = None,
         raw: bool = True,
         fit: bool = True,
-        quantity: str = "abs",
+        reconstruct: bool = True,
+        quantity: str = DEFAULT_QUANTITY,
         **fit_kwargs: Any,
     ):
         """Reconstruct and plot the acquisition according to how the gate was biased.
@@ -856,11 +972,18 @@ class TimeStream(Base):
         ==================  =======================================================
         ``sawtooth``        folds the record into one ramp period (:meth:`fold`) and
                             plots the block-averaged I/Q trace -- a QC trace
-        ``constant``        plots the readout magnitude against time above its noise
-                            spectrum (:meth:`parity_psd`), fitted to the
+        ``constant``        annotates the I/Q streams with the two-level parity
+                            reconstruction (:meth:`reconstruct_parity`) -- levels,
+                            switching events and any rapid-switching burst -- above
+                            the noise spectra (:meth:`parity_psd`) fitted to the
                             random-telegraph parity model
         ``unknown``         the plain per-tone time-stream plot, as before
         ==================  =======================================================
+
+        **Every reconstruction is per tone and shows all of them**, one row of the usual
+        two-column grid each, with one spectrum per tone on the shared panel below. A
+        multi-tone parity acquisition is normally a signal tone beside a reference; showing
+        only the first would answer a question nobody asked.
 
         So ``ts.attach(bias=fgen)`` before ``run()`` is what makes a bare ``ts.analyze()``
         do the right thing afterwards; without it nothing about the samples says whether the
@@ -873,28 +996,33 @@ class TimeStream(Base):
         from the stream itself, so a single hand-rolled acquisition or a reloaded file gets it
         without wrapping it in a measurement class.
 
-        :param num_samples: Limit the time-axis panel to this many samples. Applies to the
+        :param num_samples: Limit the time-axis panels to this many samples. Applies to the
             ``raw`` and ``constant`` plots; the folded trace is one period long by
-            construction.
+            construction. The reconstruction itself still runs on the whole record, so the
+            rates and bursts reported describe the acquisition rather than the window.
         :param title: Figure title. Defaults to naming the reconstruction, the device and the
             tone's frequency.
-        :param show_iq: ``raw`` mode only -- show I and Q rather than power and phase.
+        :param show_iq: Show I and Q rather than power and phase, in the ``raw`` and
+            ``constant`` grids. The reconstructed levels are drawn only on I/Q.
         :param mode: Force a reconstruction: ``"sawtooth"``, ``"constant"`` or ``"raw"``.
             ``None`` (the default) or ``"auto"`` reads :attr:`bias_mode`.
-        :param tone: Which tone to reconstruct, for a multi-tone stream. The bias
-            reconstructions are single-tone; the ``raw`` plot shows every tone regardless.
+        :param tone: Restrict the figure to one tone. ``None`` (the default) shows every tone,
+            one row each.
         :param period_s: ``sawtooth`` mode only -- fold on this period instead of the attached
             ramp's. The way to fold a stream whose generator was never attached.
         :param raw: ``sawtooth`` mode only -- overlay one un-averaged period, showing what the
             averaging bought.
         :param fit: ``constant`` mode only -- overlay the parity-model fit. A fit that raises
             is reported on the panel rather than costing the spectrum.
+        :param reconstruct: ``constant`` mode only -- mark the two-level reconstruction on the
+            streams. ``False`` leaves the grid bare.
         :param quantity: ``constant`` mode only -- which projection of the complex readout to
-            take the spectrum of (``"abs"``, ``"real"``, ``"imag"``).
+            threshold and to take the spectrum of (``"abs"``, ``"real"``, ``"imag"``).
         :param fit_kwargs: ``constant`` mode only -- passed to
             :func:`~daq.analysis.noise.fit_parity_psd` (e.g. ``fit_onef=True``).
         :raises RuntimeError: If there is no data to analyse.
         :raises ValueError: If *mode* or *quantity* is not recognised.
+        :raises IndexError: If *tone* is out of range.
         :returns: The created figure.
 
         """
@@ -919,7 +1047,9 @@ class TimeStream(Base):
                 num_samples=num_samples,
                 title=title,
                 tone=tone,
+                show_iq=show_iq,
                 fit=fit,
+                reconstruct=reconstruct,
                 quantity=quantity,
                 **fit_kwargs,
             )
@@ -929,14 +1059,14 @@ class TimeStream(Base):
         self,
         *,
         title: Optional[str],
-        tone: int,
+        tone: Optional[int],
         period_s: Optional[float],
         raw: bool,
     ):
-        """Fold the record into one bias-ramp period and plot it.
+        """Fold the record into one bias-ramp period and plot it, one row per tone.
 
         :param title: Figure title, or ``None`` for the default.
-        :param tone: Which tone to fold.
+        :param tone: Which tone to fold, or ``None`` for all of them.
         :param period_s: Fold period, or ``None`` for the attached ramp's.
         :param raw: Overlay one un-averaged period.
         :returns: The created figure.
@@ -947,34 +1077,209 @@ class TimeStream(Base):
         from ..analysis.plotting import plot_qc_trace
 
         self._warn_if_ramp_ungated()
-        time_ms, avg_iq = self.fold(period_s=period_s, tone=tone)
-        n_folded = int(np.asarray(self.signal).shape[0] // avg_iq.shape[1])
+        tones = self._tones(tone)
 
-        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True, tight_layout=True)
+        fig, axes = plt.subplots(
+            len(tones),
+            2,
+            figsize=(12, 3 * len(tones)),
+            sharex=True,
+            tight_layout=True,
+            squeeze=False,
+        )
+        n_folded = 0
+        for row, index in enumerate(tones):
+            time_ms, avg_iq = self.fold(period_s=period_s, tone=index)
+            n_folded = int(np.asarray(self.signal).shape[0] // avg_iq.shape[1])
+            plot_qc_trace(
+                time_ms,
+                avg_iq,
+                raw=self if raw else None,
+                ax=tuple(axes[row]),
+                tone=index,
+                title="",
+            )
+            for axis, name in zip(axes[row], ("I [FS]", "Q [FS]")):
+                axis.set_ylabel(f"{name}\n{self._tone_label(index)}")
+                # plot_qc_trace labels its own x-axis; only the bottom row should keep one.
+                axis.set_xlabel("")
+
+        for axis in axes[-1]:
+            axis.set_xlabel("Time [ms]")
         if title is None:
-            title = self._title(f"QC trace (block-averaged, {n_folded} periods)", tone)
-        plot_qc_trace(time_ms, avg_iq, raw=self if raw else None, ax=axes, tone=tone, title=title)
+            title = self._title(f"QC trace (block-averaged, {n_folded} periods)", tones[0])
+        fig.suptitle(title)
 
         plt.show()
         return fig
+
+    def _time_axis(self, n_samples: int) -> Tuple[npt.NDArray[np.floating], float, str]:
+        """Return a time axis, its scale factor from seconds, and its unit.
+
+        Scaled to the length of what is plotted: a parity record runs for seconds and a QC
+        period for milliseconds, so a fixed unit labels one of them in millions.
+
+        :param n_samples: Number of samples being plotted.
+        :returns: ``(time, scale, unit)``, where ``seconds * scale`` is in the returned unit.
+
+        """
+        duration_s = n_samples / self.df
+        if duration_s >= 1.0:
+            scale, unit = 1.0, "s"
+        elif duration_s >= 1e-3:
+            scale, unit = 1e3, "ms"
+        else:
+            scale, unit = 1e6, "μs"
+        return np.arange(n_samples) / self.df * scale, scale, unit
+
+    def _tone_label(self, tone: int) -> str:
+        """Return the sideband-annotated frequency label of a tone.
+
+        :param tone: Which tone.
+        :returns: E.g. ``"6.437 GHz (USB)"``.
+
+        """
+        sideband = "USB" if self.is_usb[tone] else "LSB"
+        freqs = np.atleast_1d(self.signal_freqs)
+        return f"{freqs[tone] / 1e9:.3f} GHz ({sideband})"
+
+    def _draw_stream_grid(
+        self,
+        axes,
+        *,
+        tones: Optional[List[int]] = None,
+        num_samples: Optional[int] = None,
+        show_iq: bool = True,
+    ) -> Tuple[npt.NDArray[np.floating], float, str]:
+        """Draw the per-tone two-column stream grid: I and Q, or power and phase.
+
+        The historical :meth:`analyze` plot, factored out so the bias reconstructions can
+        annotate it rather than replace it.
+
+        :param axes: Axes array of shape ``(len(tones), 2)`` to draw into.
+        :param tones: Which tones to draw, one row each. ``None`` draws every tone.
+        :param num_samples: Plot only this many leading samples.
+        :param show_iq: Draw I and Q rather than power and phase.
+        :returns: ``(time, scale, unit)`` -- the axis the grid was drawn against.
+
+        """
+        data = np.asarray(self.signal)
+        if num_samples is not None:
+            data = data[:num_samples]
+        tones = list(range(data.shape[1])) if tones is None else list(tones)
+        time_axis, scale, unit = self._time_axis(data.shape[0])
+
+        for row, tone in enumerate(tones):
+            label = self._tone_label(tone)
+            if show_iq:
+                columns = (
+                    (np.real(data[:, tone]), "I [FS]"),
+                    (np.imag(data[:, tone]), "Q [FS]"),
+                )
+            else:
+                columns = (
+                    (20.0 * np.log10(np.abs(data[:, tone])), "Power [dBFS]"),
+                    (np.angle(data[:, tone]), "Phase [rad]"),
+                )
+            for axis, (values, name) in zip(axes[row], columns):
+                axis.plot(time_axis, values, lw=0.6, color="tab:blue")
+                axis.set_ylabel(f"{name}\n{label}")
+                axis.grid(True, alpha=0.3)
+
+        for axis in axes[-1]:
+            axis.set_xlabel(f"Time [{unit}]")
+        return time_axis, scale, unit
+
+    def _overlay_telegraph(
+        self,
+        axes,
+        result: Any,
+        *,
+        time_axis: npt.NDArray[np.floating],
+        scale: float,
+        show_iq: bool,
+    ) -> None:
+        """Mark one tone's reconstructed branches, flips and bursts on its row of the grid.
+
+        :param axes: The ``(left, right)`` axes of this tone's row.
+        :param result: One :meth:`reconstruct_parity` result, i.e. ``qpd``'s.
+        :param time_axis: Time axis the row was drawn against.
+        :param scale: Seconds-to-plot-unit factor for that axis.
+        :param show_iq: Whether the row holds I/Q (branch levels are drawn) or power/phase.
+
+        """
+        from ..analysis.parity import summarize
+
+        if time_axis.size == 0:
+            return
+        if result.degenerate:
+            # qpd's own verdict that the fitted model latched onto noise. Marking its flips
+            # would be marking noise crossings, and the fidelity estimate stays high while it
+            # does -- which is exactly why the flag exists and is read here.
+            axes[0].set_title(
+                f"qpd reports a degenerate model (contrast = {result.contrast:.1f}); "
+                "flips not marked",
+                fontsize=8,
+                color="tab:red",
+            )
+            return
+
+        window = time_axis.shape[0]
+        branch = np.asarray(result.branch)[:window] > 0
+        data = np.asarray(self.signal)[:window, result.tone]
+
+        if show_iq and branch.any() and (~branch).any():
+            # The decoded branch sequence, drawn as each channel's mean within each state --
+            # the reconstruction as the readout would have looked without noise.
+            for axis, values in ((axes[0], np.real(data)), (axes[1], np.imag(data))):
+                levels = np.where(branch, values[branch].mean(), values[~branch].mean())
+                axis.plot(time_axis, levels, color="tab:orange", lw=1.2, drawstyle="steps-post")
+
+        limit = float(time_axis[-1])
+        flips = np.asarray(result.flip_times) * scale
+        flips = flips[flips <= limit]
+        for axis in axes:
+            if flips.size <= _MAX_FLIP_MARKS:
+                for flip in flips:
+                    axis.axvline(flip, color="0.25", lw=0.7, alpha=0.65)
+            for burst in result.bursts:
+                start = burst.t_start * scale
+                if start > limit:
+                    continue
+                axis.axvspan(start, min(burst.t_end * scale, limit), color="tab:red", alpha=0.15)
+
+        info = summarize(result, result.bursts)
+        summary = (
+            f"{info['n_flips']} flips, rate = {info['rate_hz']:.3g} Hz\n"
+            f"contrast = {info['contrast']:.1f}, fidelity = {info['decoded_fidelity']:.3f}"
+        )
+        if info["n_bursts"]:
+            summary += f"\n{info['n_bursts']} burst(s), shaded"
+        elif flips.size > _MAX_FLIP_MARKS:
+            summary += f"\nflip marks omitted above {_MAX_FLIP_MARKS}"
+        axes[0].legend([summary], loc="best", fontsize=7, handlelength=0)
 
     def _analyze_constant(
         self,
         *,
         num_samples: Optional[int],
         title: Optional[str],
-        tone: int,
+        tone: Optional[int],
+        show_iq: bool,
         fit: bool,
+        reconstruct: bool,
         quantity: str,
         **fit_kwargs: Any,
     ):
-        """Plot the readout magnitude against time above its fitted noise spectrum.
+        """Annotate the stream grid with the parity reconstruction, over the fitted spectra.
 
-        :param num_samples: Limit the time panel to this many samples.
+        :param num_samples: Limit the time panels to this many samples.
         :param title: Figure title, or ``None`` for the default.
-        :param tone: Which tone to reconstruct.
-        :param fit: Overlay the parity-model fit.
-        :param quantity: Projection of the readout to take the spectrum of.
+        :param tone: Which tone to reconstruct, or ``None`` for all of them.
+        :param show_iq: Draw I/Q rather than power/phase in the grid.
+        :param fit: Overlay the parity-model fit on the spectra.
+        :param reconstruct: Mark the two-level reconstruction on the grid.
+        :param quantity: Projection of the readout to threshold and spectrate.
         :param fit_kwargs: Passed to :func:`~daq.analysis.noise.fit_parity_psd`.
         :returns: The created figure.
 
@@ -983,51 +1288,74 @@ class TimeStream(Base):
 
         from ..analysis.plotting import plot_psd
 
+        from ..analysis.parity import qpd_available
+
+        tones = self._tones(tone)
+        if quantity == "proj" and not qpd_available():
+            # The separation axis is qpd's to fit. Without it, say so and fall back to the
+            # magnitude rather than failing -- announced, and the panel labels record which
+            # projection was actually taken.
+            print(
+                "INFO: qpd is not installed, so the spectrum falls back to quantity='abs' "
+                "(the maximal-separation axis needs qpd.reconstruction)."
+            )
+            quantity = "abs"
         # Projected before drawing anything, so an unknown quantity costs no figure.
-        # The time panel shows the projection as recorded, operating point included, even
-        # though the spectrum below is of the fluctuation about it -- where the readout sits
-        # is half of what a constant-bias record is for.
-        projection = self._projection(tone=tone, quantity=quantity)
-        label = _QUANTITY_LABELS[quantity]
-        # The spread of the projection is BiasHunt's parity-contrast metric, so the number
-        # that ranks this operating point against others is the one annotated here. Taken
-        # over the whole record, not the plotted window, so num_samples cannot quietly
-        # change what it means.
-        contrast = float(np.std(projection))
+        for index in tones:
+            self._projection(tone=index, quantity=quantity)
 
-        fig, (ax_t, ax_psd) = plt.subplots(2, 1, figsize=(8, 8), tight_layout=True)
+        n_rows = len(tones)
+        fig = plt.figure(figsize=(12, 2.2 * n_rows + 4.5), tight_layout=True)
+        grid = fig.add_gridspec(n_rows + 1, 2, height_ratios=[1.0] * n_rows + [2.2])
+        axes = np.empty((n_rows, 2), dtype=object)
+        shared = None
+        for row in range(n_rows):
+            for column in range(2):
+                axis = fig.add_subplot(grid[row, column], sharex=shared)
+                shared = shared if shared is not None else axis
+                axes[row, column] = axis
+        ax_psd = fig.add_subplot(grid[n_rows, :])
 
-        trace = projection if num_samples is None else projection[:num_samples]
-        time_s = np.arange(trace.shape[0]) / self.df
-        ax_t.plot(time_s, trace, lw=0.5, color="tab:green")
-        ax_t.set_xlabel("Time [s]")
-        ax_t.set_ylabel(f"{label} [FS]")
-        ax_t.grid(True, alpha=0.3)
-        ax_t.legend(
-            [f"std over the record = {contrast:.4e} FS"],
-            loc="best",
-            fontsize=8,
-            handlelength=0,
+        time_axis, scale, _ = self._draw_stream_grid(
+            axes, tones=tones, num_samples=num_samples, show_iq=show_iq
         )
+
+        if reconstruct:
+            # No quantity here: qpd fits its own discrimination axis to the cloud. The
+            # quantity below is what the *spectrum* is taken of, which is a separate choice.
+            try:
+                results = self.reconstruct_parity(tone=tone)
+            except ImportError as err:
+                print(f"INFO: skipping the parity reconstruction: {err}")
+                results = []
+            else:
+                results = [results] if not isinstance(results, list) else results
+            for row, result in enumerate(results):
+                self._overlay_telegraph(
+                    axes[row], result, time_axis=time_axis, scale=scale, show_iq=show_iq
+                )
 
         f, psd = self.parity_psd(tone=tone, quantity=quantity)
         _, fits = plot_psd(
             f,
             psd,
             basis="electronic",
-            labels=(label, ""),
+            labels=(_QUANTITY_LABELS[quantity], ""),
             f_bw=self.df,
             fit=fit,
+            tone_labels=[self._tone_label(index) for index in tones],
             ax=ax_psd,
             **fit_kwargs,
         )
-        # plot_psd fits the array it was handed rather than reading one off this object, so
-        # what lands here describes the spectrum that was actually drawn. Only when a fit was
+        # plot_psd fits the arrays it was handed rather than reading one off this object, so
+        # what lands here describes the spectra that were actually drawn. Only when a fit was
         # asked for: analyze(fit=False) must not wipe an earlier fit_parity() result.
         if fit:
             self.fit_results = fits["a"]
 
-        fig.suptitle(self._title("Constant-bias parity stream", tone) if title is None else title)
+        fig.suptitle(
+            self._title("Constant-bias parity stream", tones[0]) if title is None else title
+        )
 
         plt.show()
         return fig
@@ -1039,84 +1367,27 @@ class TimeStream(Base):
         title: Optional[str] = None,
         show_iq: bool = True,
     ):
-        """
-        Plot the timestream data, using each tone's selected sideband.
+        """Plot the time-stream data, using each tone's selected sideband.
 
-        Parameters:
-        -----------
-        num_samples : int, optional
-            Number of samples to plot. If None, plots all samples.
-        title : str, optional
-            Title for the plot.
-        show_iq : bool, optional
-            If True, show I and Q streams instead of phase and power. Default is True.
-        """
-        if self.signal is None:
-            raise RuntimeError("No data available. Run the measurement first.")
+        The fallback reconstruction, and the plot every stream had before the bias dispatch
+        existed: one row per tone, I and Q (or power and phase) side by side.
 
+        :param num_samples: Plot only this many leading samples.
+        :param title: Figure title, or ``None`` for the default.
+        :param show_iq: Show I and Q rather than power and phase.
+        :returns: The created figure.
+
+        """
         import matplotlib.pyplot as plt
 
-        # Use the per-tone selected sideband
-        data = self.signal
-        freqs = self.signal_freqs
-
-        # Limit number of samples if specified
-        if num_samples is not None:
-            data = data[:num_samples]
-
-        # Create time axis
-        time_axis = np.arange(data.shape[0]) / self.df * 1e6  # time in μs
-
-        # Create figure with subplots for each frequency
-        n_freqs = data.shape[1]
+        n_tones = np.asarray(self.signal).shape[1]
         fig, axes = plt.subplots(
-            n_freqs, 2, figsize=(12, 2 * n_freqs), tight_layout=True, sharex=True
+            n_tones, 2, figsize=(12, 2 * n_tones), tight_layout=True, sharex=True, squeeze=False
         )
+        self._draw_stream_grid(axes, num_samples=num_samples, show_iq=show_iq)
 
-        # Handle single frequency case
-        if n_freqs == 1:
-            axes = axes.reshape(1, -1)
-
-        for i in range(n_freqs):
-            sb = "USB" if self.is_usb[i] else "LSB"
-            freq_label = f"{freqs[i]/1e9:.3f} GHz ({sb})"
-            if show_iq:
-                # I stream plot
-                i_stream = np.real(data[:, i])
-                axes[i, 0].plot(time_axis, i_stream)
-                axes[i, 0].set_ylabel(f"I [a.u.]\n{freq_label}")
-                axes[i, 0].grid(True, alpha=0.3)
-
-                # Q stream plot
-                q_stream = np.imag(data[:, i])
-                axes[i, 1].plot(time_axis, q_stream)
-                axes[i, 1].set_ylabel(f"Q [a.u.]\n{freq_label}")
-                axes[i, 1].grid(True, alpha=0.3)
-            else:
-                # Amplitude plot
-                amplitudes = np.abs(data[:, i])
-                power_db = 20.0 * np.log10(amplitudes)
-                axes[i, 0].plot(time_axis, power_db)
-                axes[i, 0].set_ylabel(f"Power [dBFS]\n{freq_label}")
-                axes[i, 0].grid(True, alpha=0.3)
-
-                # Phase plot
-                phases = np.angle(data[:, i])
-                axes[i, 1].plot(time_axis, phases)
-                axes[i, 1].set_ylabel(f"Phase [rad]\n{freq_label}")
-                axes[i, 1].grid(True, alpha=0.3)
-
-        # Set x-labels for bottom plots
-        axes[-1, 0].set_xlabel("Time [μs]")
-        axes[-1, 1].set_xlabel("Time [μs]")
-
-        # Set title
         plot_type = "I/Q Streams" if show_iq else "Power/Phase"
-        if title is not None:
-            fig.suptitle(f"{title} ({plot_type})")
-        else:
-            fig.suptitle(f"TimeStream ({plot_type})")
+        fig.suptitle(f"{'TimeStream' if title is None else title} ({plot_type})")
 
         plt.show()
-
         return fig

@@ -31,6 +31,14 @@ pyvisa = {version = "*", optional = true}
 # daq.analysis.resonator recovers the environmental term via the public
 # do_calibration() API.
 resonator_tools = {version = ">=2.1.0", optional = true}
+# Parity reconstruction (daq.analysis.parity, used by TimeStream's constant-bias and
+# sawtooth reconstructions): recovers when the parity flipped from an I/Q trace, and
+# clusters the flip train into quasiparticle bursts. **daq owns no parity algorithm** --
+# qpd owns the method, daq hands it the acquisition -- so this is a requirement rather than
+# an extra. Not on PyPI; installed from the lab's repository. It is still imported lazily,
+# so an environment that predates this pin degrades to "reconstruction unavailable" instead
+# of breaking `import daq`.
+qpd = {git = "https://github.com/WashU-Astroparticle-Lab/qpd.git", branch = "main"}
 
 [tool.poetry.extras]
 instruments = ["pyvisa"]

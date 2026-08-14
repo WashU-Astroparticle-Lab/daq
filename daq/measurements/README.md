@@ -205,8 +205,13 @@ biased**, because the samples alone cannot say. What tells it is the generator s
 | `ts.bias_mode` | detected from | what `analyze()` does |
 |---|---|---|
 | `"sawtooth"` | attached `function` = `RAMP` | folds the record into one ramp period and plots the block-averaged I/Q — a QC trace |
-| `"constant"` | attached `function` = `DC` | plots the readout magnitude against time above its noise spectrum, fitted to the random-telegraph parity model |
+| `"constant"` | attached `function` = `DC` | annotates the I/Q streams with the two-level parity reconstruction — levels, switching events, any burst — above the noise spectra fitted to the random-telegraph model |
 | `"unknown"` | nothing attached, or another carrier | the plain per-tone I/Q (or power/phase) plot, exactly as before |
+
+Every mode keeps the familiar layout: **one row per tone, I and Q side by side**, with the
+reconstruction drawn on top of the streams rather than in place of them. The constant-bias
+figure adds one spectrum panel below, carrying one curve and one fit per tone. Pass `tone=i`
+to restrict the figure to a single tone.
 
 ```python
 with Agilent33220A() as bias:
@@ -229,21 +234,54 @@ whose generator was never attached with `analyze(mode="sawtooth", period_s=1/500
 which it used to drop — so a file off disk knows how it was biased and reconstructs
 itself the same way a live run does. Read them back with `ts.bias_settings`.
 
-Useful arguments: `tone` (which tone to reconstruct — the bias reconstructions are
-single-tone), `raw=False` (drop the un-averaged overlay on the folded trace),
-`fit=False` and `quantity` (`"abs"`/`"real"`/`"imag"`) on the constant-bias panel, and
-any `fit_parity_psd` keyword (`fit_onef=True`, `n_bins`, …) passed straight through.
+Useful arguments: `tone=i` (one tone instead of all), `num_samples` (shorten the time
+panels — the reconstruction still runs on the whole record, so the rates and bursts
+describe the acquisition and not the window), `raw=False` (drop the un-averaged overlay
+on the folded trace), `reconstruct=False`, `fit=False`, `show_iq=False` (power/phase
+instead of I/Q; the level overlay is an I/Q construction and is skipped there),
+`quantity` (see below), and any `fit_parity_psd` keyword
+(`fit_onef=True`, `n_bins`, …) passed straight through.
 
-The same reconstructions are available without a figure:
+**Which projection.** The spectra are taken of `quantity="proj"` by default — the
+discrimination axis `qpd` fits to the IQ cloud. Parity moves the resonator between two
+points of that plane, and `"abs"`, `"real"` or `"imag"` each see only the `cos(angle)` of
+the line joining them: a separation that is mostly a phase shift barely moves the
+magnitude at all. (The *reconstruction* always fits its own axis, whatever this is set
+to. `BiasHunt` keeps `"abs"` as its own default, because that is what its contrast
+ranking uses; pass `quantity="proj"` to `hunt.average_psd()`.)
+
+**What the constant-bias panels show.** The reconstruction is
+[`qpd`](https://github.com/WashU-Astroparticle-Lab/qpd)'s — a two-blob emission model
+fitted blind and a two-state HMM decode; `daq` owns no parity algorithm and retunes none
+of its parameters. The orange step curve is the decoded branch sequence drawn at each
+channel's per-state mean, the grey verticals are the switching events, and a red span is
+a cluster of them inconsistent with the Poisson background (a quasiparticle burst). The
+legend carries the flip count, the rate implied by it, `qpd`'s contrast and its decoded
+fidelity. **A tone `qpd` calls `degenerate` is labelled as such and left unmarked** —
+that flag is its own verdict that the model latched onto noise, and it is worth reading
+before anything else, because the fidelity estimate stays high while it does.
+
+The same reconstructions are available without a figure, all of them per tone:
 
 ```python
-time_ms, avg_iq = ts.fold()          # sawtooth: defaults to the attached ramp period
-f, psd = ts.parity_psd()             # constant: mean-subtracted |S|, at the tuned df
+time_ms, avg_iq = ts.fold(tone=0)    # sawtooth: defaults to the attached ramp period
+f, psd = ts.parity_psd()             # constant: mean-subtracted |S| per tone, tuned df
 fit = ts.fit_parity(fit_onef=True)   # ... fitted; also lands on ts.fit_results
+rec = ts.reconstruct_parity()        # qpd: flip_times, rate_hz, branch, degenerate, bursts
 ```
 
-Both use the **tuned** `df` rather than the requested sample rate — a fold window off
-by a sample smears the average across blocks instead of dropping a leftover.
+`parity_psd`, `fit_parity` and `reconstruct_parity` cover **every** tone by default and
+return one result per tone — a bare dict/array for a single tone, a list/2-D array
+otherwise, following `fit_parity_psd`'s own convention. All of them use the **tuned**
+`df` rather than the requested sample rate: a fold window off by a sample smears the
+average across blocks, and a spectrum on the wrong rate sits on the wrong frequency axis.
+
+`rec.rate_hz` is worth comparing against the fitted `gamma_p` — it counts switching
+events in the time domain and owes nothing to the Lorentzian model, so if the two
+disagree badly, one of them is wrong and the reconstruction is the one you can look at.
+`reconstruct_parity` follows `bias_mode`: a sawtooth bias gets `qpd`'s *ramped*
+reconstruction, which models the moving branches, the blind crossings and the ramp
+resets that the fixed-gate routine would fit as noise.
 
 > **A gated ramp that nothing triggered still reports `"sawtooth"`** — that is the
 > measurement that was attempted — but `analyze()` warns before folding it. The

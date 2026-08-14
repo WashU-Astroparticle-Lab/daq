@@ -1,8 +1,8 @@
-"""Offline verification of ``TimeStream.analyze()``'s bias-mode dispatch.
+"""Offline verification of ``TimeStream.analyze()``'s bias-mode dispatch and reconstructions.
 
 Checks that a stream reconstructs itself according to how the gate was biased while it was
-recorded -- folded into one ramp period for a sawtooth bias, spectrum-and-parity-fit for a
-constant one, and the plain time-stream plot when nothing says::
+recorded -- folded into one ramp period for a sawtooth bias, two-level parity reconstruction
+plus spectrum for a constant one, and the plain time-stream plot when nothing says::
 
     python tests/test_timestream_analyze.py
 
@@ -11,20 +11,24 @@ no VISA runtime and no MongoDB; ``presto`` is stubbed when it is absent, since n
 test here touches it.
 
 The dispatch reads the generator settings ``Base.attach`` flattened onto the measurement, so
-three things have to hold together and each is checked separately:
+these have to hold together and each is checked separately:
 
 - **detection**: ``bias_function`` of ``"RAMP"`` means sawtooth, ``"DC"`` means constant, and
   anything else -- including no attachment at all -- falls back to the raw plot rather than
   guessing;
 - **round-trip**: ``load()`` restores those attributes, or a reloaded file analyses itself as
   ``unknown`` and the whole feature evaporates the moment the data comes off disk;
-- **reconstruction**: the fold really uses the attached ramp period at the *tuned* ``df``, and
-  the parity spectrum really is of the mean-subtracted projection.
+- **reconstruction**: the fold really uses the attached ramp period at the *tuned* ``df``, the
+  parity spectrum really is of the mean-subtracted projection, and the flip count recovers the
+  switching rate the spectral fit reports without using its model;
+- **multi-tone**: every tone is reconstructed and spectrated, not just tone 0.
 
-The gated-but-untriggered case gets its own check. A ramp gated on a port the acquisition
-never asserted records a static bias, folds happily, and produces a flat trace that looks like
-a dead device -- exactly the silent failure ``QCTrace`` refuses outright, so here it must at
-least warn.
+Two silent failures get their own checks. A ramp gated on a port the acquisition never
+asserted records a static bias, folds happily, and produces a flat trace that looks like a dead
+device -- exactly what ``QCTrace`` refuses outright, so here it must at least warn. And a
+record with no two-level structure must be reported as unresolved rather than thresholded:
+2-means splits pure Gaussian noise into "levels" 2.4 noise widths apart, so a detector that
+trusted its own output would decorate structureless noise with thousands of switching events.
 """
 
 import os
@@ -91,7 +95,7 @@ import matplotlib
 matplotlib.use("Agg")  # never open a window
 import matplotlib.pyplot as plt
 
-from daq.measurements.timestream import TimeStream
+from daq.measurements.timestream import DEFAULT_QUANTITY, TimeStream
 
 results = []
 
@@ -99,6 +103,15 @@ results = []
 def check(label, condition, detail=""):
     results.append(bool(condition))
     print(f"{'PASS' if condition else 'FAIL'}  {label}" + (f"  [{detail}]" if detail else ""))
+
+
+def _raises(call, exception):
+    """Return True when *call* raises *exception*."""
+    try:
+        call()
+    except exception:
+        return True
+    return False
 
 
 # ------------------------------------------------- synthetic streams
@@ -109,12 +122,17 @@ N_PERIODS = 40
 GAMMA_P = 200.0  # parity switching rate, Hz
 
 
-def make_stream(signal, **kwargs):
-    """Build a single-tone TimeStream carrying *signal* as its acquired data."""
-    signal = np.asarray(signal, dtype=np.complex128).reshape(-1, 1)
+def make_stream(signal, *, if_freqs=None, is_usb=None, **kwargs):
+    """Build a TimeStream carrying *signal* (1-D, or one column per tone) as its data."""
+    signal = np.asarray(signal, dtype=np.complex128)
+    if signal.ndim == 1:
+        signal = signal.reshape(-1, 1)
+    n_tones = signal.shape[1]
+    if_freqs = [0.0] * n_tones if if_freqs is None else if_freqs
     ts = TimeStream(
         lo_freq=2.8e9,
-        if_freqs=[0.0],
+        if_freqs=if_freqs,
+        is_usb=is_usb,
         df=FS,
         pixel_counts=signal.shape[0],
         amp=0.01,
@@ -126,14 +144,14 @@ def make_stream(signal, **kwargs):
     )
     ts.df = FS  # what run() would leave behind after tuning
     ts.signal = signal
-    ts.signal_freqs = np.array([2.8e9])
-    ts.freq_arr = np.array([0.0])
+    ts.freqs_usb = ts.lo_freq + ts.if_freqs
+    ts.freqs_lsb = ts.lo_freq - ts.if_freqs
+    ts.signal_freqs = np.where(ts.is_usb, ts.freqs_usb, ts.freqs_lsb)
+    ts.freq_arr = np.zeros(n_tones)
     ts.pixel_i = signal.copy()
     ts.pixel_q = signal.copy()
     ts.usb = signal.copy()
     ts.lsb = signal.copy()
-    ts.freqs_usb = np.array([2.8e9])
-    ts.freqs_lsb = np.array([2.8e9])
     return ts
 
 
@@ -150,13 +168,18 @@ def ramp_signal(seed=0):
 
 
 def telegraph_signal(seed=1, n=200_000):
-    """A random-telegraph magnitude at GAMMA_P, on a constant operating point."""
+    """A random-telegraph readout at GAMMA_P: two IQ blobs, isotropic noise.
+
+    Complex rather than a real magnitude cast to complex, because that is what a readout is
+    and what the reconstruction models -- a trace lying exactly on a line has zero width on
+    the minor axis, which is not a cloud any blob fit should be asked to interpret.
+    """
     rng = np.random.default_rng(seed)
     # Poisson switching: each sample flips with probability gamma_p / fs.
     flips = rng.random(n) < (GAMMA_P / FS)
     state = np.where(np.cumsum(flips) % 2 == 0, 1.0, -1.0)
-    magnitude = 0.5 + 0.02 * state + 0.002 * rng.standard_normal(n)
-    return magnitude.astype(np.complex128)
+    branches = (0.5 + 0.02 * state) * np.exp(1j * 0.3)
+    return branches + 0.002 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
 
 
 RAMP_SETTINGS = {
@@ -396,28 +419,181 @@ check("4f  the fit holds f_bw at the tuned df", np.isclose(fit["f_bw"], FS))
 check("4g  the fit lands on fit_results", constant.fit_results is fit)
 
 
-# ------------------------------------------------- 5. the figures themselves
+# ------------------------------------------------- 5. the reconstruction, via qpd
+
+# daq owns no parity algorithm: the reconstruction is qpd.reconstruction's, reached through
+# daq.analysis.parity. These checks are of the *wiring* -- that the trace, the tuned sample
+# rate and the right routine reach it, and that its verdicts reach the plot -- not of the
+# method, which qpd verifies in its own checks/ suite.
+
+from daq.analysis.parity import PROJECTIONS, project_readout, qpd_available  # noqa: E402
+
+HAVE_QPD = qpd_available()
+if not HAVE_QPD:
+    print("INFO: qpd is not installed; skipping the reconstruction checks")
+
+if HAVE_QPD:
+    rec = constant.reconstruct_parity()
+    # Passing the wrong sample rate is the wiring error this catches: the rate is in Hz, so a
+    # df that never reached qpd would show up here as a factor-of-anything discrepancy.
+    check(
+        "5a  the reconstructed rate matches the telegraph, so df reached qpd",
+        abs(rec.rate_hz - GAMMA_P) < 0.2 * GAMMA_P,
+        f"rate_hz = {rec.rate_hz:.1f} against {GAMMA_P:.0f} Hz",
+    )
+    check(
+        "5b  qpd does not call the model degenerate",
+        not rec.degenerate,
+        f"contrast {rec.contrast:.1f}",
+    )
+    check(
+        "5c  the decoded branch spans the record", rec.branch.shape[0] == constant.signal.shape[0]
+    )
+    check("5d  the tone index is attached", rec.tone == 0)
+    check("5e  a burst list is attached", isinstance(rec.bursts, list))
+
+    # The bias mode picks the routine: a swept gate needs the ramped reconstruction, since the
+    # static one would fit the moving branches as noise.
+    import qpd.reconstruction as _qpd  # noqa: E402
+
+    called = []
+    _static, _ramped = _qpd.reconstruct_parity_flips_static, _qpd.reconstruct_parity_flips_ramped
+    _qpd.reconstruct_parity_flips_static = lambda *a, **k: called.append("static") or _static(
+        *a, **k
+    )
+    _qpd.reconstruct_parity_flips_ramped = lambda *a, **k: called.append("ramped") or _static(
+        *a, **k
+    )
+    try:
+        constant.reconstruct_parity(bursts=False)
+        sawtooth.reconstruct_parity(bursts=False)
+        check(
+            "5f  a constant bias uses the fixed-gate reconstruction",
+            called[0] == "static",
+            str(called),
+        )
+        check("5g  a sawtooth bias uses the swept-gate one", called[1] == "ramped", str(called))
+        called.clear()
+        constant.reconstruct_parity(ramped=True, bursts=False)
+        check("5h  ... and ramped= overrides the detection", called == ["ramped"], str(called))
+    finally:
+        _qpd.reconstruct_parity_flips_static = _static
+        _qpd.reconstruct_parity_flips_ramped = _ramped
+
+    # A degenerate model must not be marked up as a reconstruction: qpd says so, and the plot
+    # has to read the flag rather than the flip list, which stays populated.
+    flat = make_stream(
+        0.5
+        + 0.002 * np.random.default_rng(11).standard_normal(50_000)
+        + 0.002j * np.random.default_rng(12).standard_normal(50_000)
+    )
+    flat.attach(bias=DC_SETTINGS)
+    flat_rec = flat.reconstruct_parity()
+    check(
+        "5i  structureless noise is reported degenerate by qpd",
+        flat_rec.degenerate,
+        f"contrast = {flat_rec.contrast:.2f}",
+    )
+    check("5j  ... and no bursts are hunted through it", flat_rec.bursts == [])
+
+    # Why "proj" is the default projection for the spectrum. Parity moves the resonator
+    # between two points of the IQ plane; a fixed axis sees only the cos(angle) of the line
+    # joining them, and for a separation that is mostly a phase shift, almost none of it.
+    phase_rng = np.random.default_rng(21)
+    phase_state = np.cumsum(phase_rng.random(100_000) < (GAMMA_P / FS)) % 2 == 0
+    phase_only = 0.5 * np.exp(1j * np.where(phase_state, 0.04, -0.04)) + 0.002 * (
+        phase_rng.standard_normal(100_000) + 1j * phase_rng.standard_normal(100_000)
+    )
+    spread_proj = np.std(project_readout(phase_only, "proj"))
+    spread_abs = np.std(project_readout(phase_only, "abs"))
+    check(
+        "5k  'proj' sees a phase-only telegraph that 'abs' does not",
+        spread_proj > 5 * spread_abs,
+        f"std proj {spread_proj:.2e} against abs {spread_abs:.2e}",
+    )
+    check("5l  ... and it is the default projection", DEFAULT_QUANTITY == "proj")
+
+check(
+    "5m  an unknown projection raises ValueError",
+    _raises(lambda: project_readout(np.ones(8, dtype=complex), "magnitude"), ValueError),
+)
+check("5n  the projections are named in one place", "proj" in PROJECTIONS and "abs" in PROJECTIONS)
+
+
+# ------------------------------------------------- 6. multi-tone
+
+# The whole complaint that prompted this: a two-tone acquisition reconstructed only tone 0.
+_ref_rng = np.random.default_rng(13)
+two_tone_signal = np.stack(
+    [
+        telegraph_signal(seed=1),
+        0.5 * np.exp(1j * 0.9)
+        + 0.002 * (_ref_rng.standard_normal(200_000) + 1j * _ref_rng.standard_normal(200_000)),
+    ],
+    axis=1,
+)
+two_tone = make_stream(two_tone_signal, if_freqs=[0.0, 10e6], is_usb=[True, False])
+two_tone.attach(bias=DC_SETTINGS)
+
+f2, psd2 = two_tone.parity_psd()
+check("6a  parity_psd returns one spectrum per tone", psd2.shape == (2, f2.size), str(psd2.shape))
+check(
+    "6b  a named tone still returns one spectrum",
+    two_tone.parity_psd(tone=1)[1].ndim == 1,
+)
+fits2 = two_tone.fit_parity()
+check("6c  fit_parity returns one fit per tone", isinstance(fits2, list) and len(fits2) == 2)
+recs2 = two_tone.reconstruct_parity()
+check(
+    "6d  reconstruct_parity returns one result per tone",
+    isinstance(recs2, list) and len(recs2) == 2,
+)
+check(
+    "6e  ... and each knows which tone it is",
+    [r.tone for r in recs2] == [0, 1],
+)
+check(
+    "6f  ... the telegraph tone resolves and the reference is called degenerate",
+    (not recs2[0].degenerate) and recs2[1].degenerate,
+    f"contrast {recs2[0].contrast:.1f} vs {recs2[1].contrast:.1f}",
+)
+try:
+    two_tone.parity_psd(tone=5)
+    bad_tone = False
+except IndexError:
+    bad_tone = True
+check("6g  an out-of-range tone raises IndexError", bad_tone)
+
+
+# ------------------------------------------------- 7. the figures themselves
 
 plt.close("all")
 fig = sawtooth.analyze()
-check("5a  the sawtooth reconstruction draws two panels", len(fig.axes) == 2)
+check("7a  the sawtooth reconstruction draws a row of I/Q per tone", len(fig.axes) == 2)
 check(
-    "5b  ... over one ramp period", "QC trace" in fig._suptitle.get_text(), fig._suptitle.get_text()
+    "7b  ... over one ramp period", "QC trace" in fig._suptitle.get_text(), fig._suptitle.get_text()
 )
 
 fig = constant.analyze()
-check("5c  the constant reconstruction draws two panels", len(fig.axes) == 2)
 check(
-    "5d  ... time series above spectrum",
-    fig.axes[1].get_xscale() == "log" and fig.axes[0].get_xscale() == "linear",
+    "7c  the constant reconstruction keeps the two-column grid, plus a spectrum", len(fig.axes) == 3
+)
+check(
+    "7d  ... streams on linear time above a log-log spectrum",
+    fig.axes[0].get_xscale() == "linear" and fig.axes[-1].get_xscale() == "log",
 )
 
+fig = two_tone.analyze()
+check("7e  a two-tone constant stream draws 2x2 panels and one shared spectrum", len(fig.axes) == 5)
+fig = two_tone.analyze(tone=0)
+check("7f  ... restricted to one tone on request", len(fig.axes) == 3)
+
 fig = bare.analyze()
-check("5e  the raw plot is unchanged: one row of I/Q per tone", len(fig.axes) == 2)
+check("7g  the raw plot is unchanged: one row of I/Q per tone", len(fig.axes) == 2)
 plt.close("all")
 
 
-# ------------------------------------------------- 6. the HDF5 round trip
+# ------------------------------------------------- 8. the HDF5 round trip
 
 # Without this the whole feature stops at the end of the session that took the data.
 with tempfile.TemporaryDirectory() as tmp:
@@ -425,19 +601,19 @@ with tempfile.TemporaryDirectory() as tmp:
     sawtooth.save(save_filename=path)
     reloaded = TimeStream.load(path)
 
-check("6a  a reloaded stream still knows it was ramp-biased", reloaded.bias_mode == "sawtooth")
+check("8a  a reloaded stream still knows it was ramp-biased", reloaded.bias_mode == "sawtooth")
 check(
-    "6b  ... at the same ramp frequency",
+    "8b  ... at the same ramp frequency",
     np.isclose(reloaded.bias_period_s, 1.0 / RAMP_HZ),
     f"{reloaded.bias_period_s}",
 )
-check("6c  ... and remembers its device", reloaded.device == "TestDevice")
+check("8c  ... and remembers its device", reloaded.device == "TestDevice")
 check(
-    "6d  ... and the generator's trigger port, so the ungated check still runs",
+    "8d  ... and the generator's trigger port, so the ungated check still runs",
     int(reloaded.bias_settings["trigger_port"]) == 1,
 )
 check(
-    "6e  the reloaded record folds to the same trace",
+    "8e  the reloaded record folds to the same trace",
     np.allclose(reloaded.fold()[1], avg_iq),
 )
 
