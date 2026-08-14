@@ -36,8 +36,19 @@ DEFAULT_BIAS_PREFIX = "bias"
 #: Reconstructions :meth:`TimeStream.analyze` can run, beyond ``"auto"``.
 ANALYZE_MODES = ("raw", "sawtooth", "constant")
 
+#: Projection of the complex readout the parity reconstructions run on by default. The
+#: maximal-separation axis: parity moves the resonator between two points of the IQ plane, and
+#: a fixed axis sees only the ``cos(angle)`` of the line joining them -- for a separation that
+#: is mostly a phase shift, almost none of it. See :data:`daq.analysis.parity.PROJECTIONS`.
+DEFAULT_QUANTITY = "proj"
+
 #: Axis labels for the projections of the complex readout the parity spectrum can be taken of.
-_QUANTITY_LABELS = {"abs": r"$|S|$", "real": r"$\mathrm{Re}(S)$", "imag": r"$\mathrm{Im}(S)$"}
+_QUANTITY_LABELS = {
+    "proj": r"$S_\parallel$",
+    "abs": r"$|S|$",
+    "real": r"$\mathrm{Re}(S)$",
+    "imag": r"$\mathrm{Im}(S)$",
+}
 
 #: Most individual switching events to draw as tick marks on a reconstructed trace. Past this
 #: the marks merge into a solid band that hides the trace they annotate; the reconstructed
@@ -49,6 +60,7 @@ __all__ = [
     "BIAS_FUNCTION_SUFFIX",
     "BoolAny",
     "DEFAULT_BIAS_PREFIX",
+    "DEFAULT_QUANTITY",
     "FloatAny",
     "MAX_TRIGGER_PORTS",
     "TimeStream",
@@ -693,34 +705,33 @@ class TimeStream(Base):
                 )
         return fold_timestream(self, self.df, period_s=period_s, n_periods=n_periods, tone=tone)
 
-    def _projection(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+    def _projection(
+        self, tone: int = 0, quantity: str = DEFAULT_QUANTITY
+    ) -> npt.NDArray[np.floating]:
         """Return a real projection of the complex readout, as recorded.
 
         :param tone: Which tone to project.
-        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :param quantity: One of :data:`~daq.analysis.parity.PROJECTIONS`.
         :raises RuntimeError: If there is no data.
-        :raises ValueError: If *quantity* is not one of the three.
+        :raises ValueError: If *quantity* is not a known projection.
         :returns: The projected series, operating point included.
 
         """
+        from ..analysis.parity import project_readout
+
         if self.signal is None:
             raise RuntimeError("No data available. Run or load the measurement first.")
-        signal = np.asarray(self.signal)[:, tone]
-        if quantity == "abs":
-            return np.abs(signal)
-        if quantity == "real":
-            return np.real(signal)
-        if quantity == "imag":
-            return np.imag(signal)
-        raise ValueError(f"quantity must be 'abs', 'real' or 'imag', got {quantity!r}")
+        return project_readout(np.asarray(self.signal)[:, tone], quantity)
 
-    def _parity_series(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+    def _parity_series(
+        self, tone: int = 0, quantity: str = DEFAULT_QUANTITY
+    ) -> npt.NDArray[np.floating]:
         """Return the real-valued series whose spectrum is the parity spectrum.
 
         :param tone: Which tone to project.
-        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :param quantity: One of :data:`~daq.analysis.parity.PROJECTIONS`.
         :raises RuntimeError: If there is no data.
-        :raises ValueError: If *quantity* is not one of the three.
+        :raises ValueError: If *quantity* is not a known projection.
         :returns: The mean-subtracted series -- the fluctuation, not the operating point.
 
         """
@@ -749,7 +760,7 @@ class TimeStream(Base):
         self,
         *,
         tone: Optional[int] = None,
-        quantity: str = "abs",
+        quantity: str = DEFAULT_QUANTITY,
         welch: bool = False,
         nperseg: Optional[int] = None,
         noverlap: Optional[int] = None,
@@ -798,7 +809,7 @@ class TimeStream(Base):
         self,
         *,
         tone: Optional[int] = None,
-        quantity: str = "abs",
+        quantity: str = DEFAULT_QUANTITY,
         welch: bool = False,
         nperseg: Optional[int] = None,
         noverlap: Optional[int] = None,
@@ -837,58 +848,68 @@ class TimeStream(Base):
         self,
         *,
         tone: Optional[int] = None,
-        quantity: str = "abs",
+        ramped: Optional[bool] = None,
         bursts: bool = True,
-        hysteresis: float = 0.25,
-        min_dwell_s: Optional[float] = None,
-        **burst_kwargs: Any,
+        burst_kwargs: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> Any:
-        """Recover the two-level switching sequence, and any rapid-switching bursts.
+        """Recover the parity-flip times of this acquisition, via ``qpd``.
 
-        The time-domain counterpart of :meth:`fit_parity`: it assigns each sample to one of the
-        two parity levels (:func:`~daq.analysis.parity.reconstruct_telegraph`) and looks for
-        runs of anomalously fast switching against the record's own mean rate
-        (:func:`~daq.analysis.parity.detect_bursts`). ``gamma_p_flips`` is an estimate of the
-        same rate the spectral fit reports, arrived at without the model -- if the two disagree
-        badly, one of them is wrong and the reconstruction is the one you can look at.
+        The time-domain counterpart of :meth:`fit_parity`: where that fits a switching rate out
+        of the spectrum, this recovers the individual tunnelling events. The method is
+        :mod:`qpd.reconstruction`'s -- a blind two-blob emission model and a two-state HMM
+        decode -- reached through :mod:`daq.analysis.parity`; this measurement supplies the
+        trace, the tuned sample rate, and which reconstruction the bias calls for, and passes
+        every algorithm parameter through on ``qpd``'s own defaults.
 
-        Check ``separated`` before reading anything else: it is ``False`` when the two levels
-        are not far enough apart to tell from noise, and the flips are then threshold crossings
-        rather than switching events.
+        Which reconstruction follows :attr:`bias_mode`, since it is the same distinction:
+        a **constant** gate holds ``n_g`` fixed and gives two stationary blobs, a **sawtooth**
+        sweeps it so the branches move, cross blind and reset with the ramp. Pass *ramped* to
+        override.
+
+        **Check ``degenerate`` and ``contrast`` on the result before using it** -- a model that
+        latched onto noise fails quietly, and its fidelity estimate stays high while it does.
+        The rate it reports (``rate_hz``) is worth comparing against the fitted ``gamma_p``
+        from :meth:`fit_parity`: the two share no machinery, so agreement is evidence and
+        disagreement means one of them is wrong.
 
         :param tone: Which tone to reconstruct. ``None`` (default) reconstructs every tone.
-        :param quantity: Projection of the complex readout to threshold -- ``"abs"``,
-            ``"real"`` or ``"imag"``.
-        :param bursts: Look for rapid-switching bursts. The result carries a ``bursts`` list
-            either way, empty when this is ``False`` or when nothing is significant.
-        :param hysteresis: Schmitt-trigger offset as a fraction of the level separation.
-        :param min_dwell_s: Absorb dwells shorter than this; see
-            :func:`~daq.analysis.parity.reconstruct_telegraph`.
-        :param burst_kwargs: Passed to :func:`~daq.analysis.parity.detect_bursts`
-            (``window_s``, ``p_value``, ``min_flips``).
-        :returns: The reconstruction dict for a single tone, or a list of them, one per tone,
-            each with a ``bursts`` key added.
+        :param ramped: Force the swept-gate (``True``) or fixed-gate (``False``)
+            reconstruction. ``None`` takes it from :attr:`bias_mode`.
+        :param bursts: Also cluster the flip train into rapid-switching bursts
+            (:func:`~daq.analysis.parity.detect_bursts`), using the reconstruction's own rate
+            as the Poisson background.
+        :param burst_kwargs: Passed to that call (``max_gap``, ``min_flips``,
+            ``max_p_value``); ``qpd``'s defaults otherwise. Note its ``max_p_value`` default is
+            ``None``, i.e. every cluster is returned with its p-value rather than filtered --
+            see :func:`~daq.analysis.parity.detect_bursts`.
+        :param kwargs: Passed to the ``qpd`` reconstruction routine.
+        :raises ImportError: If ``qpd`` is not installed.
+        :returns: ``qpd``'s result for a single tone, or a list of them, one per tone. Each
+            carries a ``bursts`` list and a ``tone`` index attached by this method.
 
         """
-        from ..analysis.parity import detect_bursts, reconstruct_telegraph
+        from ..analysis.parity import detect_bursts, reconstruct_parity
+
+        if ramped is None:
+            ramped = self.bias_mode == "sawtooth"
 
         results = []
         for index in self._tones(tone):
-            result = reconstruct_telegraph(
-                self._projection(tone=index, quantity=quantity),
-                self.df,
-                hysteresis=hysteresis,
-                min_dwell_s=min_dwell_s,
-            )
-            # A burst hunt on a record with no resolvable levels would be a hunt through noise
-            # crossings, and it would find plenty.
-            if bursts and result["separated"]:
-                result["bursts"] = detect_bursts(
-                    result["flip_times_s"], result["duration_s"], **burst_kwargs
+            signal = np.asarray(self.signal)[:, index]
+            result = reconstruct_parity(signal, self.df, ramped=ramped, **kwargs)
+            found = []
+            # A burst hunt over a degenerate model would be a hunt through noise crossings,
+            # and it would find plenty.
+            if bursts and not getattr(result, "degenerate", False):
+                found = detect_bursts(
+                    result.flip_times,
+                    getattr(result, "rate_hz", 0.0),
+                    signal.shape[0] / self.df,
+                    **(burst_kwargs or {}),
                 )
-            else:
-                result["bursts"] = []
-            result["tone"] = index
+            result.bursts = found
+            result.tone = index
             results.append(result)
         return results[0] if len(results) == 1 else results
 
@@ -936,7 +957,7 @@ class TimeStream(Base):
         raw: bool = True,
         fit: bool = True,
         reconstruct: bool = True,
-        quantity: str = "abs",
+        quantity: str = DEFAULT_QUANTITY,
         **fit_kwargs: Any,
     ):
         """Reconstruct and plot the acquisition according to how the gate was biased.
@@ -1172,70 +1193,68 @@ class TimeStream(Base):
     def _overlay_telegraph(
         self,
         axes,
-        result: Dict[str, Any],
+        result: Any,
         *,
         time_axis: npt.NDArray[np.floating],
         scale: float,
         show_iq: bool,
     ) -> None:
-        """Mark one tone's reconstructed levels, flips and bursts on its row of the grid.
+        """Mark one tone's reconstructed branches, flips and bursts on its row of the grid.
 
         :param axes: The ``(left, right)`` axes of this tone's row.
-        :param result: One :meth:`reconstruct_parity` result.
+        :param result: One :meth:`reconstruct_parity` result, i.e. ``qpd``'s.
         :param time_axis: Time axis the row was drawn against.
         :param scale: Seconds-to-plot-unit factor for that axis.
-        :param show_iq: Whether the row holds I/Q (levels are drawn) or power/phase (not).
+        :param show_iq: Whether the row holds I/Q (branch levels are drawn) or power/phase.
 
         """
-        # Imported here, not at module scope: daq.analysis pulls in iminuit and scipy through
-        # its package __init__, and `import daq` must not depend on either.
-        from ..analysis.parity import MIN_SEPARATION_SNR
+        from ..analysis.parity import summarize
 
         if time_axis.size == 0:
             return
-        if not result["separated"]:
-            # Thresholding this would produce flips at the noise rate. Say so on the panel
-            # instead: an unmarked trace is a result, a picket fence of false flips is not.
+        if result.degenerate:
+            # qpd's own verdict that the fitted model latched onto noise. Marking its flips
+            # would be marking noise crossings, and the fidelity estimate stays high while it
+            # does -- which is exactly why the flag exists and is read here.
             axes[0].set_title(
-                f"no resolvable two-level structure (separation = {result['snr']:.1f} noise "
-                f"widths, floor {MIN_SEPARATION_SNR})",
+                f"qpd reports a degenerate model (contrast = {result.contrast:.1f}); "
+                "flips not marked",
                 fontsize=8,
                 color="tab:red",
             )
             return
 
         window = time_axis.shape[0]
-        state = np.asarray(result["state"])[:window]
-        data = np.asarray(self.signal)[:window, result["tone"]]
+        branch = np.asarray(result.branch)[:window] > 0
+        data = np.asarray(self.signal)[:window, result.tone]
 
-        if show_iq and state.any() and (~state).any():
-            # The reconstruction proper: each channel held at its own per-level mean, so the
-            # step curve is what the two-level model says the readout was doing.
+        if show_iq and branch.any() and (~branch).any():
+            # The decoded branch sequence, drawn as each channel's mean within each state --
+            # the reconstruction as the readout would have looked without noise.
             for axis, values in ((axes[0], np.real(data)), (axes[1], np.imag(data))):
-                levels = np.where(state, values[state].mean(), values[~state].mean())
+                levels = np.where(branch, values[branch].mean(), values[~branch].mean())
                 axis.plot(time_axis, levels, color="tab:orange", lw=1.2, drawstyle="steps-post")
 
         limit = float(time_axis[-1])
-        flips = np.asarray(result["flip_times_s"]) * scale
+        flips = np.asarray(result.flip_times) * scale
         flips = flips[flips <= limit]
         for axis in axes:
             if flips.size <= _MAX_FLIP_MARKS:
                 for flip in flips:
                     axis.axvline(flip, color="0.25", lw=0.7, alpha=0.65)
-            for burst in result["bursts"]:
-                start = burst["start_s"] * scale
+            for burst in result.bursts:
+                start = burst.t_start * scale
                 if start > limit:
                     continue
-                axis.axvspan(start, min(burst["end_s"] * scale, limit), color="tab:red", alpha=0.15)
+                axis.axvspan(start, min(burst.t_end * scale, limit), color="tab:red", alpha=0.15)
 
+        info = summarize(result, result.bursts)
         summary = (
-            f"{result['n_flips']} flips, "
-            rf"$\Gamma_p^\mathrm{{flips}}$ = {result['gamma_p_flips']:.3g} Hz"
-            "\n"
-            f"separation = {result['snr']:.1f} noise widths"
+            f"{info['n_flips']} flips, rate = {info['rate_hz']:.3g} Hz\n"
+            f"contrast = {info['contrast']:.1f}, fidelity = {info['decoded_fidelity']:.3f}"
         )
-        if result["bursts"]:
-            summary += f"\n{len(result['bursts'])} burst(s), shaded"
+        if info["n_bursts"]:
+            summary += f"\n{info['n_bursts']} burst(s), shaded"
         elif flips.size > _MAX_FLIP_MARKS:
             summary += f"\nflip marks omitted above {_MAX_FLIP_MARKS}"
         axes[0].legend([summary], loc="best", fontsize=7, handlelength=0)
@@ -1269,7 +1288,18 @@ class TimeStream(Base):
 
         from ..analysis.plotting import plot_psd
 
+        from ..analysis.parity import qpd_available
+
         tones = self._tones(tone)
+        if quantity == "proj" and not qpd_available():
+            # The separation axis is qpd's to fit. Without it, say so and fall back to the
+            # magnitude rather than failing -- announced, and the panel labels record which
+            # projection was actually taken.
+            print(
+                "INFO: qpd is not installed, so the spectrum falls back to quantity='abs' "
+                "(the maximal-separation axis needs qpd.reconstruction)."
+            )
+            quantity = "abs"
         # Projected before drawing anything, so an unknown quantity costs no figure.
         for index in tones:
             self._projection(tone=index, quantity=quantity)
@@ -1291,8 +1321,15 @@ class TimeStream(Base):
         )
 
         if reconstruct:
-            results = self.reconstruct_parity(tone=tone, quantity=quantity)
-            results = [results] if isinstance(results, dict) else results
+            # No quantity here: qpd fits its own discrimination axis to the cloud. The
+            # quantity below is what the *spectrum* is taken of, which is a separate choice.
+            try:
+                results = self.reconstruct_parity(tone=tone)
+            except ImportError as err:
+                print(f"INFO: skipping the parity reconstruction: {err}")
+                results = []
+            else:
+                results = [results] if not isinstance(results, list) else results
             for row, result in enumerate(results):
                 self._overlay_telegraph(
                     axes[row], result, time_axis=time_axis, scale=scale, show_iq=show_iq

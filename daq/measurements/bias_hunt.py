@@ -288,21 +288,22 @@ class BiasHunt(GateBiasMeasurement):
         """Return the real-valued series whose spectrum is the parity spectrum.
 
         :param stream: A run single-tone time stream.
-        :param quantity: ``"abs"``, ``"real"`` or ``"imag"`` -- which projection of the
-            complex readout to take. ``"abs"`` matches :meth:`parity_contrast_of`.
-        :raises ValueError: If *quantity* is not one of the three.
+        :param quantity: Which projection of the complex readout to take, from
+            :data:`~daq.analysis.parity.PROJECTIONS`. ``"abs"`` is the default here because it
+            matches :meth:`parity_contrast_of`, the metric this measurement *ranks* by --
+            unlike :class:`~daq.measurements.timestream.TimeStream`, which defaults to
+            ``"proj"`` since it is not ranking anything. Pass ``"proj"`` for the
+            maximal-separation axis, which sees the whole telegraph rather than its projection
+            onto the magnitude.
+        :raises ValueError: If *quantity* is not a known projection.
         :returns: The mean-subtracted series, i.e. the fluctuation about the operating point.
 
         """
-        signal = np.asarray(stream.signal)[:, 0]
-        if quantity == "abs":
-            series = np.abs(signal)
-        elif quantity == "real":
-            series = np.real(signal)
-        elif quantity == "imag":
-            series = np.imag(signal)
-        else:
-            raise ValueError(f"quantity must be 'abs', 'real' or 'imag', got {quantity!r}")
+        from ..analysis.parity import project_readout
+
+        # One definition of each projection, shared with TimeStream, so the two classes cannot
+        # drift apart on what "abs" or "proj" means.
+        series = project_readout(np.asarray(stream.signal)[:, 0], quantity)
         # The parity signal is the *fluctuation*, not the operating point it sits on. For the
         # bare periodogram a constant offset lands entirely in the f=0 bin (which the fit drops
         # anyway), so this is cosmetic there -- but it is load-bearing on the Welch path when

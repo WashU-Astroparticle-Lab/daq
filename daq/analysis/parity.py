@@ -1,360 +1,216 @@
 # -*- coding: utf-8 -*-
-"""Time-domain reconstruction of a random-telegraph (parity) time stream.
+"""Adapter onto :mod:`qpd.reconstruction`, the parity-reconstruction package.
 
-The frequency-domain half of this analysis lives in :mod:`daq.analysis.noise` --
-:func:`~daq.analysis.noise.fit_parity_psd` fits the switching rate out of the spectrum. This
-module is its time-domain counterpart: it assigns each sample to one of the two levels, so the
-switching events themselves are recoverable rather than only their aggregate rate.
+**No parity algorithm lives here.** ``qpd`` is the lab's model of this exact measurement --
+the forward simulator, the transmon theory, and the inverse problem of recovering when the
+parity flipped from an I/Q trace -- and this module exists only to hand a
+:class:`~daq.measurements.timestream.TimeStream` to it and hand the answer back. The same
+relationship :mod:`daq.analysis.resonator` has with ``resonator_tools``: the acquisition layer
+owns the data, the analysis package owns the method.
 
-The two are worth having together because they fail differently. The spectral fit is blind to
-*when* things happened -- a record whose switching rate doubles halfway through fits a single
-Lorentzian at some intermediate corner and gives no sign of it -- while the time-domain
-reconstruction gives an independent rate estimate (flips per second) and localises the
-episodes. :func:`detect_bursts` is what that localisation is for: a run of rapid switching
-against an otherwise quiet record, which for a quasiparticle-sensitive device is an impact
-event rather than a property of the operating point.
+What ``qpd`` provides, and what would otherwise have to be reinvented badly here:
+
+- :func:`qpd.reconstruction.reconstruct_parity_flips_static` -- two-blob emission model fitted
+  blind to the trace, then a two-state HMM decode. The discrimination axis, the noise width
+  and the flip rate are all learned from the data.
+- :func:`qpd.reconstruction.reconstruct_parity_flips_ramped` -- the same for a *swept* gate,
+  where the branches move, cross blind, and reset with the ramp.
+- :func:`qpd.reconstruction.detect_bursts` -- clusters the flip train against its Poisson
+  background with a **trials-corrected** scan statistic.
+- ``degenerate`` / ``contrast`` on the result -- whether the fitted model latched onto noise,
+  which is the check to run before believing any of the rest.
+- :func:`qpd.reconstruction.benchmark_reconstruction` -- replays the fidelity fitted to *your*
+  trace into surrogates that do have truth, so the quoted efficiency is the efficiency on the
+  data you actually took. Not wrapped here; call it directly on ``ts.signal[:, tone]``.
+
+``qpd`` is an optional dependency, imported lazily so ``import daq`` works without it and the
+reconstruction degrades to "not available" rather than to a worse method.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Any, Dict, List, Optional
 
 import numpy as np
 import numpy.typing as npt
 
-__all__ = ["detect_bursts", "reconstruct_telegraph"]
+__all__ = [
+    "PROJECTIONS",
+    "detect_bursts",
+    "project_readout",
+    "qpd_available",
+    "reconstruct_parity",
+]
 
-#: Level separation, in units of the within-level noise, below which a record is not treated as
-#: two-level at all. Under this the "flips" a threshold produces are noise crossings, not
-#: switching events, and reporting them as a reconstruction would be worse than reporting
-#: nothing.
+#: Real projections of a complex readout a parity analysis can be run on.
 #:
-#: **This metric does not go to zero on structureless data**, which is why the threshold is
-#: where it is rather than near 1. Splitting a unimodal Gaussian at its own mean leaves halves
-#: whose means are ``sqrt(2/pi) = 0.80`` sigma either side and whose within-half spread is
-#: ``sqrt(1 - 2/pi) = 0.60`` sigma, so 2-means on pure noise reports a "separation" of about
-#: 2.6 noise widths. Measured over eight realisations of 2e5 Gaussian samples: 2.35-2.37,
-#: tight enough to treat as a floor. A genuine telegraph at ``separation / noise = 2`` scores
-#: 2.67 -- barely above that floor -- and its flip count over-reads the true rate by 27x, while
-#: at 4.0 it scores 4.05 and the rate is 55 % high but the right order. 3.5 sits above the
-#: floor and above the useless case, below the marginal-but-usable one.
-MIN_SEPARATION_SNR = 3.5
+#: ``"proj"`` is the default and the right one for a two-level readout: parity moves the
+#: resonator between two points of the IQ plane, and a fixed axis sees only the ``cos(angle)``
+#: of the line joining them -- for a separation that is mostly a phase shift, almost none of
+#: it. The axis itself comes from ``qpd``'s blind fit, not from anything here.
+PROJECTIONS = ("proj", "abs", "real", "imag")
 
 
-def _two_levels(series: npt.NDArray[np.floating]) -> tuple:
-    """Find the two levels of a telegraph series by 1-D 2-means.
+def qpd_available() -> bool:
+    """Return whether the ``qpd`` package can be imported.
 
-    Initialised at the 10th and 90th percentiles, which is robust to the tails a threshold
-    would otherwise be dragged by, and deterministic -- the same record always gives the same
-    levels.
-
-    :param series: The real-valued series.
-    :returns: ``(low, high)`` level estimates.
+    :returns: ``True`` when parity reconstruction is available.
 
     """
-    low, high = np.percentile(series, [10.0, 90.0])
-    for _ in range(50):
-        mid = 0.5 * (low + high)
-        below = series <= mid
-        if not below.any() or below.all():
-            break
-        new_low = float(series[below].mean())
-        new_high = float(series[~below].mean())
-        if np.isclose(new_low, low) and np.isclose(new_high, high):
-            low, high = new_low, new_high
-            break
-        low, high = new_low, new_high
-    return float(low), float(high)
+    try:
+        import qpd.reconstruction  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
-def _schmitt(
-    series: npt.NDArray[np.floating], low_threshold: float, high_threshold: float
-) -> npt.NDArray[np.bool_]:
-    """Assign a two-state sequence with hysteresis, vectorised.
+def _require_qpd():
+    """Import :mod:`qpd.reconstruction`, or explain how to get it.
 
-    A single threshold makes a sample sitting on it flip on every noise excursion, which shows
-    up as a burst of spurious switching exactly where the signal is least informative. Two
-    thresholds mean a state is held until the series crosses the *other* one.
-
-    :param series: The real-valued series.
-    :param low_threshold: Cross below this to enter the low state.
-    :param high_threshold: Cross above this to enter the high state.
-    :returns: Boolean array, ``True`` in the high state.
+    :raises ImportError: If ``qpd`` is not installed.
+    :returns: The :mod:`qpd.reconstruction` module.
 
     """
-    decided = np.zeros(series.shape[0], dtype=np.int8)
-    decided[series > high_threshold] = 1
-    decided[series < low_threshold] = -1
-
-    nonzero = decided != 0
-    if not nonzero.any():
-        # Everything sits between the thresholds: no crossing was ever unambiguous.
-        return np.zeros(series.shape[0], dtype=bool)
-
-    # Forward-fill the last decided sample: between the thresholds the state is held.
-    indices = np.maximum.accumulate(np.where(nonzero, np.arange(series.shape[0]), 0))
-    state = decided[indices] > 0
-    # Before the first decided sample there is nothing to hold, so adopt the first decision.
-    first = int(np.argmax(nonzero))
-    state[:first] = decided[first] > 0
-    return state
+    try:
+        import qpd.reconstruction as reconstruction
+    except ImportError as err:  # pragma: no cover - depends on the environment
+        raise ImportError(
+            "Parity reconstruction needs the qpd package: pip install "
+            "git+https://github.com/WashU-Astroparticle-Lab/qpd.git (or -e a local checkout). "
+            "It owns the reconstruction method; daq only hands it the acquisition."
+        ) from err
+    return reconstruction
 
 
-def _drop_short_dwells(state: npt.NDArray[np.bool_], min_samples: int) -> npt.NDArray[np.bool_]:
-    """Absorb dwells shorter than *min_samples* into the preceding one.
+def project_readout(
+    z: npt.ArrayLike, quantity: str = "proj", *, model: Optional[Any] = None
+) -> npt.NDArray[np.floating]:
+    """Reduce a complex readout to the real series a spectrum can be taken of.
 
-    :param state: The two-state sequence.
-    :param min_samples: Shortest dwell to keep, in samples.
-    :returns: The filtered sequence.
+    ``"proj"`` projects onto the discrimination axis ``qpd`` fits to the cloud
+    (:func:`qpd.reconstruction.fit_two_blobs`, whose model carries the projection), which is
+    where the whole parity signal lives. The other three are the fixed axes, kept because they
+    are what :class:`~daq.measurements.bias_hunt.BiasHunt` ranks by and are sometimes what you
+    want to look at; they need no ``qpd``.
+
+    The operating point is kept for the fixed axes -- where the readout sits is worth plotting
+    even when only its fluctuation is worth spectrating. The projected axis is centred on the
+    cloud's own origin, since it has no meaningful zero of its own.
+
+    :param z: Complex readout samples.
+    :param quantity: One of :data:`PROJECTIONS`.
+    :param model: A fitted ``qpd`` blob model to project with, e.g. ``result.model`` from a
+        reconstruction already run. Saves refitting; ignored unless *quantity* is ``"proj"``.
+    :raises ValueError: If *quantity* is not one of :data:`PROJECTIONS`.
+    :raises ImportError: If *quantity* is ``"proj"`` and ``qpd`` is not installed.
+    :returns: The real-valued series.
 
     """
-    if min_samples <= 1:
-        return state
-    state = state.copy()
-    for _ in range(10):
-        edges = np.flatnonzero(np.diff(state)) + 1
-        starts = np.concatenate(([0], edges))
-        ends = np.concatenate((edges, [state.shape[0]]))
-        short = np.flatnonzero((ends - starts) < min_samples)
-        # The first segment has no predecessor to be absorbed into; leave it.
-        short = short[short > 0]
-        if short.size == 0:
-            break
-        for index in short:
-            state[starts[index] : ends[index]] = state[starts[index] - 1]
-    return state
+    z = np.asarray(z)
+    if quantity == "proj":
+        if model is None:
+            model = _require_qpd().fit_two_blobs(z)
+        return np.asarray(model.project(z), dtype=np.float64)
+    if quantity == "abs":
+        return np.abs(z)
+    if quantity == "real":
+        return np.real(z)
+    if quantity == "imag":
+        return np.imag(z)
+    raise ValueError(f"quantity must be one of {list(PROJECTIONS)}, got {quantity!r}")
 
 
-def reconstruct_telegraph(
-    series: npt.ArrayLike,
+def reconstruct_parity(
+    iq: npt.ArrayLike,
     fs: float,
     *,
-    hysteresis: float = 0.25,
-    min_dwell_s: Optional[float] = None,
-    levels: Optional[tuple] = None,
-    min_snr: float = MIN_SEPARATION_SNR,
-) -> Dict[str, Any]:
-    """Reconstruct the two-level switching sequence of a parity time stream.
+    ramped: bool = False,
+    **kwargs: Any,
+) -> Any:
+    """Recover the parity-flip times of a readout trace, via ``qpd``.
 
-    The levels are found by 2-means, the samples are assigned with a Schmitt trigger at
-    ``mid +/- hysteresis * separation``, and the switching events are the transitions of that
-    assignment. The flip count gives a rate estimate independent of the spectral fit: for a
-    symmetric telegraph the mean dwell time is ``1 / Gamma_p``, so ``Gamma_p = n_flips /
-    duration``. Comparing it against
-    :func:`~daq.analysis.noise.fit_parity_psd`'s ``gamma_p`` is the cheapest check there is
-    that either number means anything.
+    Dispatches to the reconstruction that matches how the gate was biased, which is the same
+    distinction :attr:`~daq.measurements.timestream.TimeStream.bias_mode` already draws:
 
-    **A record with no two-level structure is reported as such, not thresholded anyway.**
-    ``separated`` is ``False`` when the levels are closer than *min_snr* noise widths, which is
-    the case for a stream taken off the parity-sensitive operating point. The flips are still
-    returned -- they are just noise crossings, and their count says so by being enormous. Note
-    that ``snr`` bottoms out near 2.4 rather than 0 on structureless data, for the reason given
-    at :data:`MIN_SEPARATION_SNR`; read it against that floor, not against zero.
+    - a **constant** bias holds ``n_g`` fixed, so the readout is two stationary blobs --
+      :func:`qpd.reconstruction.reconstruct_parity_flips_static`;
+    - a **sawtooth** bias sweeps ``n_g``, so the branches move, cross blind and reset with the
+      ramp -- :func:`qpd.reconstruction.reconstruct_parity_flips_ramped`, which models all
+      three. The static routine would fit them as noise.
 
-    :param series: Real-valued projection of the readout, e.g.
-        ``TimeStream._projection`` output. Complex input is rejected: which projection to take
-        is a decision this function should not make silently.
+    Both are blind: no device or resonator parameter is supplied.
+
+    **Check ``degenerate`` and ``contrast`` on the result before using it.** A model that has
+    latched onto noise fails quietly, and its fidelity estimate stays high while it does.
+
+    :param iq: Complex readout samples of one tone.
     :param fs: Sample rate in hertz -- the *tuned* ``TimeStream.df``.
-    :param hysteresis: Threshold offset from the midpoint, as a fraction of the level
-        separation. ``0`` gives a single threshold at the midpoint (and the chatter that comes
-        with it); the default holds a state until the series has crossed three quarters of the
-        way to the other level.
-    :param min_dwell_s: Absorb dwells shorter than this into the preceding one. ``None``
-        (default) keeps every dwell the hysteresis allows -- set it only when you know the
-        physical switching cannot be faster than some scale, since it biases the rate down.
-    :param levels: Explicit ``(low, high)`` levels, skipping the 2-means step.
-    :param min_snr: Level separation, in within-level noise widths, below which ``separated``
-        is ``False``.
-    :raises TypeError: If *series* is complex.
-    :raises ValueError: If *series* is not 1-D with at least two samples, or *fs* is not
-        positive.
-    :returns: A dict carrying ``state`` (bool array, ``True`` in the high level),
-        ``flip_indices`` / ``flip_times_s``, ``n_flips``, ``gamma_p_flips`` (Hz), ``levels``,
-        ``separation``, ``noise`` (within-level std), ``snr``, ``separated``,
-        ``low_threshold`` / ``high_threshold``, ``mean_dwell_s`` and ``duration_s``.
+    :param ramped: Use the swept-gate reconstruction rather than the fixed-gate one.
+    :param kwargs: Passed through to the ``qpd`` routine.
+    :raises ImportError: If ``qpd`` is not installed.
+    :returns: ``qpd``'s reconstruction result.
 
     """
-    series = np.asarray(series)
-    if np.iscomplexobj(series):
-        raise TypeError(
-            "reconstruct_telegraph needs a real projection of the readout, not complex I/Q; "
-            "project it first (e.g. np.abs(signal[:, tone]))."
-        )
-    series = series.astype(np.float64, copy=False)
-    if series.ndim != 1 or series.shape[0] < 2:
-        raise ValueError(f"series must be 1-D with at least 2 samples, got shape {series.shape}")
-    if fs <= 0:
-        raise ValueError(f"fs must be positive, got {fs}")
-
-    low, high = _two_levels(series) if levels is None else (float(levels[0]), float(levels[1]))
-    if high < low:
-        low, high = high, low
-    separation = high - low
-    midpoint = 0.5 * (low + high)
-
-    if separation <= 0:
-        state = np.zeros(series.shape[0], dtype=bool)
-        low_threshold = high_threshold = midpoint
-    else:
-        low_threshold = midpoint - hysteresis * separation
-        high_threshold = midpoint + hysteresis * separation
-        state = _schmitt(series, low_threshold, high_threshold)
-        if min_dwell_s is not None:
-            state = _drop_short_dwells(state, int(round(min_dwell_s * fs)))
-
-    # Noise about the assigned levels, which is what the separation has to beat. Measured
-    # against the *assignment* rather than the whole record's std, since the latter is
-    # dominated by the switching itself -- the quantity being tested against.
-    residual = series.copy()
-    if state.any():
-        residual[state] -= series[state].mean()
-    if (~state).any():
-        residual[~state] -= series[~state].mean()
-    noise = float(np.std(residual))
-    snr = float(separation / noise) if noise > 0 else float("inf")
-
-    flip_indices = np.flatnonzero(np.diff(state)) + 1
-    duration_s = series.shape[0] / fs
-    n_flips = int(flip_indices.size)
-
-    return {
-        "state": state,
-        "flip_indices": flip_indices,
-        "flip_times_s": flip_indices / fs,
-        "n_flips": n_flips,
-        # Symmetric telegraph: mean dwell = 1 / Gamma_p, so the flip rate *is* Gamma_p.
-        "gamma_p_flips": n_flips / duration_s if duration_s > 0 else float("nan"),
-        "mean_dwell_s": duration_s / n_flips if n_flips else float("nan"),
-        "levels": (low, high),
-        "separation": separation,
-        "noise": noise,
-        "snr": snr,
-        "separated": bool(snr >= min_snr and separation > 0),
-        "low_threshold": low_threshold,
-        "high_threshold": high_threshold,
-        "duration_s": duration_s,
-        "fs": float(fs),
-    }
-
-
-def _poisson_sf(k: int, mu: float) -> float:
-    """Return ``P(N >= k)`` for a Poisson variable of mean *mu*.
-
-    Summed directly for small means and normal-approximated above 50, where the direct sum
-    starts at ``exp(-mu)`` and underflows.
-
-    :param k: Count threshold.
-    :param mu: Poisson mean.
-    :returns: The upper-tail probability.
-
-    """
-    if k <= 0:
-        return 1.0
-    if mu <= 0:
-        return 0.0
-    if mu > 50:
-        # Continuity-corrected normal tail; accurate to well within the decade that matters
-        # for a detection threshold.
-        z = (k - 0.5 - mu) / math.sqrt(mu)
-        return 0.5 * math.erfc(z / math.sqrt(2.0))
-    term = math.exp(-mu)
-    cdf = term
-    for i in range(1, k):
-        term *= mu / i
-        cdf += term
-    return max(0.0, 1.0 - cdf)
+    reconstruction = _require_qpd()
+    routine = (
+        reconstruction.reconstruct_parity_flips_ramped
+        if ramped
+        else reconstruction.reconstruct_parity_flips_static
+    )
+    return routine(reconstruction.as_complex_trace(np.asarray(iq)), float(fs), **kwargs)
 
 
 def detect_bursts(
-    flip_times_s: npt.ArrayLike,
+    flip_times: npt.ArrayLike,
+    background_rate_hz: float,
     duration_s: float,
-    *,
-    window_s: Optional[float] = None,
-    expected_per_window: float = 5.0,
-    p_value: float = 1e-3,
-    min_flips: int = 20,
-) -> List[Dict[str, Any]]:
-    """Find runs of anomalously rapid switching in a reconstructed flip sequence.
+    **kwargs: Any,
+) -> List[Any]:
+    """Find rapid-switching bursts in a reconstructed flip train, via ``qpd``.
 
-    A quasiparticle burst -- an impact event depositing energy in the device -- raises the
-    parity-switching rate for a short while and then decays. Against the record's own mean rate
-    that is a local excess of flips, so this slides a window over the flip times and keeps the
-    windows whose count is too high to be a fluctuation of a Poisson process at the mean rate.
+    A pass-through to :func:`qpd.reconstruction.detect_bursts` on **its own defaults** --
+    nothing is retuned here.
 
-    **The threshold is Bonferroni-corrected over the number of windows tested**, which is what
-    keeps a long quiet record from producing "bursts" by sheer multiplicity: at ``p = 1e-3``
-    per window, a thousand windows would otherwise be expected to yield one. The correction is
-    why a quiet record returns an empty list rather than a plausible-looking span.
+    Worth knowing about one of those defaults, since it changes what the burst list means:
+    ``max_p_value`` is ``None``, so every dense cluster is returned with its trials-corrected
+    p-value attached rather than filtered on it. At low flip rates that is already a burst
+    list -- flips are far apart, so a cluster is genuinely anomalous. At high rates it is a
+    list of every coincidence: on a 4 s synthetic trace of pure 200 Hz background it returns
+    94 clusters, all of them chance, which collapse to 0 at ``max_p_value=0.01`` while an
+    injected 10x burst survives as exactly one span. Read ``burst.p_value``, or pass a
+    threshold, when the rate is high.
 
-    Two caveats worth stating, since neither is visible in the output. The null model is a
-    *homogeneous* Poisson process, so a rate that drifts slowly across the record (a
-    temperature ramp, say) reads as a burst. And the window sets the timescale this is
-    sensitive to: an episode much shorter than one window is diluted within it.
-
-    :param flip_times_s: Switching times in seconds, as
-        :func:`reconstruct_telegraph` returns them.
-    :param duration_s: Length of the record in seconds.
-    :param window_s: Window length. ``None`` (default) picks the length holding
-        *expected_per_window* flips at the mean rate, so the test scales with the record
-        instead of assuming a timescale.
-    :param expected_per_window: Mean flips per window used to size the default window.
-    :param p_value: Per-record false-positive rate, before the Bonferroni split across
-        windows.
-    :param min_flips: Records with fewer flips than this are not tested at all -- the mean rate
-        is too poorly determined to call anything anomalous against it.
-    :raises ValueError: If *duration_s* or *window_s* is not positive.
-    :returns: One dict per burst, in time order, with ``start_s``, ``end_s``, ``n_flips`` and
-        ``rate_hz``; empty when nothing is significant.
+    :param flip_times: Reconstructed tunnelling times in seconds.
+    :param background_rate_hz: Poisson rate of the background telegraph -- normally the
+        reconstruction's own ``rate_hz``.
+    :param duration_s: Length of the record in seconds, for the trials correction.
+    :param kwargs: Passed through (``max_gap``, ``min_flips``, ``max_p_value``).
+    :raises ImportError: If ``qpd`` is not installed.
+    :returns: ``qpd``'s list of detected bursts.
 
     """
-    flip_times = np.sort(np.asarray(flip_times_s, dtype=np.float64).ravel())
-    if duration_s <= 0:
-        raise ValueError(f"duration_s must be positive, got {duration_s}")
-    if window_s is not None and window_s <= 0:
-        raise ValueError(f"window_s must be positive, got {window_s}")
-    if flip_times.size < min_flips:
-        return []
+    return _require_qpd().detect_bursts(
+        np.asarray(flip_times, dtype=np.float64),
+        float(background_rate_hz),
+        duration=float(duration_s),
+        **kwargs,
+    )
 
-    rate = flip_times.size / duration_s
-    if window_s is None:
-        window_s = expected_per_window / rate
-    window_s = float(min(window_s, duration_s / 4.0))
-    if window_s <= 0:
-        return []
 
-    # Half-window steps: an episode straddling a bin boundary is still caught whole by one of
-    # the two windows covering it.
-    step = window_s / 2.0
-    starts = np.arange(0.0, max(duration_s - window_s, 0.0) + step, step)
-    if starts.size == 0:
-        return []
-    counts = np.searchsorted(flip_times, starts + window_s) - np.searchsorted(flip_times, starts)
+def summarize(result: Any, bursts: Optional[List[Any]] = None) -> Dict[str, Any]:
+    """Flatten a ``qpd`` reconstruction into the scalars a plot annotation needs.
 
-    mu = rate * window_s
-    alpha = p_value / starts.size
-    threshold = max(int(math.ceil(mu)), 1)
-    while threshold < flip_times.size and _poisson_sf(threshold, mu) >= alpha:
-        threshold += 1
+    :param result: A ``qpd`` reconstruction result.
+    :param bursts: Its detected bursts, if any.
+    :returns: Mapping of ``n_flips``, ``rate_hz``, ``contrast``, ``degenerate``,
+        ``decoded_fidelity`` and ``n_bursts``.
 
-    flagged = counts >= threshold
-    if not flagged.any():
-        return []
-
-    bursts: List[Dict[str, Any]] = []
-    start_index = None
-    for index, is_flagged in enumerate(np.append(flagged, False)):
-        if is_flagged and start_index is None:
-            start_index = index
-        elif not is_flagged and start_index is not None:
-            begin = float(starts[start_index])
-            end = float(min(starts[index - 1] + window_s, duration_s))
-            inside = int(np.searchsorted(flip_times, end) - np.searchsorted(flip_times, begin))
-            bursts.append({
-                "start_s": begin,
-                "end_s": end,
-                "n_flips": inside,
-                "rate_hz": inside / (end - begin) if end > begin else float("nan"),
-            })
-            start_index = None
-    return bursts
+    """
+    return {
+        "n_flips": int(np.asarray(result.flip_times).size),
+        "rate_hz": float(getattr(result, "rate_hz", np.nan)),
+        "contrast": float(getattr(result, "contrast", np.nan)),
+        "degenerate": bool(getattr(result, "degenerate", False)),
+        "decoded_fidelity": float(getattr(result, "decoded_fidelity", np.nan)),
+        "n_bursts": 0 if bursts is None else len(bursts),
+    }

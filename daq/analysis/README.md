@@ -10,7 +10,7 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Plotting a PSD](#plotting-a-psd)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
-- [Parity reconstruction in the time domain (`parity.py`)](#parity-reconstruction-in-the-time-domain-paritypy)
+- [Parity reconstruction (`parity.py` → the `qpd` package)](#parity-reconstruction-paritypy--the-qpd-package)
 - [Folding a periodically-driven time stream (QC trace)](#folding-a-periodically-driven-time-stream-qc-trace)
   - [The stream folds itself](#the-stream-folds-itself)
   - [The packaged routines](#the-packaged-routines)
@@ -459,47 +459,65 @@ f, psd_arc = compute_psd(arc, fs)
 
 ---
 
-## Parity reconstruction in the time domain (`parity.py`)
+## Parity reconstruction (`parity.py` → the `qpd` package)
 
-`fit_parity_psd` above measures the switching rate from the spectrum. `reconstruct_telegraph`
-measures it from the switching events themselves, and `detect_bursts` says *when* they
-happened — which the spectrum cannot, since a record whose rate doubles halfway through fits
-one Lorentzian at some intermediate corner and gives no sign of it.
+`fit_parity_psd` above measures the switching rate from the spectrum. Recovering *when* each
+flip happened is a different problem, and it is not solved here: it belongs to
+[`qpd`](https://github.com/WashU-Astroparticle-Lab/qpd), the lab's model of this measurement.
+`daq.analysis.parity` is a thin adapter — the same relationship `daq.analysis.resonator` has
+with `resonator_tools`.
 
 ```python
-from daq.analysis import detect_bursts, reconstruct_telegraph
-
-series = np.abs(ts.signal[:, 0])                 # any real projection of the readout
-rec = reconstruct_telegraph(series, ts.df)       # the tuned rate
-
-rec["gamma_p_flips"]        # n_flips / duration -- the rate, with no model behind it
-rec["flip_times_s"]         # when each switch happened
-rec["state"]                # per-sample level assignment (True = high)
-rec["snr"], rec["separated"]
-
-bursts = detect_bursts(rec["flip_times_s"], rec["duration_s"])
-# [{'start_s': 2.0, 'end_s': 2.21, 'n_flips': 405, 'rate_hz': 1938.0}]
+ts.reconstruct_parity()          # per tone; follows ts.bias_mode
 ```
 
-`TimeStream.reconstruct_parity()` wraps both and runs them per tone, so on a measurement the
-call is just `ts.reconstruct_parity()`.
+or directly, for a bare trace:
 
-**Check `separated` before believing anything else.** The levels come from 1-D 2-means and the
-assignment from a Schmitt trigger at `mid ± 0.25 × separation` (a single threshold chatters on
-noise exactly where the signal is weakest). But this SNR metric does **not** go to zero on
-structureless data: splitting a unimodal Gaussian at its own mean leaves halves `0.80σ` apart
-with `0.60σ` spread, so pure noise reports a "separation" of ~2.4 noise widths. Hence
-`MIN_SEPARATION_SNR = 3.5` — above that floor, and above a genuine telegraph at
-`separation/noise = 2`, which scores 2.67 and over-reads the true rate by 27×. Read `snr`
-against ~2.4, never against 0.
+```python
+from daq.analysis import reconstruct_parity, detect_bursts
 
-`detect_bursts` slides a half-overlapping window — sized to hold about five flips at the
-record's own mean rate — and keeps the windows whose count beats a Poisson tail **Bonferroni
--corrected over the number of windows tested**. That correction is what makes an empty list
-meaningful: at `p = 1e-3` per window, a thousand windows would otherwise be expected to throw
-up one "burst" on a perfectly quiet record. Two things it cannot see: the null model is a
-*homogeneous* Poisson process, so a slowly drifting rate reads as a burst, and an episode much
-shorter than one window is diluted within it (pass `window_s` to set the timescale yourself).
+rec = reconstruct_parity(ts.signal[:, 0], ts.df)   # ramped=True for a swept gate
+rec.flip_times      # when each parity flip happened [s]
+rec.rate_hz         # switching rate, from the flips themselves
+rec.branch          # decoded per-sample branch
+rec.degenerate      # <- check this first
+rec.contrast, rec.decoded_fidelity
+
+bursts = detect_bursts(rec.flip_times, rec.rate_hz, len(rec.branch) / ts.df)
+```
+
+**Check `rec.degenerate` before believing anything else.** A model that has latched onto noise
+fails quietly and its fidelity estimate stays high while it does. `TimeStream.analyze()` reads
+the flag and leaves a degenerate tone unmarked with a note on the panel, rather than drawing
+flips that are noise crossings.
+
+`rec.rate_hz` is worth comparing against the fitted `gamma_p` from `fit_parity_psd`: the two
+share no machinery, so agreement is evidence and disagreement means one of them is wrong.
+
+**Algorithm parameters are `qpd`'s own defaults** — nothing is retuned in `daq`. One of them
+changes what the burst list means: `detect_bursts(max_p_value=None)` returns *every* dense
+cluster with its trials-corrected p-value attached rather than filtering on it. At low flip
+rates that is already a burst list; at 200 Hz on a 4 s trace it is 94 chance coincidences,
+which collapse to 0 at `max_p_value=0.01` while an injected 10× burst survives as exactly one
+span. Read `burst.p_value`, or pass a threshold, when the rate is high.
+
+Two things `qpd` offers that are deliberately *not* wrapped, and are worth calling directly:
+
+```python
+from qpd.reconstruction import benchmark_reconstruction, plot_trace_with_flips
+
+# efficiency and purity on *your* data, by replaying its fitted fidelity into surrogates
+report = benchmark_reconstruction(ts.signal[:, 0], ts.df, n_trials=16)
+print(report.summary()); report.warnings      # read these first
+```
+
+### Which projection
+
+`project_readout(z, quantity)` reduces the complex readout to the real series a *spectrum* is
+taken of. `"proj"` (the default) projects onto the discrimination axis `qpd` fits to the cloud;
+`"abs"`, `"real"` and `"imag"` are fixed axes. Parity moves the resonator between two points of
+the IQ plane, and a fixed axis sees only the `cos(angle)` of the line joining them — for a
+separation that is mostly a phase shift, almost none of it. Only `"proj"` needs `qpd`.
 
 ---
 

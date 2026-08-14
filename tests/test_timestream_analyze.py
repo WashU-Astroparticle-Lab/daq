@@ -95,7 +95,7 @@ import matplotlib
 matplotlib.use("Agg")  # never open a window
 import matplotlib.pyplot as plt
 
-from daq.measurements.timestream import TimeStream
+from daq.measurements.timestream import DEFAULT_QUANTITY, TimeStream
 
 results = []
 
@@ -103,6 +103,15 @@ results = []
 def check(label, condition, detail=""):
     results.append(bool(condition))
     print(f"{'PASS' if condition else 'FAIL'}  {label}" + (f"  [{detail}]" if detail else ""))
+
+
+def _raises(call, exception):
+    """Return True when *call* raises *exception*."""
+    try:
+        call()
+    except exception:
+        return True
+    return False
 
 
 # ------------------------------------------------- synthetic streams
@@ -159,13 +168,18 @@ def ramp_signal(seed=0):
 
 
 def telegraph_signal(seed=1, n=200_000):
-    """A random-telegraph magnitude at GAMMA_P, on a constant operating point."""
+    """A random-telegraph readout at GAMMA_P: two IQ blobs, isotropic noise.
+
+    Complex rather than a real magnitude cast to complex, because that is what a readout is
+    and what the reconstruction models -- a trace lying exactly on a line has zero width on
+    the minor axis, which is not a cloud any blob fit should be asked to interpret.
+    """
     rng = np.random.default_rng(seed)
     # Poisson switching: each sample flips with probability gamma_p / fs.
     flips = rng.random(n) < (GAMMA_P / FS)
     state = np.where(np.cumsum(flips) % 2 == 0, 1.0, -1.0)
-    magnitude = 0.5 + 0.02 * state + 0.002 * rng.standard_normal(n)
-    return magnitude.astype(np.complex128)
+    branches = (0.5 + 0.02 * state) * np.exp(1j * 0.3)
+    return branches + 0.002 * (rng.standard_normal(n) + 1j * rng.standard_normal(n))
 
 
 RAMP_SETTINGS = {
@@ -405,74 +419,117 @@ check("4f  the fit holds f_bw at the tuned df", np.isclose(fit["f_bw"], FS))
 check("4g  the fit lands on fit_results", constant.fit_results is fit)
 
 
-# ------------------------------------------------- 5. the time-domain reconstruction
+# ------------------------------------------------- 5. the reconstruction, via qpd
 
-# The flip count is an estimate of the same rate the spectral fit reports, arrived at without
-# the model. Agreeing with the truth *and* with the fit is what makes either believable.
-rec = constant.reconstruct_parity()
-check(
-    "5a  the flip rate recovers the telegraph rate",
-    abs(rec["gamma_p_flips"] - GAMMA_P) < 0.2 * GAMMA_P,
-    f"gamma_p_flips = {rec['gamma_p_flips']:.1f} Hz against {GAMMA_P:.0f} Hz",
-)
-check("5b  the two levels are resolved", rec["separated"], f"snr = {rec['snr']:.1f}")
-check(
-    "5c  the state assignment spans the record",
-    rec["state"].shape[0] == np.asarray(constant.signal).shape[0],
-)
-check(
-    "5d  flip times are inside the record",
-    rec["flip_times_s"].size == rec["n_flips"] and (rec["flip_times_s"] <= rec["duration_s"]).all(),
-)
-check("5e  a quiet record reports no bursts", rec["bursts"] == [], str(rec["bursts"]))
+# daq owns no parity algorithm: the reconstruction is qpd.reconstruction's, reached through
+# daq.analysis.parity. These checks are of the *wiring* -- that the trace, the tuned sample
+# rate and the right routine reach it, and that its verdicts reach the plot -- not of the
+# method, which qpd verifies in its own checks/ suite.
 
-# A record with no telegraph at all must not be thresholded into thousands of "flips" and
-# presented as a reconstruction -- 2-means splits pure noise happily, and the resulting picket
-# fence looks exactly like a fast switcher.
-flat = make_stream(0.5 + 0.002 * np.random.default_rng(11).standard_normal(200_000))
-flat.attach(bias=DC_SETTINGS)
-flat_rec = flat.reconstruct_parity()
-check(
-    "5f  structureless noise is reported as unresolved, not reconstructed",
-    not flat_rec["separated"],
-    f"snr = {flat_rec['snr']:.2f}",
-)
-check("5g  ... and no bursts are hunted through it", flat_rec["bursts"] == [])
+from daq.analysis.parity import PROJECTIONS, project_readout, qpd_available  # noqa: E402
 
-# An injected burst: 10x the switching rate for 200 ms in the middle of the record.
-burst_seed = np.random.default_rng(12)
-flips = burst_seed.random(200_000) < (GAMMA_P / FS)
-lo, hi = int(2.0 * FS), int(2.2 * FS)
-flips[lo:hi] = burst_seed.random(hi - lo) < (10 * GAMMA_P / FS)
-state = np.cumsum(flips) % 2 == 0
-bursty = make_stream(
-    0.5 + 0.02 * np.where(state, 1.0, -1.0) + 0.002 * burst_seed.standard_normal(200_000)
-)
-bursty.attach(bias=DC_SETTINGS)
-bursty_rec = bursty.reconstruct_parity()
-found = bursty_rec["bursts"]
-check("5h  an injected rapid-switching burst is found", len(found) == 1, f"{len(found)} found")
+HAVE_QPD = qpd_available()
+if not HAVE_QPD:
+    print("INFO: qpd is not installed; skipping the reconstruction checks")
+
+if HAVE_QPD:
+    rec = constant.reconstruct_parity()
+    # Passing the wrong sample rate is the wiring error this catches: the rate is in Hz, so a
+    # df that never reached qpd would show up here as a factor-of-anything discrepancy.
+    check(
+        "5a  the reconstructed rate matches the telegraph, so df reached qpd",
+        abs(rec.rate_hz - GAMMA_P) < 0.2 * GAMMA_P,
+        f"rate_hz = {rec.rate_hz:.1f} against {GAMMA_P:.0f} Hz",
+    )
+    check(
+        "5b  qpd does not call the model degenerate",
+        not rec.degenerate,
+        f"contrast {rec.contrast:.1f}",
+    )
+    check(
+        "5c  the decoded branch spans the record", rec.branch.shape[0] == constant.signal.shape[0]
+    )
+    check("5d  the tone index is attached", rec.tone == 0)
+    check("5e  a burst list is attached", isinstance(rec.bursts, list))
+
+    # The bias mode picks the routine: a swept gate needs the ramped reconstruction, since the
+    # static one would fit the moving branches as noise.
+    import qpd.reconstruction as _qpd  # noqa: E402
+
+    called = []
+    _static, _ramped = _qpd.reconstruct_parity_flips_static, _qpd.reconstruct_parity_flips_ramped
+    _qpd.reconstruct_parity_flips_static = lambda *a, **k: called.append("static") or _static(
+        *a, **k
+    )
+    _qpd.reconstruct_parity_flips_ramped = lambda *a, **k: called.append("ramped") or _static(
+        *a, **k
+    )
+    try:
+        constant.reconstruct_parity(bursts=False)
+        sawtooth.reconstruct_parity(bursts=False)
+        check(
+            "5f  a constant bias uses the fixed-gate reconstruction",
+            called[0] == "static",
+            str(called),
+        )
+        check("5g  a sawtooth bias uses the swept-gate one", called[1] == "ramped", str(called))
+        called.clear()
+        constant.reconstruct_parity(ramped=True, bursts=False)
+        check("5h  ... and ramped= overrides the detection", called == ["ramped"], str(called))
+    finally:
+        _qpd.reconstruct_parity_flips_static = _static
+        _qpd.reconstruct_parity_flips_ramped = _ramped
+
+    # A degenerate model must not be marked up as a reconstruction: qpd says so, and the plot
+    # has to read the flag rather than the flip list, which stays populated.
+    flat = make_stream(
+        0.5
+        + 0.002 * np.random.default_rng(11).standard_normal(50_000)
+        + 0.002j * np.random.default_rng(12).standard_normal(50_000)
+    )
+    flat.attach(bias=DC_SETTINGS)
+    flat_rec = flat.reconstruct_parity()
+    check(
+        "5i  structureless noise is reported degenerate by qpd",
+        flat_rec.degenerate,
+        f"contrast = {flat_rec.contrast:.2f}",
+    )
+    check("5j  ... and no bursts are hunted through it", flat_rec.bursts == [])
+
+    # Why "proj" is the default projection for the spectrum. Parity moves the resonator
+    # between two points of the IQ plane; a fixed axis sees only the cos(angle) of the line
+    # joining them, and for a separation that is mostly a phase shift, almost none of it.
+    phase_rng = np.random.default_rng(21)
+    phase_state = np.cumsum(phase_rng.random(100_000) < (GAMMA_P / FS)) % 2 == 0
+    phase_only = 0.5 * np.exp(1j * np.where(phase_state, 0.04, -0.04)) + 0.002 * (
+        phase_rng.standard_normal(100_000) + 1j * phase_rng.standard_normal(100_000)
+    )
+    spread_proj = np.std(project_readout(phase_only, "proj"))
+    spread_abs = np.std(project_readout(phase_only, "abs"))
+    check(
+        "5k  'proj' sees a phase-only telegraph that 'abs' does not",
+        spread_proj > 5 * spread_abs,
+        f"std proj {spread_proj:.2e} against abs {spread_abs:.2e}",
+    )
+    check("5l  ... and it is the default projection", DEFAULT_QUANTITY == "proj")
+
 check(
-    "5i  ... at the time it was injected",
-    bool(found) and found[0]["start_s"] < 2.1 < found[0]["end_s"],
-    str([(round(b["start_s"], 2), round(b["end_s"], 2)) for b in found]),
+    "5m  an unknown projection raises ValueError",
+    _raises(lambda: project_readout(np.ones(8, dtype=complex), "magnitude"), ValueError),
 )
-check(
-    "5j  ... with an elevated rate inside it",
-    bool(found) and found[0]["rate_hz"] > 3 * bursty_rec["gamma_p_flips"],
-    (
-        f"{found[0]['rate_hz']:.0f} Hz inside against {bursty_rec['gamma_p_flips']:.0f} Hz overall"
-        if found
-        else ""
-    ),
-)
+check("5n  the projections are named in one place", "proj" in PROJECTIONS and "abs" in PROJECTIONS)
 
 
 # ------------------------------------------------- 6. multi-tone
 
 # The whole complaint that prompted this: a two-tone acquisition reconstructed only tone 0.
+_ref_rng = np.random.default_rng(13)
 two_tone_signal = np.stack(
-    [telegraph_signal(seed=1), 0.5 + 0.002 * np.random.default_rng(13).standard_normal(200_000)],
+    [
+        telegraph_signal(seed=1),
+        0.5 * np.exp(1j * 0.9)
+        + 0.002 * (_ref_rng.standard_normal(200_000) + 1j * _ref_rng.standard_normal(200_000)),
+    ],
     axis=1,
 )
 two_tone = make_stream(two_tone_signal, if_freqs=[0.0, 10e6], is_usb=[True, False])
@@ -493,12 +550,12 @@ check(
 )
 check(
     "6e  ... and each knows which tone it is",
-    [r["tone"] for r in recs2] == [0, 1],
+    [r.tone for r in recs2] == [0, 1],
 )
 check(
-    "6f  ... the telegraph tone resolves and the reference does not",
-    recs2[0]["separated"] and not recs2[1]["separated"],
-    f"snr {recs2[0]['snr']:.1f} vs {recs2[1]['snr']:.1f}",
+    "6f  ... the telegraph tone resolves and the reference is called degenerate",
+    (not recs2[0].degenerate) and recs2[1].degenerate,
+    f"contrast {recs2[0].contrast:.1f} vs {recs2[1].contrast:.1f}",
 )
 try:
     two_tone.parity_psd(tone=5)
