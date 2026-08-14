@@ -1,8 +1,8 @@
-"""Offline verification of ``TimeStream.analyze()``'s bias-mode dispatch.
+"""Offline verification of ``TimeStream.analyze()``'s bias-mode dispatch and reconstructions.
 
 Checks that a stream reconstructs itself according to how the gate was biased while it was
-recorded -- folded into one ramp period for a sawtooth bias, spectrum-and-parity-fit for a
-constant one, and the plain time-stream plot when nothing says::
+recorded -- folded into one ramp period for a sawtooth bias, two-level parity reconstruction
+plus spectrum for a constant one, and the plain time-stream plot when nothing says::
 
     python tests/test_timestream_analyze.py
 
@@ -11,20 +11,24 @@ no VISA runtime and no MongoDB; ``presto`` is stubbed when it is absent, since n
 test here touches it.
 
 The dispatch reads the generator settings ``Base.attach`` flattened onto the measurement, so
-three things have to hold together and each is checked separately:
+these have to hold together and each is checked separately:
 
 - **detection**: ``bias_function`` of ``"RAMP"`` means sawtooth, ``"DC"`` means constant, and
   anything else -- including no attachment at all -- falls back to the raw plot rather than
   guessing;
 - **round-trip**: ``load()`` restores those attributes, or a reloaded file analyses itself as
   ``unknown`` and the whole feature evaporates the moment the data comes off disk;
-- **reconstruction**: the fold really uses the attached ramp period at the *tuned* ``df``, and
-  the parity spectrum really is of the mean-subtracted projection.
+- **reconstruction**: the fold really uses the attached ramp period at the *tuned* ``df``, the
+  parity spectrum really is of the mean-subtracted projection, and the flip count recovers the
+  switching rate the spectral fit reports without using its model;
+- **multi-tone**: every tone is reconstructed and spectrated, not just tone 0.
 
-The gated-but-untriggered case gets its own check. A ramp gated on a port the acquisition
-never asserted records a static bias, folds happily, and produces a flat trace that looks like
-a dead device -- exactly the silent failure ``QCTrace`` refuses outright, so here it must at
-least warn.
+Two silent failures get their own checks. A ramp gated on a port the acquisition never
+asserted records a static bias, folds happily, and produces a flat trace that looks like a dead
+device -- exactly what ``QCTrace`` refuses outright, so here it must at least warn. And a
+record with no two-level structure must be reported as unresolved rather than thresholded:
+2-means splits pure Gaussian noise into "levels" 2.4 noise widths apart, so a detector that
+trusted its own output would decorate structureless noise with thousands of switching events.
 """
 
 import os
@@ -109,12 +113,17 @@ N_PERIODS = 40
 GAMMA_P = 200.0  # parity switching rate, Hz
 
 
-def make_stream(signal, **kwargs):
-    """Build a single-tone TimeStream carrying *signal* as its acquired data."""
-    signal = np.asarray(signal, dtype=np.complex128).reshape(-1, 1)
+def make_stream(signal, *, if_freqs=None, is_usb=None, **kwargs):
+    """Build a TimeStream carrying *signal* (1-D, or one column per tone) as its data."""
+    signal = np.asarray(signal, dtype=np.complex128)
+    if signal.ndim == 1:
+        signal = signal.reshape(-1, 1)
+    n_tones = signal.shape[1]
+    if_freqs = [0.0] * n_tones if if_freqs is None else if_freqs
     ts = TimeStream(
         lo_freq=2.8e9,
-        if_freqs=[0.0],
+        if_freqs=if_freqs,
+        is_usb=is_usb,
         df=FS,
         pixel_counts=signal.shape[0],
         amp=0.01,
@@ -126,14 +135,14 @@ def make_stream(signal, **kwargs):
     )
     ts.df = FS  # what run() would leave behind after tuning
     ts.signal = signal
-    ts.signal_freqs = np.array([2.8e9])
-    ts.freq_arr = np.array([0.0])
+    ts.freqs_usb = ts.lo_freq + ts.if_freqs
+    ts.freqs_lsb = ts.lo_freq - ts.if_freqs
+    ts.signal_freqs = np.where(ts.is_usb, ts.freqs_usb, ts.freqs_lsb)
+    ts.freq_arr = np.zeros(n_tones)
     ts.pixel_i = signal.copy()
     ts.pixel_q = signal.copy()
     ts.usb = signal.copy()
     ts.lsb = signal.copy()
-    ts.freqs_usb = np.array([2.8e9])
-    ts.freqs_lsb = np.array([2.8e9])
     return ts
 
 
@@ -396,28 +405,138 @@ check("4f  the fit holds f_bw at the tuned df", np.isclose(fit["f_bw"], FS))
 check("4g  the fit lands on fit_results", constant.fit_results is fit)
 
 
-# ------------------------------------------------- 5. the figures themselves
+# ------------------------------------------------- 5. the time-domain reconstruction
+
+# The flip count is an estimate of the same rate the spectral fit reports, arrived at without
+# the model. Agreeing with the truth *and* with the fit is what makes either believable.
+rec = constant.reconstruct_parity()
+check(
+    "5a  the flip rate recovers the telegraph rate",
+    abs(rec["gamma_p_flips"] - GAMMA_P) < 0.2 * GAMMA_P,
+    f"gamma_p_flips = {rec['gamma_p_flips']:.1f} Hz against {GAMMA_P:.0f} Hz",
+)
+check("5b  the two levels are resolved", rec["separated"], f"snr = {rec['snr']:.1f}")
+check(
+    "5c  the state assignment spans the record",
+    rec["state"].shape[0] == np.asarray(constant.signal).shape[0],
+)
+check(
+    "5d  flip times are inside the record",
+    rec["flip_times_s"].size == rec["n_flips"] and (rec["flip_times_s"] <= rec["duration_s"]).all(),
+)
+check("5e  a quiet record reports no bursts", rec["bursts"] == [], str(rec["bursts"]))
+
+# A record with no telegraph at all must not be thresholded into thousands of "flips" and
+# presented as a reconstruction -- 2-means splits pure noise happily, and the resulting picket
+# fence looks exactly like a fast switcher.
+flat = make_stream(0.5 + 0.002 * np.random.default_rng(11).standard_normal(200_000))
+flat.attach(bias=DC_SETTINGS)
+flat_rec = flat.reconstruct_parity()
+check(
+    "5f  structureless noise is reported as unresolved, not reconstructed",
+    not flat_rec["separated"],
+    f"snr = {flat_rec['snr']:.2f}",
+)
+check("5g  ... and no bursts are hunted through it", flat_rec["bursts"] == [])
+
+# An injected burst: 10x the switching rate for 200 ms in the middle of the record.
+burst_seed = np.random.default_rng(12)
+flips = burst_seed.random(200_000) < (GAMMA_P / FS)
+lo, hi = int(2.0 * FS), int(2.2 * FS)
+flips[lo:hi] = burst_seed.random(hi - lo) < (10 * GAMMA_P / FS)
+state = np.cumsum(flips) % 2 == 0
+bursty = make_stream(
+    0.5 + 0.02 * np.where(state, 1.0, -1.0) + 0.002 * burst_seed.standard_normal(200_000)
+)
+bursty.attach(bias=DC_SETTINGS)
+bursty_rec = bursty.reconstruct_parity()
+found = bursty_rec["bursts"]
+check("5h  an injected rapid-switching burst is found", len(found) == 1, f"{len(found)} found")
+check(
+    "5i  ... at the time it was injected",
+    bool(found) and found[0]["start_s"] < 2.1 < found[0]["end_s"],
+    str([(round(b["start_s"], 2), round(b["end_s"], 2)) for b in found]),
+)
+check(
+    "5j  ... with an elevated rate inside it",
+    bool(found) and found[0]["rate_hz"] > 3 * bursty_rec["gamma_p_flips"],
+    (
+        f"{found[0]['rate_hz']:.0f} Hz inside against {bursty_rec['gamma_p_flips']:.0f} Hz overall"
+        if found
+        else ""
+    ),
+)
+
+
+# ------------------------------------------------- 6. multi-tone
+
+# The whole complaint that prompted this: a two-tone acquisition reconstructed only tone 0.
+two_tone_signal = np.stack(
+    [telegraph_signal(seed=1), 0.5 + 0.002 * np.random.default_rng(13).standard_normal(200_000)],
+    axis=1,
+)
+two_tone = make_stream(two_tone_signal, if_freqs=[0.0, 10e6], is_usb=[True, False])
+two_tone.attach(bias=DC_SETTINGS)
+
+f2, psd2 = two_tone.parity_psd()
+check("6a  parity_psd returns one spectrum per tone", psd2.shape == (2, f2.size), str(psd2.shape))
+check(
+    "6b  a named tone still returns one spectrum",
+    two_tone.parity_psd(tone=1)[1].ndim == 1,
+)
+fits2 = two_tone.fit_parity()
+check("6c  fit_parity returns one fit per tone", isinstance(fits2, list) and len(fits2) == 2)
+recs2 = two_tone.reconstruct_parity()
+check(
+    "6d  reconstruct_parity returns one result per tone",
+    isinstance(recs2, list) and len(recs2) == 2,
+)
+check(
+    "6e  ... and each knows which tone it is",
+    [r["tone"] for r in recs2] == [0, 1],
+)
+check(
+    "6f  ... the telegraph tone resolves and the reference does not",
+    recs2[0]["separated"] and not recs2[1]["separated"],
+    f"snr {recs2[0]['snr']:.1f} vs {recs2[1]['snr']:.1f}",
+)
+try:
+    two_tone.parity_psd(tone=5)
+    bad_tone = False
+except IndexError:
+    bad_tone = True
+check("6g  an out-of-range tone raises IndexError", bad_tone)
+
+
+# ------------------------------------------------- 7. the figures themselves
 
 plt.close("all")
 fig = sawtooth.analyze()
-check("5a  the sawtooth reconstruction draws two panels", len(fig.axes) == 2)
+check("7a  the sawtooth reconstruction draws a row of I/Q per tone", len(fig.axes) == 2)
 check(
-    "5b  ... over one ramp period", "QC trace" in fig._suptitle.get_text(), fig._suptitle.get_text()
+    "7b  ... over one ramp period", "QC trace" in fig._suptitle.get_text(), fig._suptitle.get_text()
 )
 
 fig = constant.analyze()
-check("5c  the constant reconstruction draws two panels", len(fig.axes) == 2)
 check(
-    "5d  ... time series above spectrum",
-    fig.axes[1].get_xscale() == "log" and fig.axes[0].get_xscale() == "linear",
+    "7c  the constant reconstruction keeps the two-column grid, plus a spectrum", len(fig.axes) == 3
+)
+check(
+    "7d  ... streams on linear time above a log-log spectrum",
+    fig.axes[0].get_xscale() == "linear" and fig.axes[-1].get_xscale() == "log",
 )
 
+fig = two_tone.analyze()
+check("7e  a two-tone constant stream draws 2x2 panels and one shared spectrum", len(fig.axes) == 5)
+fig = two_tone.analyze(tone=0)
+check("7f  ... restricted to one tone on request", len(fig.axes) == 3)
+
 fig = bare.analyze()
-check("5e  the raw plot is unchanged: one row of I/Q per tone", len(fig.axes) == 2)
+check("7g  the raw plot is unchanged: one row of I/Q per tone", len(fig.axes) == 2)
 plt.close("all")
 
 
-# ------------------------------------------------- 6. the HDF5 round trip
+# ------------------------------------------------- 8. the HDF5 round trip
 
 # Without this the whole feature stops at the end of the session that took the data.
 with tempfile.TemporaryDirectory() as tmp:
@@ -425,19 +544,19 @@ with tempfile.TemporaryDirectory() as tmp:
     sawtooth.save(save_filename=path)
     reloaded = TimeStream.load(path)
 
-check("6a  a reloaded stream still knows it was ramp-biased", reloaded.bias_mode == "sawtooth")
+check("8a  a reloaded stream still knows it was ramp-biased", reloaded.bias_mode == "sawtooth")
 check(
-    "6b  ... at the same ramp frequency",
+    "8b  ... at the same ramp frequency",
     np.isclose(reloaded.bias_period_s, 1.0 / RAMP_HZ),
     f"{reloaded.bias_period_s}",
 )
-check("6c  ... and remembers its device", reloaded.device == "TestDevice")
+check("8c  ... and remembers its device", reloaded.device == "TestDevice")
 check(
-    "6d  ... and the generator's trigger port, so the ungated check still runs",
+    "8d  ... and the generator's trigger port, so the ungated check still runs",
     int(reloaded.bias_settings["trigger_port"]) == 1,
 )
 check(
-    "6e  the reloaded record folds to the same trace",
+    "8e  the reloaded record folds to the same trace",
     np.allclose(reloaded.fold()[1], avg_iq),
 )
 

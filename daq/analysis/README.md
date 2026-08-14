@@ -10,8 +10,10 @@ This guide covers the analysis tools in `daq.analysis` with practical examples.
 - [Plotting a PSD](#plotting-a-psd)
 - [Averaged PSD from repeated TimeStreams](#averaged-psd-from-repeated-timestreams)
 - [Electronic to Resonator Basis](#electronic-to-resonator-basis)
+- [Parity reconstruction in the time domain (`parity.py`)](#parity-reconstruction-in-the-time-domain-paritypy)
 - [Folding a periodically-driven time stream (QC trace)](#folding-a-periodically-driven-time-stream-qc-trace)
-  - [The packaged routine](#the-packaged-routine)
+  - [The stream folds itself](#the-stream-folds-itself)
+  - [The packaged routines](#the-packaged-routines)
 - [I/Q Comparison Plot](#iq-comparison-plot)
 - [Correlated Noise Removal](#correlated-noise-removal)
   - [Batch cleaning of interleaved streams](#batch-cleaning-of-interleaved-streams)
@@ -454,6 +456,50 @@ fs = ts.df  # sampling rate (Hz)
 f, psd_rad = compute_psd(rad, fs)
 f, psd_arc = compute_psd(arc, fs)
 ```
+
+---
+
+## Parity reconstruction in the time domain (`parity.py`)
+
+`fit_parity_psd` above measures the switching rate from the spectrum. `reconstruct_telegraph`
+measures it from the switching events themselves, and `detect_bursts` says *when* they
+happened — which the spectrum cannot, since a record whose rate doubles halfway through fits
+one Lorentzian at some intermediate corner and gives no sign of it.
+
+```python
+from daq.analysis import detect_bursts, reconstruct_telegraph
+
+series = np.abs(ts.signal[:, 0])                 # any real projection of the readout
+rec = reconstruct_telegraph(series, ts.df)       # the tuned rate
+
+rec["gamma_p_flips"]        # n_flips / duration -- the rate, with no model behind it
+rec["flip_times_s"]         # when each switch happened
+rec["state"]                # per-sample level assignment (True = high)
+rec["snr"], rec["separated"]
+
+bursts = detect_bursts(rec["flip_times_s"], rec["duration_s"])
+# [{'start_s': 2.0, 'end_s': 2.21, 'n_flips': 405, 'rate_hz': 1938.0}]
+```
+
+`TimeStream.reconstruct_parity()` wraps both and runs them per tone, so on a measurement the
+call is just `ts.reconstruct_parity()`.
+
+**Check `separated` before believing anything else.** The levels come from 1-D 2-means and the
+assignment from a Schmitt trigger at `mid ± 0.25 × separation` (a single threshold chatters on
+noise exactly where the signal is weakest). But this SNR metric does **not** go to zero on
+structureless data: splitting a unimodal Gaussian at its own mean leaves halves `0.80σ` apart
+with `0.60σ` spread, so pure noise reports a "separation" of ~2.4 noise widths. Hence
+`MIN_SEPARATION_SNR = 3.5` — above that floor, and above a genuine telegraph at
+`separation/noise = 2`, which scores 2.67 and over-reads the true rate by 27×. Read `snr`
+against ~2.4, never against 0.
+
+`detect_bursts` slides a half-overlapping window — sized to hold about five flips at the
+record's own mean rate — and keeps the windows whose count beats a Poisson tail **Bonferroni
+-corrected over the number of windows tested**. That correction is what makes an empty list
+meaningful: at `p = 1e-3` per window, a thousand windows would otherwise be expected to throw
+up one "burst" on a perfectly quiet record. Two things it cannot see: the null model is a
+*homogeneous* Poisson process, so a slowly drifting rate reads as a burst, and an episode much
+shorter than one window is diluted within it (pass `window_s` to set the timescale yourself).
 
 ---
 

@@ -23,6 +23,7 @@ from .mattis_bardeen import (
     MB_fitter,
 )
 from .folding import fold_timestream
+from .parity import detect_bursts, reconstruct_telegraph
 from .plotting import plot_iq_comparison, plot_psd, plot_qc_trace
 from .resonator import (
     ResonatorFitError,
@@ -37,6 +38,7 @@ __all__ = [
     "averaged_psd_timestream",
     "clean_correlated_streams",
     "compute_psd",
+    "detect_bursts",
     "environmental_term",
     "fit_notch",
     "fit_parity_psd",
@@ -44,6 +46,7 @@ __all__ = [
     "from_elec_to_reson",
     "resonator_tools_available",
     "parity_psd_model",
+    "reconstruct_telegraph",
     "remove_correlated_noise",
     "plot_iq_comparison",
     "plot_psd",
