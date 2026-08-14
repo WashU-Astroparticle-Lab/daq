@@ -198,7 +198,62 @@ filepath = ts.run()
 ts.analyze()
 ```
 
-**Analysis**: Plots I/Q streams for each tone, labelled with its sideband (USB/LSB).
+**Analysis** — `analyze()` reconstructs the record according to **how the gate was
+biased**, because the samples alone cannot say. What tells it is the generator state
+`attach()` recorded:
+
+| `ts.bias_mode` | detected from | what `analyze()` does |
+|---|---|---|
+| `"sawtooth"` | attached `function` = `RAMP` | folds the record into one ramp period and plots the block-averaged I/Q — a QC trace |
+| `"constant"` | attached `function` = `DC` | plots the readout magnitude against time above its noise spectrum, fitted to the random-telegraph parity model |
+| `"unknown"` | nothing attached, or another carrier | the plain per-tone I/Q (or power/phase) plot, exactly as before |
+
+```python
+with Agilent33220A() as bias:
+    bias.sawtooth(vpp=2.0, freq_hz=500)
+    ts = TimeStream(..., df=5e4, external_trigger=trigger_for(bias))
+    ts.attach(bias=bias)          # <- this is what analyze() reads afterwards
+    ts.run()
+
+ts.bias_mode                      # 'sawtooth'
+ts.analyze()                      # folded QC trace, raw period overlaid
+TimeStream.load(path).analyze()   # same, on a reloaded file
+```
+
+Attaching the generator is therefore not just record-keeping: without it a
+ramp-biased stream analyses as `"unknown"` and you get the raw plot. Override the
+detection with `analyze(mode="sawtooth" | "constant" | "raw")`, and fold a stream
+whose generator was never attached with `analyze(mode="sawtooth", period_s=1/500)`.
+
+`load()` restores those attached settings — along with `device`, `filter` and `notes`,
+which it used to drop — so a file off disk knows how it was biased and reconstructs
+itself the same way a live run does. Read them back with `ts.bias_settings`.
+
+Useful arguments: `tone` (which tone to reconstruct — the bias reconstructions are
+single-tone), `raw=False` (drop the un-averaged overlay on the folded trace),
+`fit=False` and `quantity` (`"abs"`/`"real"`/`"imag"`) on the constant-bias panel, and
+any `fit_parity_psd` keyword (`fit_onef=True`, `n_bins`, …) passed straight through.
+
+The same reconstructions are available without a figure:
+
+```python
+time_ms, avg_iq = ts.fold()          # sawtooth: defaults to the attached ramp period
+f, psd = ts.parity_psd()             # constant: mean-subtracted |S|, at the tuned df
+fit = ts.fit_parity(fit_onef=True)   # ... fitted; also lands on ts.fit_results
+```
+
+Both use the **tuned** `df` rather than the requested sample rate — a fold window off
+by a sample smears the average across blocks instead of dropping a leftover.
+
+> **A gated ramp that nothing triggered still reports `"sawtooth"`** — that is the
+> measurement that was attempted — but `analyze()` warns before folding it. The
+> generator sat at its burst start level, so the record is a static bias and the folded
+> trace is flat, which reads as a dead device rather than as a wiring fault. This is the
+> failure `QCTrace` refuses up front; here it is caught after the fact.
+
+`QCTrace` and `BiasHunt` are unaffected — they own the acquisition *and* the bias, so
+they run these reconstructions themselves. This is the same analysis reached from the
+stream, for a hand-rolled acquisition or a reloaded file.
 
 ---
 

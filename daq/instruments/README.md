@@ -136,6 +136,14 @@ ts.attach(bias=bias, led=led)
 Values are queried back from the hardware rather than echoed from what was written, so the
 record reflects what the instrument actually did.
 
+**Attaching the bias generator also decides how the stream analyses itself.** `TimeStream`
+reads `bias_function` back off the record — `RAMP` or `DC` — and `ts.analyze()` folds the
+acquisition into one ramp period or plots its parity spectrum accordingly, on a reloaded file
+as much as a live run. Without the `attach`, nothing in the samples says which was happening
+and you get the plain I/Q plot. See *TimeStream → Analysis* in
+[`daq/measurements/README.md`](../measurements/README.md). Attaching an LED is unaffected: the
+DC2200 reports `mode`, not `function`, so it is never read as the gate bias.
+
 ### Synchronising the bias to an acquisition
 
 `TimeStream(external_trigger=trigger_for(bias))` makes the Presto assert the generator's own

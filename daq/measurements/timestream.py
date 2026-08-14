@@ -4,7 +4,7 @@ TimeStream measurement class for acquiring time-domain data with multiple freque
 """
 
 import warnings
-from typing import Callable, List, Optional, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import h5py
 import numpy as np
@@ -15,13 +15,35 @@ from presto.utils import untwist_downconversion
 
 from .._base import Base
 from ..config import get_presto_address, get_presto_port
-from ..triggers import MAX_TRIGGER_PORTS, TriggerAny, resolve_trigger_states
+from ..triggers import (
+    MAX_TRIGGER_PORTS,
+    TriggerAny,
+    describe_trigger_states,
+    resolve_trigger_states,
+)
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
 
+#: Suffix of the attribute :meth:`daq._base.Base.attach` writes for a function generator's
+#: carrier waveform, e.g. ``bias_function``. Its prefix names the attachment.
+BIAS_FUNCTION_SUFFIX = "_function"
+
+#: Attachment prefix preferred when more than one instrument reports a carrier waveform.
+#: ``QCTrace`` and ``BiasHunt`` both attach their generator as ``bias``.
+DEFAULT_BIAS_PREFIX = "bias"
+
+#: Reconstructions :meth:`TimeStream.analyze` can run, beyond ``"auto"``.
+ANALYZE_MODES = ("raw", "sawtooth", "constant")
+
+#: Axis labels for the projections of the complex readout the parity spectrum can be taken of.
+_QUANTITY_LABELS = {"abs": r"$|S|$", "real": r"$\mathrm{Re}(S)$", "imag": r"$\mathrm{Im}(S)$"}
+
 __all__ = [
+    "ANALYZE_MODES",
+    "BIAS_FUNCTION_SUFFIX",
     "BoolAny",
+    "DEFAULT_BIAS_PREFIX",
     "FloatAny",
     "MAX_TRIGGER_PORTS",
     "TimeStream",
@@ -30,7 +52,40 @@ __all__ = [
 ]
 
 
+def _as_text(value: Any) -> str:
+    """Render an HDF5-round-tripped scalar as text.
+
+    h5py hands back ``bytes`` for some string vintages and ``numpy.str_`` for others, so a
+    bare ``str()`` is not enough to compare a stored setting against a literal.
+
+    :param value: The value to render.
+    :returns: The value as a plain string.
+
+    """
+    return value.decode() if isinstance(value, bytes) else str(value)
+
+
 class TimeStream(Base):
+    _CONSTRUCTOR_ATTRS = frozenset({
+        "lo_freq",
+        "df",
+        "pixel_counts",
+        "output_port",
+        "input_port",
+        "dither",
+        "discard_start_ms",
+        "external_trigger",
+    })
+    """HDF5 attributes :meth:`load` consumes itself, and must not restore a second time.
+
+    Everything *else* in a saved file's attributes belongs to something other than the
+    acquisition parameters -- the instrument settings :meth:`~daq._base.Base.attach` flattened
+    on, and the ``device``/``filter``/``notes`` metadata -- and :meth:`load` copies it back
+    verbatim. Listing what is consumed rather than what is restored is deliberate: a new
+    instrument driver, or a new ``settings()`` key on an existing one, then round-trips
+    without an edit here.
+    """
+
     TRIGGER_WIDTH_S: float = 0.03
     """s -- trigger-high duration handed to presto's ``set_trigger_out``.
 
@@ -132,6 +187,14 @@ class TimeStream(Base):
         #   signal_freqs[i]   -> physical frequency (Hz) of tone i
         self.signal = None
         self.signal_freqs = None
+
+        self.fit_results = None
+        """Parity-model fit of this stream's spectrum, from :meth:`fit_parity`.
+
+        Set only by the constant-bias reconstruction. Like every other ``fit_results`` in the
+        repo it lives on the object alone -- ``Base`` skips the name in both the HDF5 and the
+        MongoDB paths, and this one holds a live ``iminuit`` object besides.
+        """
 
         self.check_amp()
         self.check_sideband()
@@ -374,6 +437,18 @@ class TimeStream(Base):
             signal = h5f["signal"][()] if "signal" in h5f else None  # type: ignore
             signal_freqs = h5f["signal_freqs"][()] if "signal_freqs" in h5f else None  # type: ignore
 
+            # Everything else in the attributes is state this class does not own: the
+            # per-instrument settings attach() flattened onto the measurement (bias_function,
+            # bias_freq_hz, led_mode, ...), plus device/filter/notes. Restoring them is what
+            # lets a *loaded* stream still say how it was biased, which is what analyze()'s
+            # reconstruction dispatch reads. Copied wholesale rather than by a fixed list, so a
+            # new instrument driver's settings come back without touching this method.
+            extra = {
+                str(key): value
+                for key, value in h5f.attrs.items()
+                if str(key) not in cls._CONSTRUCTOR_ATTRS
+            }
+
         # Legacy files (saved before scalar-amp broadcasting) stored a single scalar
         # amp for a multi-tone measurement. presto's set_amplitudes drove only the
         # first tone and left the rest unpowered, so those other tones contain only
@@ -425,14 +500,544 @@ class TimeStream(Base):
         if self.signal_freqs is None and freqs_usb is not None and freqs_lsb is not None:
             self.signal_freqs = np.where(self.is_usb, freqs_usb, freqs_lsb)
 
+        # Attached instrument state and the database metadata, restored after the constructor
+        # so nothing it set is clobbered by a stale attribute of the same name.
+        for key, value in extra.items():
+            setattr(self, key, _as_text(value) if isinstance(value, bytes) else value)
+
         # Files written by run() hold the full acquisition, so re-apply the trim
         # to match the in-memory state produced by a live run.
         self._apply_discard_start()
 
         return self
 
+    # ------------------------------------------------------------------ how it was biased
+
+    def _attached_bias(self) -> Tuple[Optional[str], Dict[str, Any]]:
+        """Find the attached function generator's recorded settings.
+
+        :meth:`~daq._base.Base.attach` flattens an instrument's ``settings()`` onto the
+        measurement as ``<prefix>_<key>``, so a generator attached as ``bias`` leaves
+        ``bias_function``, ``bias_freq_hz`` and the rest. The carrier-waveform key is what
+        identifies a function generator among the attachments: the DC2200 reports ``mode``,
+        not ``function``, so an attached LED is never mistaken for the gate bias.
+
+        :returns: ``(prefix, settings)`` with the prefix stripped from the keys, or
+            ``(None, {})`` when nothing that looks like a function generator is attached.
+
+        """
+        prefixes = sorted(
+            name[: -len(BIAS_FUNCTION_SUFFIX)]
+            for name, value in self.__dict__.items()
+            if name.endswith(BIAS_FUNCTION_SUFFIX)
+            and name != BIAS_FUNCTION_SUFFIX
+            and isinstance(value, (str, bytes))
+        )
+        if not prefixes:
+            return None, {}
+
+        if len(prefixes) == 1:
+            prefix = prefixes[0]
+        else:
+            prefix = DEFAULT_BIAS_PREFIX if DEFAULT_BIAS_PREFIX in prefixes else prefixes[0]
+            warnings.warn(
+                f"More than one attached instrument reports a carrier waveform ({prefixes}); "
+                f"reading the bias off {prefix!r}. Attach the gate-bias generator as "
+                f"{DEFAULT_BIAS_PREFIX!r} to make the choice explicit, or pass "
+                "analyze(mode=...) to skip the detection.",
+                stacklevel=3,
+            )
+
+        head = f"{prefix}_"
+        settings = {
+            name[len(head) :]: value
+            for name, value in self.__dict__.items()
+            if name.startswith(head)
+        }
+        return prefix, settings
+
+    @property
+    def bias_settings(self) -> Dict[str, Any]:
+        """The attached gate-bias generator's recorded settings, prefix stripped.
+
+        These are the values :meth:`~daq._base.Base.attach` read back from the instrument at
+        the time of the call -- a snapshot of the hardware, not a live link.
+
+        :returns: The settings mapping; empty when no generator is attached.
+
+        """
+        return self._attached_bias()[1]
+
+    @property
+    def bias_mode(self) -> str:
+        """How the gate was biased during this acquisition.
+
+        Read off the generator settings :meth:`~daq._base.Base.attach` recorded, which
+        :meth:`load` restores, so it works on a reloaded file as well as a live run. It is the
+        *configured* waveform: a gated ramp that nothing triggered still reports
+        ``"sawtooth"`` (and :meth:`analyze` warns about it), because that is the measurement
+        that was attempted.
+
+        :returns: ``"sawtooth"`` for a ramp, ``"constant"`` for DC, and ``"unknown"`` when no
+            generator was attached or its carrier is neither -- in which case
+            :meth:`analyze` falls back to the plain time-stream plot.
+
+        """
+        settings = self.bias_settings
+        if not settings:
+            return "unknown"
+        function = _as_text(settings.get("function", "")).strip().upper()
+        if function.startswith("RAMP"):
+            return "sawtooth"
+        if function.startswith("DC"):
+            return "constant"
+        return "unknown"
+
+    @property
+    def bias_period_s(self) -> Optional[float]:
+        """Period of the attached bias ramp in seconds.
+
+        :returns: ``1 / freq_hz`` of the attached generator, or ``None`` unless the bias was a
+            ramp with a usable frequency.
+
+        """
+        if self.bias_mode != "sawtooth":
+            return None
+        freq_hz = self.bias_settings.get("freq_hz")
+        if freq_hz is None or float(freq_hz) <= 0:
+            return None
+        return 1.0 / float(freq_hz)
+
+    def _warn_if_ramp_ungated(self) -> None:
+        """Warn when the attached ramp was gated on a port this acquisition never asserted.
+
+        The generator then sits at its burst start level for the whole record and the data is
+        a static bias wearing a sawtooth's metadata -- the silent failure
+        :class:`~daq.measurements.qc_trace.QCTrace` refuses outright. Folding it succeeds and
+        returns a flat trace, so it is worth saying so before the plot rather than after.
+
+        """
+        settings = self.bias_settings
+        if not settings.get("burst", False):
+            # A free-running ramp needs no trigger; nothing to check.
+            return
+        port = settings.get("trigger_port")
+        if port is None:
+            return
+        port = int(port)
+        states = resolve_trigger_states(self.external_trigger)
+        if port <= states.size and states[port - 1]:
+            return
+        warnings.warn(
+            f"The attached bias generator was in gated-burst mode on trigger port {port}, but "
+            f"this acquisition asserted {describe_trigger_states(states)}. The ramp would have "
+            "waited on a gate that never came and held its burst start level, so the record is "
+            "a static bias and the folded trace will be flat. Check the wiring "
+            "(bias.trigger_port, or DAQ_FGEN_TRIGGER_PORT) against the measurement's "
+            "external_trigger.",
+            stacklevel=3,
+        )
+
+    # ------------------------------------------------------------------ reconstructions
+
+    def fold(
+        self,
+        *,
+        period_s: Optional[float] = None,
+        n_periods: Optional[int] = None,
+        tone: int = 0,
+    ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+        """Block-average this stream into a single bias-ramp period.
+
+        The sawtooth-bias reconstruction: the gate ramp repeats while the stream records
+        continuously, so averaging in blocks of one period beats uncorrelated noise down by
+        ``sqrt(n_periods)`` and leaves the device's response to one sweep of the gate.
+
+        The period defaults to the attached generator's own, ``1 / bias_freq_hz``, and the
+        fold runs at the **tuned** :attr:`df` rather than the requested sample rate -- a
+        window off by a sample smears the average across blocks instead of dropping a
+        leftover. Note that folding cuts the record into ``round(period_s * df)``-sample
+        blocks, so a sample rate that is not a whole multiple of the ramp rate makes every
+        block start a fraction of a sample late and the error accumulate; see
+        :class:`~daq.measurements.qc_trace.QCTrace`, which warns about this up front.
+
+        :param period_s: Fold on this period instead of the attached ramp's.
+        :param n_periods: Fold on the record divided into this many periods instead. Mutually
+            exclusive with *period_s*.
+        :param tone: Which tone to fold, for a multi-tone stream.
+        :raises RuntimeError: If there is no data, or no period is known and none was given.
+        :raises ValueError: If both *period_s* and *n_periods* are given, or the record is
+            shorter than one period.
+        :returns: ``(time_ms, avg_iq)``, as
+            :func:`~daq.analysis.folding.fold_timestream` -- ``avg_iq`` has shape
+            ``(2, n_samples)``, row 0 I and row 1 Q.
+
+        """
+        from ..analysis.folding import fold_timestream
+
+        if self.signal is None:
+            raise RuntimeError("No data available. Run or load the measurement first.")
+        if period_s is None and n_periods is None:
+            period_s = self.bias_period_s
+            if period_s is None:
+                raise RuntimeError(
+                    "No bias-ramp period is known for this stream, so there is nothing to fold "
+                    "on. Attach the generator before running "
+                    "(ts.attach(bias=fgen)) so the ramp frequency is recorded, or pass the "
+                    "period explicitly: ts.fold(period_s=1 / ramp_freq_hz)."
+                )
+        return fold_timestream(self, self.df, period_s=period_s, n_periods=n_periods, tone=tone)
+
+    def _projection(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+        """Return a real projection of the complex readout, as recorded.
+
+        :param tone: Which tone to project.
+        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :raises RuntimeError: If there is no data.
+        :raises ValueError: If *quantity* is not one of the three.
+        :returns: The projected series, operating point included.
+
+        """
+        if self.signal is None:
+            raise RuntimeError("No data available. Run or load the measurement first.")
+        signal = np.asarray(self.signal)[:, tone]
+        if quantity == "abs":
+            return np.abs(signal)
+        if quantity == "real":
+            return np.real(signal)
+        if quantity == "imag":
+            return np.imag(signal)
+        raise ValueError(f"quantity must be 'abs', 'real' or 'imag', got {quantity!r}")
+
+    def _parity_series(self, tone: int = 0, quantity: str = "abs") -> npt.NDArray[np.floating]:
+        """Return the real-valued series whose spectrum is the parity spectrum.
+
+        :param tone: Which tone to project.
+        :param quantity: ``"abs"``, ``"real"`` or ``"imag"``.
+        :raises RuntimeError: If there is no data.
+        :raises ValueError: If *quantity* is not one of the three.
+        :returns: The mean-subtracted series -- the fluctuation, not the operating point.
+
+        """
+        series = self._projection(tone=tone, quantity=quantity)
+        return series - series.mean()
+
+    def parity_psd(
+        self,
+        *,
+        tone: int = 0,
+        quantity: str = "abs",
+        welch: bool = False,
+        nperseg: Optional[int] = None,
+        noverlap: Optional[int] = None,
+    ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+        """Noise spectrum of this stream, for the constant-bias reconstruction.
+
+        The spectrum of the **mean-subtracted** projection of the readout, at the **tuned**
+        :attr:`df` -- the parity signal is the fluctuation about the operating point, not the
+        point itself, and the frequency axis follows the rate the hardware settled on rather
+        than the one that was asked for. ``"abs"`` matches the metric
+        :class:`~daq.measurements.bias_hunt.BiasHunt` ranks its tries by.
+
+        One stream's periodogram is noisy; ``BiasHunt.average_psd`` averages over the tries to
+        beat that down before fitting.
+
+        :param tone: Which tone to take the spectrum of.
+        :param quantity: Projection of the complex readout -- ``"abs"``, ``"real"`` or
+            ``"imag"``.
+        :param welch: Use Welch's method instead of the bare periodogram.
+        :param nperseg: Welch segment length. Ignored unless *welch*.
+        :param noverlap: Welch segment overlap. Ignored unless *welch*.
+        :returns: ``(f, psd)`` -- frequencies in Hz and the PSD in ``FS^2/Hz``.
+
+        """
+        from ..analysis.noise import compute_psd
+
+        return compute_psd(
+            self._parity_series(tone=tone, quantity=quantity),
+            self.df,
+            welch=welch,
+            nperseg=nperseg,
+            noverlap=noverlap,
+        )
+
+    def fit_parity(
+        self,
+        *,
+        tone: int = 0,
+        quantity: str = "abs",
+        welch: bool = False,
+        nperseg: Optional[int] = None,
+        noverlap: Optional[int] = None,
+        **fit_kwargs: Any,
+    ) -> dict:
+        """Fit this stream's noise spectrum to the random-telegraph parity model.
+
+        The sampling bandwidth is held at the tuned :attr:`df`, as
+        :func:`~daq.analysis.noise.fit_parity_psd` expects. Check ``resid_dex_rms`` before
+        believing the result -- ``~0.1`` is a good fit, ``~1`` means the model is a decade off
+        across the band.
+
+        The result is stored on :attr:`fit_results` and reused by :meth:`analyze`.
+
+        :param tone: Which tone to fit.
+        :param quantity: Projection of the complex readout to fit.
+        :param welch: Use Welch's method for the spectrum.
+        :param nperseg: Welch segment length. Ignored unless *welch*.
+        :param noverlap: Welch segment overlap. Ignored unless *welch*.
+        :param fit_kwargs: Passed to :func:`~daq.analysis.noise.fit_parity_psd` --
+            ``fit_onef=True`` for a ``1/f``-like low-frequency rise, ``n_bins``, and so on.
+        :returns: The ``fit_results`` dict.
+
+        """
+        from ..analysis.noise import fit_parity_psd
+
+        f, psd = self.parity_psd(
+            tone=tone, quantity=quantity, welch=welch, nperseg=nperseg, noverlap=noverlap
+        )
+        self.fit_results = fit_parity_psd(f, psd, f_bw=self.df, **fit_kwargs)
+        return self.fit_results
+
+    # ------------------------------------------------------------------ analysis
+
+    def _resolve_analyze_mode(self, mode: Optional[str]) -> str:
+        """Decide which reconstruction :meth:`analyze` runs.
+
+        :param mode: The caller's *mode* argument.
+        :raises ValueError: If *mode* is not a recognised reconstruction.
+        :returns: One of :data:`ANALYZE_MODES`.
+
+        """
+        if mode is None or mode == "auto":
+            detected = self.bias_mode
+            return "raw" if detected == "unknown" else detected
+        if mode not in ANALYZE_MODES:
+            raise ValueError(f"mode must be 'auto' or one of {list(ANALYZE_MODES)}, got {mode!r}")
+        return mode
+
+    def _title(self, prefix: str, tone: int) -> str:
+        """Compose a default figure title naming the device and the tone's frequency.
+
+        :param prefix: Leading description of the plot.
+        :param tone: Which tone the plot is of.
+        :returns: The title.
+
+        """
+        parts = [prefix]
+        if self.device is not None:
+            parts.append(str(self.device))
+        if self.signal_freqs is not None:
+            parts.append(f"{np.atleast_1d(self.signal_freqs)[tone] / 1e9:.6f} GHz")
+        return " -- ".join(parts)
+
     def analyze(
-        self, num_samples: Optional[int] = None, title: Optional[str] = None, show_iq: bool = True
+        self,
+        num_samples: Optional[int] = None,
+        title: Optional[str] = None,
+        show_iq: bool = True,
+        *,
+        mode: Optional[str] = None,
+        tone: int = 0,
+        period_s: Optional[float] = None,
+        raw: bool = True,
+        fit: bool = True,
+        quantity: str = "abs",
+        **fit_kwargs: Any,
+    ):
+        """Reconstruct and plot the acquisition according to how the gate was biased.
+
+        The bias is not a property of the time stream the Presto took -- it is a property of
+        what the function generator was doing while it took it -- so this reads the generator
+        settings :meth:`~daq._base.Base.attach` recorded (and :meth:`load` restores) and runs
+        the matching reconstruction:
+
+        ==================  =======================================================
+        :attr:`bias_mode`   what ``analyze()`` does
+        ==================  =======================================================
+        ``sawtooth``        folds the record into one ramp period (:meth:`fold`) and
+                            plots the block-averaged I/Q trace -- a QC trace
+        ``constant``        plots the readout magnitude against time above its noise
+                            spectrum (:meth:`parity_psd`), fitted to the
+                            random-telegraph parity model
+        ``unknown``         the plain per-tone time-stream plot, as before
+        ==================  =======================================================
+
+        So ``ts.attach(bias=fgen)`` before ``run()`` is what makes a bare ``ts.analyze()``
+        do the right thing afterwards; without it nothing about the samples says whether the
+        gate was ramping, and the fallback is the raw plot. Pass *mode* to override the
+        detection either way.
+
+        This is the same reconstruction the composed measurements do --
+        :class:`~daq.measurements.qc_trace.QCTrace` folds, and
+        :class:`~daq.measurements.bias_hunt.BiasHunt` takes and fits the spectrum -- reached
+        from the stream itself, so a single hand-rolled acquisition or a reloaded file gets it
+        without wrapping it in a measurement class.
+
+        :param num_samples: Limit the time-axis panel to this many samples. Applies to the
+            ``raw`` and ``constant`` plots; the folded trace is one period long by
+            construction.
+        :param title: Figure title. Defaults to naming the reconstruction, the device and the
+            tone's frequency.
+        :param show_iq: ``raw`` mode only -- show I and Q rather than power and phase.
+        :param mode: Force a reconstruction: ``"sawtooth"``, ``"constant"`` or ``"raw"``.
+            ``None`` (the default) or ``"auto"`` reads :attr:`bias_mode`.
+        :param tone: Which tone to reconstruct, for a multi-tone stream. The bias
+            reconstructions are single-tone; the ``raw`` plot shows every tone regardless.
+        :param period_s: ``sawtooth`` mode only -- fold on this period instead of the attached
+            ramp's. The way to fold a stream whose generator was never attached.
+        :param raw: ``sawtooth`` mode only -- overlay one un-averaged period, showing what the
+            averaging bought.
+        :param fit: ``constant`` mode only -- overlay the parity-model fit. A fit that raises
+            is reported on the panel rather than costing the spectrum.
+        :param quantity: ``constant`` mode only -- which projection of the complex readout to
+            take the spectrum of (``"abs"``, ``"real"``, ``"imag"``).
+        :param fit_kwargs: ``constant`` mode only -- passed to
+            :func:`~daq.analysis.noise.fit_parity_psd` (e.g. ``fit_onef=True``).
+        :raises RuntimeError: If there is no data to analyse.
+        :raises ValueError: If *mode* or *quantity* is not recognised.
+        :returns: The created figure.
+
+        """
+        if self.signal is None:
+            raise RuntimeError("No data available. Run the measurement first.")
+
+        resolved = self._resolve_analyze_mode(mode)
+        if fit_kwargs and resolved != "constant":
+            # **fit_kwargs would otherwise swallow a misspelled argument without a word.
+            warnings.warn(
+                f"analyze() ignored {sorted(fit_kwargs)}: fit arguments belong to the "
+                f"constant-bias spectrum, and this stream reconstructs as {resolved!r}.",
+                stacklevel=2,
+            )
+        if mode is None or mode == "auto":
+            print(f"TimeStream.analyze: bias_mode={self.bias_mode!r} -> {resolved} reconstruction")
+
+        if resolved == "sawtooth":
+            return self._analyze_sawtooth(title=title, tone=tone, period_s=period_s, raw=raw)
+        if resolved == "constant":
+            return self._analyze_constant(
+                num_samples=num_samples,
+                title=title,
+                tone=tone,
+                fit=fit,
+                quantity=quantity,
+                **fit_kwargs,
+            )
+        return self._analyze_raw(num_samples=num_samples, title=title, show_iq=show_iq)
+
+    def _analyze_sawtooth(
+        self,
+        *,
+        title: Optional[str],
+        tone: int,
+        period_s: Optional[float],
+        raw: bool,
+    ):
+        """Fold the record into one bias-ramp period and plot it.
+
+        :param title: Figure title, or ``None`` for the default.
+        :param tone: Which tone to fold.
+        :param period_s: Fold period, or ``None`` for the attached ramp's.
+        :param raw: Overlay one un-averaged period.
+        :returns: The created figure.
+
+        """
+        import matplotlib.pyplot as plt
+
+        from ..analysis.plotting import plot_qc_trace
+
+        self._warn_if_ramp_ungated()
+        time_ms, avg_iq = self.fold(period_s=period_s, tone=tone)
+        n_folded = int(np.asarray(self.signal).shape[0] // avg_iq.shape[1])
+
+        fig, axes = plt.subplots(2, 1, figsize=(8, 6), sharex=True, tight_layout=True)
+        if title is None:
+            title = self._title(f"QC trace (block-averaged, {n_folded} periods)", tone)
+        plot_qc_trace(time_ms, avg_iq, raw=self if raw else None, ax=axes, tone=tone, title=title)
+
+        plt.show()
+        return fig
+
+    def _analyze_constant(
+        self,
+        *,
+        num_samples: Optional[int],
+        title: Optional[str],
+        tone: int,
+        fit: bool,
+        quantity: str,
+        **fit_kwargs: Any,
+    ):
+        """Plot the readout magnitude against time above its fitted noise spectrum.
+
+        :param num_samples: Limit the time panel to this many samples.
+        :param title: Figure title, or ``None`` for the default.
+        :param tone: Which tone to reconstruct.
+        :param fit: Overlay the parity-model fit.
+        :param quantity: Projection of the readout to take the spectrum of.
+        :param fit_kwargs: Passed to :func:`~daq.analysis.noise.fit_parity_psd`.
+        :returns: The created figure.
+
+        """
+        import matplotlib.pyplot as plt
+
+        from ..analysis.plotting import plot_psd
+
+        # Projected before drawing anything, so an unknown quantity costs no figure.
+        # The time panel shows the projection as recorded, operating point included, even
+        # though the spectrum below is of the fluctuation about it -- where the readout sits
+        # is half of what a constant-bias record is for.
+        projection = self._projection(tone=tone, quantity=quantity)
+        label = _QUANTITY_LABELS[quantity]
+        # The spread of the projection is BiasHunt's parity-contrast metric, so the number
+        # that ranks this operating point against others is the one annotated here. Taken
+        # over the whole record, not the plotted window, so num_samples cannot quietly
+        # change what it means.
+        contrast = float(np.std(projection))
+
+        fig, (ax_t, ax_psd) = plt.subplots(2, 1, figsize=(8, 8), tight_layout=True)
+
+        trace = projection if num_samples is None else projection[:num_samples]
+        time_s = np.arange(trace.shape[0]) / self.df
+        ax_t.plot(time_s, trace, lw=0.5, color="tab:green")
+        ax_t.set_xlabel("Time [s]")
+        ax_t.set_ylabel(f"{label} [FS]")
+        ax_t.grid(True, alpha=0.3)
+        ax_t.legend(
+            [f"std over the record = {contrast:.4e} FS"],
+            loc="best",
+            fontsize=8,
+            handlelength=0,
+        )
+
+        f, psd = self.parity_psd(tone=tone, quantity=quantity)
+        _, fits = plot_psd(
+            f,
+            psd,
+            basis="electronic",
+            labels=(label, ""),
+            f_bw=self.df,
+            fit=fit,
+            ax=ax_psd,
+            **fit_kwargs,
+        )
+        # plot_psd fits the array it was handed rather than reading one off this object, so
+        # what lands here describes the spectrum that was actually drawn. Only when a fit was
+        # asked for: analyze(fit=False) must not wipe an earlier fit_parity() result.
+        if fit:
+            self.fit_results = fits["a"]
+
+        fig.suptitle(self._title("Constant-bias parity stream", tone) if title is None else title)
+
+        plt.show()
+        return fig
+
+    def _analyze_raw(
+        self,
+        *,
+        num_samples: Optional[int] = None,
+        title: Optional[str] = None,
+        show_iq: bool = True,
     ):
         """
         Plot the timestream data, using each tone's selected sideband.
