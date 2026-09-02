@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""
-Power calibration utilities.
+"""Power calibration utilities.
 
-Translates between DAC full-scale amplitude (``amp``) and calibrated output
-power in dBm using packaged calibration grid data.
+``amp`` is the DAC voltage amplitude as a fraction of full scale.  At a fixed
+frequency, output power therefore follows
 
-The preferred calibration asset is a NumPy ``.npz`` archive containing the
-calibration grids (``f_grid``, ``a_grid``, ``Z``). A legacy cloudpickle-based
-asset is still supported as a fallback for compatibility, but the interpolator
-is always rebuilt from raw arrays at runtime.
+``power_dbm = power_dbm_at_amp_1 + 20 * log10(amp)``.
+
+The packaged calibration contains the measured full-scale power versus
+frequency.  Keeping amplitude scaling analytic avoids interpolating sparse or
+noise-floor-limited power measurements on an inappropriate linear-amplitude
+grid.
 """
 
 from functools import lru_cache
@@ -19,144 +20,88 @@ import numpy as np
 import numpy.typing as npt
 
 _DATA_PATH = Path(__file__).parent / "power_calibration.npz"
-_LEGACY_PICKLE_PATH = Path(__file__).parent / "power_cal_interpolator.pkl"
 
 FloatArray = Union[float, npt.NDArray[np.floating]]
 
 
-def _is_monotonic_along_amp_axis(Z: npt.NDArray[np.float64]) -> bool:
-    """Return whether power changes monotonically with amplitude."""
-    dZ = np.diff(Z, axis=1)
-    return bool(np.all(dZ >= 0.0) or np.all(dZ <= 0.0))
-
-
-def _orient_calibration_grid(
-    f_grid: npt.NDArray[np.float64],
-    a_grid: npt.NDArray[np.float64],
-    Z: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """Match the calibration matrix to ``(frequency, amplitude)`` axes.
-
-    Some packaged assets were saved with the grid transposed. Power should
-    vary monotonically with amplitude at fixed frequency, so use that
-    physical constraint to choose the correct orientation.
-    """
-    expected_shape = (len(f_grid), len(a_grid))
-
-    if Z.shape == expected_shape and _is_monotonic_along_amp_axis(Z):
-        return Z
-
-    if Z.T.shape == expected_shape and _is_monotonic_along_amp_axis(Z.T):
-        return Z.T
-
-    raise ValueError(
-        "Calibration grid shape/orientation is inconsistent with the "
-        "frequency and amplitude axes."
-    )
-
-
 @lru_cache(maxsize=1)
-def _load_calibration():
-    """Load calibration grids and build a scipy interpolator.
-
-    The preferred data source is a packaged ``.npz`` archive with ``f_grid``
-    (GHz), ``a_grid`` (full-scale amplitude), and ``Z`` (power in dBm). For
-    backward compatibility, a legacy cloudpickle-based calibration asset is
-    used only if the stable archive is unavailable.
-
-    :returns: ``(interpolator, f_grid, a_grid)``
-    """
-    from scipy.interpolate import RegularGridInterpolator
-
-    if _DATA_PATH.exists():
+def _load_calibration() -> tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], float, float]:
+    """Load and validate the packaged full-scale calibration."""
+    try:
         with np.load(_DATA_PATH) as data:
-            f_grid = np.asarray(data["f_grid"], dtype=np.float64)
-            a_grid = np.asarray(data["a_grid"], dtype=np.float64)
-            Z = np.asarray(data["Z"], dtype=np.float64)
-    else:
-        try:
-            import cloudpickle
+            frequency_ghz = np.asarray(data["frequency_ghz"], dtype=np.float64)
+            power_dbm_at_amp_1 = np.asarray(data["power_dbm_at_amp_1"], dtype=np.float64)
+            amp_min = float(data["amp_min"])
+            amp_max = float(data["amp_max"])
+    except (OSError, KeyError, ValueError) as exc:
+        raise RuntimeError(
+            f"Could not load a valid power calibration from '{_DATA_PATH}'."
+        ) from exc
 
-            with _LEGACY_PICKLE_PATH.open("rb") as f:
-                fn = cloudpickle.load(f)
-        except Exception as exc:
-            raise RuntimeError(
-                "Calibration data could not be loaded. "
-                f"Expected '{_DATA_PATH.name}' or a compatible legacy "
-                f"'{_LEGACY_PICKLE_PATH.name}'."
-            ) from exc
+    if frequency_ghz.ndim != 1 or power_dbm_at_amp_1.ndim != 1:
+        raise RuntimeError("Calibration frequency and power arrays must be one-dimensional.")
+    if frequency_ghz.size < 2 or frequency_ghz.shape != power_dbm_at_amp_1.shape:
+        raise RuntimeError("Calibration frequency and power arrays have incompatible sizes.")
+    if not np.all(np.isfinite(frequency_ghz)) or not np.all(np.isfinite(power_dbm_at_amp_1)):
+        raise RuntimeError("Calibration frequency and power arrays must be finite.")
+    if not np.all(np.diff(frequency_ghz) > 0.0):
+        raise RuntimeError("Calibration frequencies must be strictly increasing.")
+    if not (0.0 < amp_min < amp_max <= 1.0):
+        raise RuntimeError("Calibration amplitude limits must satisfy 0 < min < max <= 1.")
 
-        g = fn.__globals__
-        f_grid = np.asarray(g["f_grid"], dtype=np.float64)
-        a_grid = np.asarray(g["a_grid"], dtype=np.float64)
-        Z = np.asarray(g["Z"], dtype=np.float64)
+    return frequency_ghz, power_dbm_at_amp_1, amp_min, amp_max
 
-    Z = _orient_calibration_grid(f_grid, a_grid, Z)
 
-    interp = RegularGridInterpolator(
-        (f_grid, a_grid), Z, method="linear", bounds_error=True
-    )
-    return interp, f_grid, a_grid
+def _full_scale_power_dbm(freq_ghz: float) -> float:
+    """Interpolate measured full-scale power at *freq_ghz*."""
+    frequency_ghz, power_dbm_at_amp_1, _, _ = _load_calibration()
+    if not np.isfinite(freq_ghz):
+        raise ValueError("Frequency must be finite.")
+    if freq_ghz < frequency_ghz[0] or freq_ghz > frequency_ghz[-1]:
+        raise ValueError(
+            f"Frequency {freq_ghz:.4f} GHz is outside the calibrated range "
+            f"[{frequency_ghz[0]:.4f}, {frequency_ghz[-1]:.4f}] GHz."
+        )
+    return float(np.interp(freq_ghz, frequency_ghz, power_dbm_at_amp_1))
 
 
 def amp_to_power_dbm(freq_ghz: float, amp: FloatArray) -> FloatArray:
-    """Convert DAC full-scale amplitude to calibrated output power in dBm.
+    """Convert DAC voltage amplitude to calibrated output power in dBm.
 
     :param freq_ghz: Carrier frequency in GHz.
-    :param amp: DAC amplitude (fraction of full scale), scalar or array.
-    :returns: Output power in dBm, same shape as *amp*.
-    :raises ValueError: If *freq_ghz* or any *amp* value is outside the
-        calibration grid.
+    :param amp: DAC voltage amplitude (fraction of full scale), scalar or array.
+    :returns: Output power in dBm, with the same shape as *amp*.
+    :raises ValueError: If frequency or amplitude is outside the calibrated range.
     """
-    interp, _, _ = _load_calibration()
-    amp = np.asarray(amp, dtype=np.float64)
-    scalar = amp.ndim == 0
-    amp = np.atleast_1d(amp)
-    pts = np.column_stack([np.full_like(amp, freq_ghz), amp])
-    result = interp(pts)
-    return float(result[0]) if scalar else result
+    _, _, amp_min, amp_max = _load_calibration()
+    amps = np.asarray(amp, dtype=np.float64)
+    if not np.all(np.isfinite(amps)):
+        raise ValueError("Amplitude must be finite.")
+    if np.any(amps < amp_min) or np.any(amps > amp_max):
+        raise ValueError(f"Amplitude is outside the calibrated range [{amp_min:g}, {amp_max:g}].")
+
+    result = _full_scale_power_dbm(freq_ghz) + 20.0 * np.log10(amps)
+    return float(result) if result.ndim == 0 else result
 
 
 def amp_to_power_dbm_hz(freq_hz: float, amp: FloatArray) -> FloatArray:
-    """Convert DAC full-scale amplitude to calibrated output power in dBm.
-
-    Convenience wrapper that accepts frequency in Hz (converted to GHz
-    internally).
-
-    :param freq_hz: Carrier frequency in Hz.
-    :param amp: DAC amplitude (fraction of full scale), scalar or array.
-    :returns: Output power in dBm, same shape as *amp*.
-    :raises ValueError: If frequency or any *amp* value is outside the
-        calibration grid.
-    """
+    """Convert DAC voltage amplitude to output power, accepting frequency in Hz."""
     return amp_to_power_dbm(freq_hz * 1e-9, amp)
 
 
 def power_dbm_to_amp(freq_ghz: float, power_dbm: float) -> float:
-    """Convert a desired output power in dBm back to DAC amplitude.
+    """Convert calibrated output power in dBm to DAC voltage amplitude."""
+    _, _, amp_min, amp_max = _load_calibration()
+    if not np.isfinite(power_dbm):
+        raise ValueError("Power must be finite.")
 
-    Uses root-finding (Brent's method) assuming that at a given frequency,
-    amplitude and power are monotonically related.
-
-    :param freq_ghz: Carrier frequency in GHz.
-    :param power_dbm: Desired output power in dBm.
-    :returns: DAC amplitude (fraction of full scale).
-    :raises ValueError: If the requested power is outside the calibrated range.
-    """
-    from scipy.optimize import brentq
-
-    _, _, a_grid = _load_calibration()
-    amp_lo, amp_hi = float(a_grid[0]), float(a_grid[-1])
-    p_lo = amp_to_power_dbm(freq_ghz, amp_lo)
-    p_hi = amp_to_power_dbm(freq_ghz, amp_hi)
-
-    # Ensure bracket covers the target
-    if power_dbm < min(p_lo, p_hi) or power_dbm > max(p_lo, p_hi):
+    full_scale_power = _full_scale_power_dbm(freq_ghz)
+    power_min = full_scale_power + 20.0 * np.log10(amp_min)
+    power_max = full_scale_power + 20.0 * np.log10(amp_max)
+    if power_dbm < power_min or power_dbm > power_max:
         raise ValueError(
             f"Requested power {power_dbm:.1f} dBm is outside the calibrated range "
-            f"[{min(p_lo, p_hi):.1f}, {max(p_lo, p_hi):.1f}] dBm at {freq_ghz:.4f} GHz."
+            f"[{power_min:.1f}, {power_max:.1f}] dBm at {freq_ghz:.4f} GHz."
         )
-
-    return float(
-        brentq(lambda a: amp_to_power_dbm(freq_ghz, a) - power_dbm, amp_lo, amp_hi)
-    )
+    amp = 10.0 ** ((power_dbm - full_scale_power) / 20.0)
+    return float(np.clip(amp, amp_min, amp_max))
