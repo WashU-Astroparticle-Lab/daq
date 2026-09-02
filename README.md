@@ -103,13 +103,17 @@ Power calibration is exported at top level — `amp_to_power_dbm(freq_ghz, amp)`
 `power_dbm_to_amp(freq_ghz, power_dbm)` — so a measurement can be set up in dBm
 (`amp=power_dbm_to_amp(5.0, -20.0)`). Here `amp` is a full-scale voltage
 fraction, so its power dependence is `20 log10(amp)`; `SweepPower` and
-`TwoTonePower` label their axes with the calibration.
+`TwoTonePower` label their axes with the calibration. Any `0 < |amp| <= 1` converts, but
+below `min_verified_amp(freq_ghz)` — the amplitude where the spectrum analyzer's own floor
+started hiding the tone during calibration — the conversion is an extrapolation of that law
+and raises a `CalibrationWarning` to say so.
 
-Regenerate the packaged asset—and optionally its diagnostic figure—from the
-spectrum-analyzer CSV directory with:
+The spectrum-analyzer sweeps the asset was built from are committed under
+`daq/calibrations/source_data/`. Regenerate the packaged asset—and optionally its diagnostic
+figure—with:
 
 ```bash
-python scripts/build_power_calibration.py <csv-directory> --diagnostic-plot docs/power_calibration_diagnostic.png
+python scripts/build_power_calibration.py --diagnostic-plot docs/power_calibration_diagnostic.png
 ```
 
 ## Tests
