@@ -105,6 +105,13 @@ Power calibration is exported at top level — `amp_to_power_dbm(freq_ghz, amp)`
 fraction, so its power dependence is `20 log10(amp)`; `SweepPower` and
 `TwoTonePower` label their axes with the calibration.
 
+Regenerate the packaged asset—and optionally its diagnostic figure—from the
+spectrum-analyzer CSV directory with:
+
+```bash
+python scripts/build_power_calibration.py <csv-directory> --diagnostic-plot docs/power_calibration_diagnostic.png
+```
+
 ## Tests
 
 There is no CI. `tests/` is an offline verification suite: no hardware, no VISA runtime, no
