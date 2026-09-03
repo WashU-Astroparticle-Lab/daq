@@ -116,6 +116,15 @@ figure—with:
 python scripts/build_power_calibration.py --diagnostic-plot docs/power_calibration_diagnostic.png
 ```
 
+Two more figures document the calibration and can be regenerated the same way:
+`docs/power_calibration_interpolation.png` (`scripts/plot_power_calibration_interpolation.py`)
+shows how the conversions behave at frequencies with no calibration data — the interpolated
+full-scale power and verified floor across the band, every DAC-configuration switch, and nine
+off-grid frequencies drawn between their calibrated neighbours — and is the plot to check after
+any rebuild. `docs/power_calibration_before_after.png`
+(`scripts/plot_power_calibration_before_after.py`) compares it with the four-corner grid it
+replaced.
+
 ## Tests
 
 There is no CI. `tests/` is an offline verification suite: no hardware, no VISA runtime, no
