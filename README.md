@@ -101,7 +101,29 @@ daq/
 
 Power calibration is exported at top level — `amp_to_power_dbm(freq_ghz, amp)` and
 `power_dbm_to_amp(freq_ghz, power_dbm)` — so a measurement can be set up in dBm
-(`amp=power_dbm_to_amp(5.0, -20.0)`); `SweepPower` and `TwoTonePower` label their axes with it.
+(`amp=power_dbm_to_amp(5.0, -20.0)`). Here `amp` is a full-scale voltage
+fraction, so its power dependence is `20 log10(amp)`; `SweepPower` and
+`TwoTonePower` label their axes with the calibration. Any `0 < |amp| <= 1` converts, but
+below `min_verified_amp(freq_ghz)` — the amplitude where the spectrum analyzer's own floor
+started hiding the tone during calibration — the conversion is an extrapolation of that law
+and raises a `CalibrationWarning` to say so.
+
+The spectrum-analyzer sweeps the asset was built from are committed under
+`daq/calibrations/source_data/`. Regenerate the packaged asset—and optionally its diagnostic
+figure—with:
+
+```bash
+python scripts/build_power_calibration.py --diagnostic-plot docs/power_calibration_diagnostic.png
+```
+
+Two more figures document the calibration and can be regenerated the same way:
+`docs/power_calibration_interpolation.png` (`scripts/plot_power_calibration_interpolation.py`)
+shows how the conversions behave at frequencies with no calibration data — the interpolated
+full-scale power and verified floor across the band, every DAC-configuration switch, and nine
+off-grid frequencies drawn between their calibrated neighbours — and is the plot to check after
+any rebuild. `docs/power_calibration_before_after.png`
+(`scripts/plot_power_calibration_before_after.py`) compares it with the four-corner grid it
+replaced.
 
 ## Tests
 
@@ -109,7 +131,7 @@ There is no CI. `tests/` is an offline verification suite: no hardware, no VISA 
 MongoDB. Each script prints one PASS/FAIL line per check and exits non-zero on failure.
 
 ```bash
-python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_timestream_analyze.py && python tests/test_resonator.py && python tests/test_qc_trace.py && python tests/test_bias_hunt.py && python tests/test_plotting.py
+python tests/test_calibrations.py && python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_timestream_analyze.py && python tests/test_resonator.py && python tests/test_qc_trace.py && python tests/test_bias_hunt.py && python tests/test_plotting.py
 ```
 
 They are standalone scripts, not pytest suites — run them as scripts. Extend them when
