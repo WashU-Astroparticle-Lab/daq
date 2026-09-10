@@ -11,10 +11,12 @@ from .two_tone_power import TwoTonePower
 # the folding step.
 from .bias_hunt import BiasHunt
 from .qc_trace import QCTrace
+from .sweep_std_dev import StdDevSweep
 
 __all__ = [
     "BiasHunt",
     "QCTrace",
+    "StdDevSweep",
     "Sweep",
     "SweepFreqAndDC",
     "SweepPower",

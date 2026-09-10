@@ -9,6 +9,7 @@ from .instruments import Agilent33220A, DC2200, InstrumentError
 from .measurements import (
     BiasHunt,
     QCTrace,
+    StdDevSweep,
     Sweep,
     SweepFreqAndDC,
     SweepPower,
@@ -28,6 +29,7 @@ __all__ = [
     "InstrumentError",
     "BiasHunt",
     "QCTrace",
+    "StdDevSweep",
     "Sweep",
     "SweepFreqAndDC",
     "SweepPower",

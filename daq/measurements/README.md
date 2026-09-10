@@ -694,6 +694,93 @@ alone; `analyze(fit=False)` the spectrum without the model.
 
 ---
 
+### 8. StdDevSweep (`sweep_std_dev.py`)
+
+**Purpose**: choose a QPD readout frequency from the standard deviation of a QC trace.
+Acquires a `QCTrace` at each supplied frequency, folds each record into one averaged gate-ramp
+period, and plots standard deviation versus readout frequency. `best_freq` is the frequency
+with the largest value of the selected statistic.
+
+The default `quantity="principal"` measures the **principal axis of the I/Q trace**. At each
+frequency, it centers the folded I/Q samples, forms their 2-by-2 covariance matrix, and finds
+the eigenvector with the largest eigenvalue. Projecting onto that unit vector gives the
+direction with the largest standard deviation, `sqrt(largest eigenvalue)`. This is equivalent
+to rotating I/Q so that the axis of greatest variation becomes I. The axis is fitted afresh
+at each frequency: independent fixed rotations or DC offsets of the traces do not change the
+resulting curve. No resonator fit is needed to determine the axis.
+
+This follows the notebooks' **fold first, then take std** workflow. Separate `std(I)` and
+`std(Q)` curves remain available and are plotted alongside the principal-axis curve.
+The metric measures readout variation in ADC full-scale units; it does not convert the
+response to capacitance or normalize frequency-dependent gain. A large std is the selection
+criterion, rather than a noise-subtracted SNR or a parity-fidelity estimate.
+
+```python
+import numpy as np
+from daq import StdDevSweep, QCTrace
+
+fr = sweep.fit_results["fr"]  # resonance from an earlier Sweep
+scan = StdDevSweep(
+    freq_arr=np.linspace(fr - 250e3, fr + 250e3, 51),
+    amp=amp, output_port=1, input_port=1,
+    ramp_vpp=1.2, ramp_freq_hz=500,
+    sampling_frequency=1e5, num_periods=1000,
+    device="my-QPD", notes="Readout frequency optimization",
+)
+path = scan.run()             # opens the Agilent33220A once for the sweep
+scan.analyze()               # I, Q and principal-axis std; maximum marked
+readout_freq = scan.best_freq # Hz, ready for a subsequent QCTrace or BiasHunt
+best_trace = QCTrace.load(scan.best_qc_file)
+best_trace.analyze()
+
+restored = StdDevSweep.load(path)
+restored.analyze()           # summary alone suffices, no hardware or raw-file loading
+```
+
+Like `QCTrace`, `run(bias)` accepts an already-open Agilent33220A; otherwise it discovers one.
+It uses the existing driver and trigger routing (`trigger_states=None` follows the generator's
+`trigger_port`). The bias output is disabled on completion or failure, and a caller-owned VISA
+session is left open. Each frequency uses the same ramp configuration and DAC amplitude.
+Frequency spacing is set by `freq_arr`, independently of `sampling_frequency`; the sweep
+does not interpolate an optimum between measured points.
+
+**Statistic choices** (all saved with the measurement):
+
+| Parameter | Choices |
+|---|---|
+| `trace_source` | `"folded"` (default): std across the averaged ramp period; `"raw"`: std across the startup-trimmed timestream |
+| `quantity` | `"principal"` (default), `"real"` (I), `"imag"` (Q), `"complex"` (combined I/Q), `"abs"` (magnitude) |
+| `ddof` | `0` (default, divisor N, as in the notebooks); `1` uses N-1 |
+
+`"complex"` computes `sqrt(var(I) + var(Q))`, which includes spread along both axes;
+`"principal"` uses only the largest-variance axis. For `"abs"` with a folded trace, I/Q is
+averaged **before** taking the magnitude. Equal principal variances make the axis direction
+ambiguous, but the principal standard deviation remains well-defined and rotation invariant.
+The eigenvector's sign is also arbitrary and has no effect on the statistic.
+
+**Results and persistence**:
+
+- `freq_arr` and `std_arr`: frequency in Hz and the selected standard-deviation curve.
+- `std_i_arr`, `std_q_arr`, `std_principal_arr`: the three diagnostic curves, always recorded.
+- `principal_axes`: unit `[I, Q]` direction at each frequency, shape `(n_frequencies, 2)`.
+- `best_freq`, `best_std`, `best_qc_file`: the selected maximum and its folded QC record.
+- `qc_files`, `raw_files`: paths to each point's folded QC record and raw TimeStream.
+- `sample_counts`, `sampling_frequencies`: samples used in each std and actual tuned rates.
+- `trigger_states`: resolved digital routing. As with `QCTrace.load()`, re-running a loaded
+  sweep reads the current generator's wiring; pass an override on a new instance to pin it.
+
+Each point saves its normal TimeStream and QCTrace records; the sweep adds one
+`sweep_std_dev` HDF5/MongoDB summary. `save_filename` only names that summary. The underlying
+QCTrace handles startup trimming and folds using the tuned sample rate. Choose an integral
+ratio of sampling frequency to ramp frequency, as for a standalone QCTrace.
+
+Exact ties select the first supplied frequency. An all-zero curve has no optimum
+(`best_freq`, `best_std`, and `best_qc_file` are `None`). Nonfinite or insufficient samples
+raise rather than enter the ranking. A failed re-run clears the old optimum and retains paths
+to completed new points; `save()` and `analyze()` require a completed curve.
+
+---
+
 ## Common Parameters
 
 All measurements share these common parameters:
@@ -757,6 +844,8 @@ Each measurement class provides an `analyze()` method for visualization:
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
 - **QCTrace**: the block-averaged I/Q QC trace over one ramp period
+- **StdDevSweep**: I, Q and principal-axis standard deviation versus readout frequency,
+  with the maximum of the selected statistic marked
 - **BiasHunt**: parity contrast vs. gate bias with the winner marked, above the averaged noise
   PSD and its random-telegraph fit
 

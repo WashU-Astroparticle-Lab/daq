@@ -216,6 +216,15 @@ Settings are cached after first access via `get_settings()`. Call `reload_settin
 
 ### Measurement Classes (`daq/measurements/`)
 
+- **`StdDevSweep`** (`sweep_std_dev.py`) — Sweeps an explicit frequency array using one
+  `QCTrace` per point. Defaults to the principal-axis standard deviation of the folded QC
+  trace: the square root of the largest eigenvalue of the centered I/Q covariance, fitted
+  separately at each frequency so IQ rotations leave the curve unchanged. Also records I/Q
+  std curves and principal directions; raw-stream and complex/magnitude/I/Q statistics are
+  optional. Saves each constituent acquisition plus an HDF5/MongoDB summary with the maximum
+  and all paths. Reuses QCTrace's Agilent33220A acquisition and cleanup. Offline integration
+  and rotation-invariance tests: `python tests/test_sweep_std_dev.py`.
+
 All measurement classes inherit from `Base` (`daq/_base.py`). Each runs a hardware acquisition via the `presto` library, optionally fits the data, saves results to HDF5, and logs metadata to MongoDB.
 
 - **`Sweep`** — Single-tone frequency sweep. Auto-fits resonator parameters (fr, Qi, Qc, Ql, kappa) via `daq.analysis.resonator.fit_notch` (see Analysis), so `fit_results` also carries the environmental term.
