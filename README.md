@@ -131,7 +131,7 @@ There is no CI. `tests/` is an offline verification suite: no hardware, no VISA 
 MongoDB. Each script prints one PASS/FAIL line per check and exits non-zero on failure.
 
 ```bash
-python tests/test_calibrations.py && python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_timestream_analyze.py && python tests/test_resonator.py && python tests/test_qc_trace.py && python tests/test_bias_hunt.py && python tests/test_plotting.py
+python tests/test_calibrations.py && python tests/test_instruments.py && python tests/test_timestream_run.py && python tests/test_timestream_analyze.py && python tests/test_resonator.py && python tests/test_qc_trace.py && python tests/test_software_led.py && python tests/test_bias_hunt.py && python tests/test_plotting.py
 ```
 
 They are standalone scripts, not pytest suites — run them as scripts. Extend them when

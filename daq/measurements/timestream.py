@@ -3,6 +3,7 @@
 TimeStream measurement class for acquiring time-domain data with multiple frequencies.
 """
 
+import time
 import warnings
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
@@ -21,6 +22,7 @@ from ..triggers import (
     describe_trigger_states,
     resolve_trigger_states,
 )
+from ._software_led import SoftwareLEDMixin
 
 FloatAny = Union[float, List[float], npt.NDArray[np.floating]]
 BoolAny = Union[bool, List[bool], npt.NDArray[np.bool_]]
@@ -82,7 +84,7 @@ def _as_text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-class TimeStream(Base):
+class TimeStream(SoftwareLEDMixin, Base):
     _CONSTRUCTOR_ATTRS = frozenset({
         "lo_freq",
         "df",
@@ -318,8 +320,9 @@ class TimeStream(Base):
             data (the first recorded pulse position, modulo the pulse period). Keep the
             callable fast and side-effect-only; its return value is ignored. If it raises,
             the acquisition is abandoned and the exception propagates -- the Presto outputs
-            are muted on the way out and the connection closes, but disarming any instrument
-            the caller armed stays with the caller (e.g. its ``with`` block).
+            are muted on the way out and the connection closes. Instruments armed by this
+            hook remain the caller's responsibility. An LED registered with ``attach_led``
+            starts after this hook and is automatically disabled before saving.
         :returns: Path of the saved HDF5 file.
 
         """
@@ -327,7 +330,7 @@ class TimeStream(Base):
             presto_address = get_presto_address()
         if presto_port is None:
             presto_port = get_presto_port()
-        with lockin.Lockin(
+        with self._software_led_acquisition() as start_led, lockin.Lockin(
             address=presto_address,
             port=presto_port,
             ext_ref_clk=ext_ref_clk,
@@ -373,6 +376,10 @@ class TimeStream(Base):
                     # done and any trigger output is asserted, so side hardware started here
                     # lands ms-scale from sample zero instead of a seconds-scale offset.
                     on_acquire()
+
+                if start_led is not None:
+                    start_led()
+                    self.led_acquire_requested_unix = time.time()
 
                 # Acquire data
                 pixel_dict = lck.get_pixels(self.pixel_counts)

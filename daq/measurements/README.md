@@ -448,6 +448,14 @@ tt.analyze(quantity="quadrature", linecut=True)
 
 ### 6. QCTrace (`qc_trace.py`)
 
+For software-started LED pulses alongside the QC acquisition, configure a DC2200 in
+pulse mode with its output disabled, then call `qct.attach_led(led)` before `run()`.
+The same method is available on `TimeStream`. It starts the pulse engine immediately
+before sampling and disables it before saving, including on failure; existing
+`attach(led=led)` snapshots and TTL routing keep their behavior. See the
+[LED attachment examples and timing metadata](../instruments/README.md#attach-software-started-pulses-attach_led).
+Use the raw `qc_stream` to locate pulses; the QC fold follows the gate ramp's period.
+
 **Purpose**: Quantum-capacitance (charge-parity / quasiparticle-tunnelling) trace on one
 device — a gated gate-voltage ramp, block-averaged into a single ramp period. It drives no
 Presto hardware of its own: it composes one `TimeStream` and an `Agilent33220A` gate-bias

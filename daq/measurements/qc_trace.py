@@ -25,10 +25,11 @@ from ..triggers import (
     trigger_for,
 )
 from ._gate_bias import GateBiasMeasurement
+from ._software_led import SoftwareLEDMixin
 from .timestream import TimeStream
 
 
-class QCTrace(GateBiasMeasurement):
+class QCTrace(SoftwareLEDMixin, GateBiasMeasurement):
     """Quantum-capacitance trace: a gated gate-voltage ramp, folded into one period.
 
     The gate is swept by a sawtooth that repeats at ``ramp_freq_hz`` while a single-tone time
@@ -317,6 +318,12 @@ class QCTrace(GateBiasMeasurement):
     ) -> str:
         """Acquire the gated-ramp time stream, fold it, and save the derived record.
 
+        An LED registered with ``attach_led(led)`` is forwarded to the raw time stream:
+        its internal pulse engine starts immediately before acquisition, independently of
+        the ramp's digital trigger, and is disabled before saving the stream. LED settings
+        and host timing metadata are also copied to this derived record. Pulse locations
+        should be inspected in ``qc_stream``; folding averages on the gate ramp's period.
+
         The gate-bias generator's output is forced off when the acquisition finishes --
         including on exception -- so no bias is left on the device. When *bias* is omitted the
         generator is opened and closed here; when it is passed in the caller keeps ownership
@@ -344,8 +351,9 @@ class QCTrace(GateBiasMeasurement):
             presto_port=presto_port,
             ext_ref_clk=ext_ref_clk,
         )
+        led = self._get_software_led()
 
-        with ExitStack() as stack:
+        with self._software_led_acquisition(), ExitStack() as stack:
             if bias is None:
                 bias = stack.enter_context(Agilent33220A())
             else:
@@ -380,7 +388,18 @@ class QCTrace(GateBiasMeasurement):
                 notes="Gated sawtooth QC trace",
             )
             self._qc_stream.attach(bias=bias)
+            if led is not None:
+                self._qc_stream.attach_led(led)
             self.qc_file = self._qc_stream.run(**run_kwargs)
+            if led is not None:
+                self._clear_led_metadata()
+                self.attach(
+                    led={
+                        key[4:]: value
+                        for key, value in self._qc_stream.__dict__.items()
+                        if key.startswith("led_")
+                    }
+                )
             self.fold()
 
         # Saved after the bias is de-energised, so a failure here cannot leave it applied.
@@ -515,6 +534,9 @@ class QCTrace(GateBiasMeasurement):
                 self.trigger_states = resolve_trigger_states(h5f["trigger_states"][()])  # type: ignore
 
             self.qc_file = attrs.get("qc_file", None)
+            for name, value in attrs.items():
+                if name.startswith("led_"):
+                    setattr(self, name, value)
             if "num_periods_folded" in attrs:
                 self.num_periods_folded = int(attrs["num_periods_folded"])  # type: ignore
             for name in ("time_ms", "avg_iq"):

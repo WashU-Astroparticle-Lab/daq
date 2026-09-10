@@ -668,6 +668,84 @@ inside it. If what you need is a brief flash, the options are:
   hardware-timed short pulse, but it is a different presto measurement mode from `Lockin` and
   is not wrapped by this library; `TimeStream` cannot produce it by changing a parameter.
 
+### Attach software-started pulses: `attach_led`
+
+`TimeStream` and `QCTrace` can manage the notebook-style software start and shutdown
+of a configured DC2200 pulse engine. This is a separate operation from
+`attach(led=led)`, which remains a settings snapshot and is still used for TTL.
+
+```python
+from daq.instruments import Agilent33220A, DC2200
+from daq.measurements.timestream import TimeStream
+
+with Agilent33220A() as bias, DC2200() as led:
+    bias.constant(0.1, output=True)
+    led.configure_pulse(
+        on_time_s=30e-6, off_time_s=60e-3, current_a=0.099, count=0, output=False,
+    )
+    ts = TimeStream(
+        lo_freq=2.8e9, if_freqs=[0.0], df=10e3, pixel_counts=10_000,
+        amp=0.01, output_port=1, input_port=1, device="my-device",
+        external_trigger=False, discard_start_ms=0,
+    )
+    ts.attach(bias=bias)
+    ts.attach_led(led)
+    ts.run()  # starts the LED just before get_pixels; disables it before saving
+```
+
+Choose pulse parameters and current for your device; the driver's current-limit
+validation still applies. `count=0` repeats until acquisition finishes; a positive
+count requests a finite train, which is also disabled if the acquisition ends first.
+
+Configure the LED with its output disabled before attaching. Each `run()` disables
+the output during setup, refreshes its settings, and starts a fresh train after any
+caller-supplied `on_acquire` hook. It disables the LED on success or failure and
+leaves the caller's VISA session open. `attach_led(None)` removes this behavior and
+clears the LED metadata. It does not control a separately attached DC bias.
+
+For a gated QC trace, use the same separate attachment:
+
+```python
+from daq.measurements.qc_trace import QCTrace
+
+with Agilent33220A() as bias, DC2200() as led:
+    led.configure_pulse(
+        on_time_s=30e-6, off_time_s=60e-3, current_a=0.099, count=0, output=False,
+    )
+    qct = QCTrace(
+        readout_freq=2.8e9, amp=0.01, output_port=1, input_port=1,
+        ramp_freq_hz=500, sampling_frequency=50e3, num_periods=500,
+        discard_start_ms=0, device="my-device",
+    )
+    qct.attach_led(led)
+    qct.run(bias=bias)
+    raw_stream = qct.qc_stream
+```
+
+The QC ramp keeps its existing digital trigger routing. LED pulses use the DC2200's
+internal timing and do not add a trigger port. Inspect pulse responses in
+`qct.qc_stream` (or reload `qct.qc_file`); the QC fold averages on the **gate ramp's**
+period and may smear LED transients.
+
+Both raw and derived files record `led_synchronization="software"`, driver settings,
+and the following host timing fields in HDF5 and MongoDB:
+
+| Field | Meaning |
+|---|---|
+| `led_start_command_unix` | Host wall-clock time before enabling the output |
+| `led_start_completed_unix` | Host wall-clock time after the enable call returns |
+| `led_start_command_duration_s` | Enable-call duration measured with a monotonic clock |
+| `led_acquire_requested_unix` | Host wall-clock time immediately before `get_pixels()` |
+
+`led_output=False` describes the disabled configuration snapshot, not the output
+during acquisition. Loading restores metadata without opening hardware; reattach
+a configured driver, or call `attach_led(None)`, before running a loaded record.
+
+These timestamps do **not** measure optical onset or Presto sample zero. USB/SCPI
+latency leaves a variable offset; locate pulses separately in each raw stream before
+aligning or averaging. A short first pulse can occur before sampling begins even
+with `discard_start_ms=0`. This has the same timing limits as the explicit hook below.
+
 ### Short pulses at a few-ms offset: `on_acquire`
 
 When exact sync is out of reach (no free wiring path, `presto.pulsed` not warranted) but a
