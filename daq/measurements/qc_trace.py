@@ -127,28 +127,13 @@ class QCTrace(GateBiasMeasurement):
             notes=notes,
         )
 
-        if ramp_vpp <= 0:
-            raise ValueError(f"ramp_vpp must be positive, got {ramp_vpp}")
-        if ramp_freq_hz <= 0:
-            raise ValueError(f"ramp_freq_hz must be positive, got {ramp_freq_hz}")
-        if not 0.0 <= ramp_symmetry_pct <= 100.0:
-            raise ValueError(
-                f"ramp_symmetry_pct must be between 0 and 100, got {ramp_symmetry_pct}"
-            )
-        if num_periods < 1:
-            raise ValueError(f"num_periods must be at least 1, got {num_periods}")
-        if self.sampling_frequency < ramp_freq_hz:
-            raise ValueError(
-                f"sampling_frequency={sampling_frequency} Hz gives fewer than one sample per "
-                f"{ramp_freq_hz} Hz ramp period; raise the sample rate or slow the ramp."
-            )
-
-        self.ramp_vpp = ramp_vpp
-        self.ramp_freq_hz = ramp_freq_hz
-        self.ramp_offset_v = ramp_vpp / 2.0 if ramp_offset_v is None else ramp_offset_v
-        self.ramp_symmetry_pct = ramp_symmetry_pct
-        self.num_periods = num_periods
-        self._warn_if_period_not_integral()
+        self._init_ramp(
+            ramp_vpp=ramp_vpp,
+            ramp_freq_hz=ramp_freq_hz,
+            ramp_offset_v=ramp_offset_v,
+            ramp_symmetry_pct=ramp_symmetry_pct,
+            num_periods=num_periods,
+        )
 
         # Which digital output ports gate the acquisition. An explicit routing is resolved
         # here, so a bad one raises before the hardware is touched; None defers to run(), where
@@ -195,42 +180,6 @@ class QCTrace(GateBiasMeasurement):
         return self._qc_stream
 
     # ------------------------------------------------------------------ helpers
-
-    def _warn_if_period_not_integral(self) -> None:
-        """Warn when one ramp period is not a whole number of samples.
-
-        Folding cuts the record into blocks of ``round(period_s * fs)`` samples -- an integer.
-        When the true period is fractional, every block starts a fraction of a sample later
-        than the last and the error accumulates over :attr:`num_periods`, so a feature sharp
-        on the scale of the drift is averaged away rather than reinforced. At 50 kHz with a
-        300 Hz ramp (166.67 samples per period) a sharp feature loses about 90 % of its
-        contrast over 200 periods, and nothing about the resulting trace says so.
-
-        Warned rather than refused: a slow, smooth QC trace tolerates the drift, and the user
-        may know that. The cure is to pick a ``sampling_frequency`` that is a whole multiple of
-        ``ramp_freq_hz``.
-
-        This uses the *requested* sample rate, which is the one the caller can act on;
-        ``TimeStream.run`` tunes it slightly, so the realised drift differs a little. That
-        tuning is small and cannot rescue a ratio that is far from integral.
-
-        """
-        samples_per_period = self.sampling_frequency / self.ramp_freq_hz
-        drift = abs(samples_per_period - round(samples_per_period))
-        if drift <= 1e-6 * samples_per_period:
-            return
-        warnings.warn(
-            f"sampling_frequency={self.sampling_frequency:g} Hz is not a whole multiple of "
-            f"ramp_freq_hz={self.ramp_freq_hz:g} Hz: one ramp period is "
-            f"{samples_per_period:.4f} samples, so each folded block starts {drift:.4f} "
-            f"samples later than the last and drifts {drift * self.num_periods:.1f} samples "
-            f"({100 * drift * self.num_periods / samples_per_period:.0f} % of a period) over "
-            f"{self.num_periods} periods. Features sharper than that are averaged away, and "
-            "the folded trace gives no sign of it. Pick a sampling_frequency that divides "
-            f"evenly by the ramp rate (e.g. {round(samples_per_period) * self.ramp_freq_hz:g} "
-            "Hz).",
-            stacklevel=3,
-        )
 
     @staticmethod
     def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
