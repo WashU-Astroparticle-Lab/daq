@@ -303,6 +303,7 @@ class Base:
 
         - ``amp`` (scalar) at ``freq_center`` → ``power_dbm``
         - ``amp`` (scalar) at ``readout_freq`` → ``power_dbm``
+        - ``amp`` (scalar) at ``readout_freqs`` → ``power_dbm_arr``
         - ``amp_arr`` at ``freq_center`` → ``power_dbm_arr``
         - ``readout_amp`` at ``readout_freq`` → ``readout_power_dbm``
         - ``control_amp_arr`` at ``control_freq_center`` → ``control_power_dbm_arr``
@@ -327,6 +328,16 @@ class Base:
                     document["power_dbm"] = float(
                         amp_to_power_dbm(getattr(self, "readout_freq") * 1e-9, amp_val)
                     )
+
+            # StdDevSweep: scalar amp repeated at every readout frequency of the sweep. The
+            # calibration takes one frequency at a time.
+            if hasattr(self, "amp") and hasattr(self, "readout_freqs"):
+                amp_val = getattr(self, "amp")
+                if np.isscalar(amp_val):
+                    document["power_dbm_arr"] = [
+                        float(amp_to_power_dbm(f * 1e-9, amp_val))
+                        for f in np.asarray(getattr(self, "readout_freqs"))
+                    ]
 
             # TimeStream: per-tone amp array at the selected sideband frequency
             # (lo_freq + if_freqs for USB, lo_freq - if_freqs for LSB)

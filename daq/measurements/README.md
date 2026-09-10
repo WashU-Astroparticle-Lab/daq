@@ -694,6 +694,100 @@ alone; `analyze(fit=False)` the spectrum without the model.
 
 ---
 
+### 8. StdDevSweep (`sweep_std_dev.py`)
+
+**Purpose**: pick the readout frequency at which the gate moves the resonator the most. One
+`QCTrace` is taken at each entry of `readout_freqs` -- same ramp, drive and sample rate every
+time -- each folded trace is reduced to its standard deviation over the ramp period, and
+`best_freq` is the frequency with the largest spread. That is the operating point for a
+subsequent `QCTrace` or `BiasHunt`.
+
+Like its two siblings it inherits `GateBiasMeasurement`, so the readout, ramp and trigger
+handling are `QCTrace`'s; it adds only the sweep and the statistic.
+
+The default `quantity="principal"` measures the spread along the folded trace's **principal
+axis**: the I/Q samples are centred, their 2-by-2 covariance diagonalised, and the standard
+deviation is the square root of the largest eigenvalue -- the spread along the direction the
+trace actually moves in. The axis is fitted afresh at each frequency, so a rotation of the I/Q
+plane (a cable-length change, a different LO phase) leaves the curve and the winner unchanged,
+where `std(I)` or `std(Q)` alone would not. This is the covariance's principal axis, not the
+two-blob discrimination axis `daq.analysis.parity` uses for a telegraph signal: a folded QC
+trace is a continuous curve, not two clusters. No resonator fit is needed for it.
+
+The statistic is in ADC full-scale units and compares frequencies against each other. It does
+not convert the response to capacitance, normalise frequency-dependent gain, or subtract a
+noise floor -- a large spread is the criterion, not an SNR or a parity fidelity.
+
+```python
+import numpy as np
+from daq import StdDevSweep, QCTrace
+
+fr = sweep.fit_results["fr"]  # resonance from an earlier Sweep
+scan = StdDevSweep(
+    readout_freqs=np.linspace(fr - 250e3, fr + 250e3, 51),
+    amp=amp, output_port=1, input_port=1,
+    ramp_vpp=1.2, ramp_freq_hz=500,
+    sampling_frequency=1e5, num_periods=1000,
+    device="my-QPD", notes="Readout frequency optimization",
+)
+path = scan.run()              # opens the Agilent33220A once for the whole sweep
+scan.analyze()                 # I, Q and principal-axis std vs frequency; maximum marked
+readout_freq = scan.best_freq  # Hz, for the next QCTrace or BiasHunt
+best_trace = QCTrace.load(scan.best_qc_file)
+best_trace.analyze()
+
+restored = StdDevSweep.load(path)
+restored.analyze()             # the summary alone suffices; no hardware, no raw files
+```
+
+`run(bias)` takes an already-open `Agilent33220A` or discovers one, exactly as `QCTrace.run`
+does, and the Presto connection parameters are keyword-only. The bias output is forced off on
+exit -- including on exception -- and a caller-owned VISA session is left open. Each point is
+gated on the generator's own `trigger_port` unless `trigger_states` overrides it; an explicit
+routing is validated in `__init__`, before any hardware is touched. Frequency spacing is set by
+`readout_freqs` alone; the sweep does not interpolate between measured points. Choose an
+integral ratio of `sampling_frequency` to `ramp_freq_hz`, for the reason `QCTrace` warns about
+(the warning fires here too).
+
+**Statistic choices** (all saved with the measurement):
+
+| Parameter | Choices |
+|---|---|
+| `trace_source` | `"folded"` (default): the spread of the block-averaged ramp period; `"raw"`: the spread of the startup-trimmed time stream, which includes the noise the folding averages away |
+| `quantity` | `"principal"` (default), `"complex"` (`sqrt(var(I) + var(Q))`, both axes together), `"abs"`, `"real"` (I), `"imag"` (Q) |
+| `ddof` | numpy's delta degrees of freedom; `0` (default) divides by `N` |
+
+For `"abs"` on a folded trace the I/Q average is taken **before** the magnitude. Equal
+eigenvalues make the principal *direction* ambiguous, but the spread along it is not; the
+eigenvector's sign is fixed only so the saved axis is deterministic.
+
+**Results and persistence**:
+
+- `readout_freqs`, `std_arr`: the frequency axis in Hz and the ranked curve. The axis is
+  deliberately not called `freq_arr`, which the MongoDB document builder skips as `Sweep`'s
+  data array; this one reaches the document, beside a `power_dbm_arr` calibrated at each
+  frequency.
+- `std_i_arr`, `std_q_arr`, `std_principal_arr`, `principal_axes`: the diagnostic curves and
+  the unit `[I, Q]` axis at each frequency, recorded whatever `quantity` was chosen.
+  `statistics(trace)` computes all of them in one pass.
+- `sample_counts`, `sampling_frequencies`: the samples behind each value and the **tuned**
+  rate each point ran at.
+- `best_freq`, `best_std`, `best_qc_file`: the winner. Always named: an exact tie takes the
+  first frequency acquired, and an all-zero curve names its first frequency with
+  `best_std = 0`, which `analyze()` flags on the plot.
+- `qc_files`, `raw_files`, `trigger_states`: each point's `qc_trace` and `timestream` record,
+  and the resolved digital routing. As for `QCTrace.load()`, a loaded sweep re-reads the
+  generator's wiring when re-run.
+
+Each point saves its own records through the normal paths; the sweep adds one `sweep_std_dev`
+HDF5/MongoDB summary, and `save_filename` names only that. `load()` restores the summary but
+not the traces (load one from `qc_files` with `QCTrace.load`) and recomputes the winner from
+the curve. A point that fails aborts the sweep: completed points' files stay on disk, every
+result is cleared so no stale winner survives, and `save()`/`analyze()` refuse until a run
+completes.
+
+---
+
 ## Common Parameters
 
 All measurements share these common parameters:
@@ -757,6 +851,8 @@ Each measurement class provides an `analyze()` method for visualization:
 - **SweepFreqAndDC**: 2D heatmap with multiple quantity options
 - **TwoTonePower**: 2D heatmap with interactive linecuts
 - **QCTrace**: the block-averaged I/Q QC trace over one ramp period
+- **StdDevSweep**: I, Q and principal-axis standard deviation versus readout frequency,
+  with the maximum of the selected statistic marked
 - **BiasHunt**: parity contrast vs. gate bias with the winner marked, above the averaged noise
   PSD and its random-telegraph fit
 
