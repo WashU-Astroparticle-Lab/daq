@@ -478,6 +478,21 @@ check(
     "a self-opened session is closed on failure too", failed_bias.closed and not failed_bias.output
 )
 
+# ---------------------------------------------------------------- earlier draft's names
+
+old_path = os.path.join(tmp.name, "old-draft.h5")
+with h5py.File(path, "r") as src, h5py.File(old_path, "w") as dst:
+    for name in src:
+        if name != "readout_freqs":
+            src.copy(name, dst)
+    dst["freq_arr"] = src["readout_freqs"][()]
+    for key, value in src.attrs.items():
+        dst.attrs[key] = value
+check(
+    "a file from the earlier draft, with freq_arr, still loads",
+    np.array_equal(StdDevSweep.load(old_path).readout_freqs, FREQS),
+)
+
 # ---------------------------------------------------------------- refused configurations
 
 refused = []

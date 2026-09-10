@@ -532,8 +532,11 @@ class StdDevSweep(GateBiasMeasurement):
         with h5py.File(load_filename, "r") as h5f:
             attrs = h5f.attrs
 
+            # Files written by the first draft of this class stored the axis as freq_arr; it
+            # was renamed because Base._build_document skips that name as Sweep's data array.
+            axis_name = "readout_freqs" if "readout_freqs" in h5f else "freq_arr"
             self = cls(
-                readout_freqs=h5f["readout_freqs"][()],  # type: ignore
+                readout_freqs=h5f[axis_name][()],  # type: ignore
                 amp=float(attrs["amp"]),  # type: ignore
                 output_port=int(attrs["output_port"]),  # type: ignore
                 input_port=int(attrs["input_port"]),  # type: ignore

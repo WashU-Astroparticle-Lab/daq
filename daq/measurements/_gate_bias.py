@@ -29,7 +29,7 @@ class GateBiasMeasurement(Base):
 
     Not a measurement in its own right: it validates and stores the readout parameters the
     concrete measurements share, and builds the :class:`~daq.measurements.timestream.TimeStream`
-    they both acquire through. Subclasses call :meth:`_init_readout` from ``__init__`` and then
+    they all acquire through. Subclasses call :meth:`_init_readout` from ``__init__`` and then
     add whatever their own step needs; the ones that sweep the gate with a ramp also call
     :meth:`_init_ramp`.
     """
@@ -47,7 +47,7 @@ class GateBiasMeasurement(Base):
         filter: Optional[str],
         notes: Optional[str],
     ) -> None:
-        """Validate and store the readout parameters shared by both measurements.
+        """Validate and store the readout parameters shared by the gate-bias measurements.
 
         :param readout_freq: Readout frequency in hertz -- normally a resonance located by a
             preceding :class:`~daq.measurements.sweep.Sweep`.
