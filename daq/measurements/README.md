@@ -561,9 +561,15 @@ that overrides the generator, and warns if it leaves the generator's own port un
 **Records**: the `TimeStream` saves its own HDF5 + MongoDB record via the normal path with
 `attach(bias=...)` applied, so the raw acquisition stays individually loadable. `QCTrace` saves
 one further `qc_trace` record with the folded trace (`time_ms`/`avg_iq`), the blocks actually
-averaged (`num_periods_folded`), the resolved `trigger_states` and the raw acquisition's path
-(`qc_file`). The stream hangs off a read-only `qc_stream` property; `load()` restores the
-derived record but not the stream.
+averaged (`num_periods_folded`), the resolved `trigger_states`, the raw acquisition's path
+(`qc_file`) and `tone`, the column of that raw stream this record was folded from -- `0` for a
+trace that acquired its own stream, the device's column index for one of `StdDevSweep`'s
+per-device records built from a shared multitone stream. The stream hangs off a read-only
+`qc_stream` property; `load()` restores the derived record (including `tone`) but not the
+stream. `fold()` defaults to the stored `tone` and refuses one the stream does not have, or one
+whose `signal_freqs` entry is not this record's `readout_freq`: a QC record describes one
+device, and folding another device's column into it would leave `avg_iq` and `readout_freq`
+disagreeing.
 
 **Analysis**: the folded I/Q trace over one ramp period, optionally with one un-averaged period
 overlaid (`analyze(raw=True)`) to show what the averaging bought.
