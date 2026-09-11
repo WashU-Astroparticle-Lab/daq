@@ -7,6 +7,7 @@ the standard deviation of its folded trace along its principal axis.
 
 from __future__ import annotations
 
+import math
 from contextlib import ExitStack
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -18,13 +19,25 @@ from ..instruments import Agilent33220A
 from ..triggers import TriggerAny, describe_trigger_states, resolve_trigger_states
 from ._gate_bias import GateBiasMeasurement
 from .qc_trace import QCTrace
-from .timestream import TimeStream
 
 TRACE_SOURCES = ("folded", "raw")
 """Which record the statistic is taken over: the folded period or the trimmed time stream."""
 
 QUANTITIES = ("principal", "complex", "abs", "real", "imag")
 """Projections of the complex readout the standard deviation can be taken of."""
+
+MAX_TONES = 96
+"""Most tones one multitone acquisition can demodulate.
+
+The spec sheet's 192 demodulators are the ``NR_LCK_FREQ = 192`` budget of one ``Lockin``, but
+``Lockin._add_input`` spends two of them per input frequency (``freqs.repeat(2)  # I&Q``,
+presto 2.16.0 ``lockin.py:680``, 2.17.1 ``lockin.py:695``) before checking the total, so a
+single input port demodulates at most 96 tones. Refused here so the sweep fails before the
+generator is armed rather than inside ``TimeStream.run``.
+"""
+
+MAX_IF_HZ = 500e6
+"""Largest |IF| a tone may sit at: the spec sheet's 1 GHz IF bandwidth, per sideband."""
 
 
 class StdDevSweep(GateBiasMeasurement):
@@ -39,6 +52,22 @@ class StdDevSweep(GateBiasMeasurement):
     A 2-D frequency matrix acquires all columns simultaneously in one ``TimeStream`` per
     row. Each column follows one device and gets its own folded QC traces, statistics and
     optimum frequency. Existing 1-D calls retain flat curves and scalar winners.
+
+    **A multitone row is not the same hardware configuration as a single-tone point.** The
+    1-D path puts the Presto's LO on each tone (zero IF, phase reset on, the DAC configuration
+    chosen per point). A 2-D row fixes the LO at *lo_freq* and drives every tone at a non-zero
+    IF, which disables phase reset and chooses one DAC configuration for the whole grid from
+    the LO alone. Two consequences to keep in mind. First, only the lock-in window ``df`` is
+    tuned, not the IFs: presto's ``set_frequencies`` expects tuned frequencies, and a tone
+    whose spacing from another is not a whole multiple of ``df`` leaks into that tone's column
+    with a weight of order ``df / (pi * spacing)``. That leakage is not ramp-synchronous, so
+    folding averages it down by ``sqrt(num_periods)``, but ``trace_source="raw"`` counts it in
+    full. The size of the effect on the hardware has not been bench-verified. Second, the
+    calibrated ``power_dbm`` written on each per-tone QC record comes from zero-IF
+    single-tone sweeps; it is the right pairing of frequency and amplitude but does not know
+    the drive went through the IF path, and a *lo_freq* within ~125 MHz of a DAC-mode switch
+    point (2.40, 3.00, 4.27, 4.90, 5.605, 7.005, 7.105, 8.00 GHz) can put the whole grid on a
+    different configuration than the calibration used at those frequencies.
 
     By default the spread is measured along the trace's **principal axis**: the folded I/Q
     samples are centred, their 2x2 covariance is diagonalised, and the standard deviation is
@@ -94,8 +123,10 @@ class StdDevSweep(GateBiasMeasurement):
     :param filter: Filter / amplifier chain description, for database logging.
     :param notes: Free-text note. Also prefixed onto each QC trace's own note.
     :param lo_freq: Fixed LO in hertz for multitone acquisition. Defaults to the midpoint
-        of the entire frequency grid. Every tone must have ``abs(freq - lo_freq) < 500e6``.
-        USB/LSB selection is automatic. Not used for a 1-D single-tone sweep.
+        of the entire frequency grid -- check it against the DAC-mode switch points listed
+        above, and pass it explicitly when the midpoint lands near one. Every tone must have
+        ``abs(freq - lo_freq) < MAX_IF_HZ``. USB/LSB selection is automatic. Not used for a
+        1-D single-tone sweep.
     :param tone_labels: Optional display labels in column order; defaults to ``Tone 0``, etc.
         ``device`` remains the shared sample identifier for database logging.
     :raises ValueError: If any parameter is out of range.
@@ -151,8 +182,12 @@ class StdDevSweep(GateBiasMeasurement):
                 or amplitudes.sum() >= 1.0
             ):
                 raise ValueError("Tone amplitudes must be finite, positive and sum to less than 1")
-            if self.n_tones > 192:
-                raise ValueError("Presto-8 supports at most 192 simultaneous tones")
+            if self.n_tones > MAX_TONES:
+                raise ValueError(
+                    f"A multitone acquisition can demodulate at most {MAX_TONES} tones on one "
+                    f"input port (presto spends two of its 192 lock-in channels per tone), "
+                    f"got {self.n_tones} columns"
+                )
             if any(np.unique(row).size != self.n_tones for row in self.readout_freqs):
                 raise ValueError("Each acquisition row must contain distinct readout frequencies")
             self.lo_freq = float(
@@ -162,8 +197,10 @@ class StdDevSweep(GateBiasMeasurement):
             )
             if not np.isfinite(self.lo_freq) or self.lo_freq <= 0:
                 raise ValueError("lo_freq must be finite and positive")
-            if np.any(np.abs(self.readout_freqs - self.lo_freq) >= 500e6):
-                raise ValueError("Every tone must be within 500 MHz of lo_freq (exclusive)")
+            if np.any(np.abs(self.readout_freqs - self.lo_freq) >= MAX_IF_HZ):
+                raise ValueError(
+                    f"Every tone must be within {MAX_IF_HZ / 1e6:g} MHz of lo_freq (exclusive)"
+                )
         elif amplitudes.ndim != 0 or lo_freq is not None:
             raise ValueError("A 1-D sweep requires scalar amp and no lo_freq override")
         if tone_labels is not None:
@@ -230,7 +267,7 @@ class StdDevSweep(GateBiasMeasurement):
         # As in QCTrace: an explicit routing is validated here and kept privately, so that a
         # re-run reads the caller's argument rather than the states a previous run resolved.
         self._trigger_states_arg = (
-            None if trigger_states is None else QCTrace._check_trigger_states(trigger_states)
+            None if trigger_states is None else self._check_trigger_states(trigger_states)
         )
         self.trigger_states = self._trigger_states_arg
 
@@ -534,8 +571,18 @@ class StdDevSweep(GateBiasMeasurement):
                     principal_axes[index] = stats["axis"]
                     sample_counts[index] = stats["n_samples"]
                 sampling_frequencies[ii] = trace.qc_stream.df
+                # Every point is gated the same way; keep the routing the last one resolved.
                 self.trigger_states = resolve_trigger_states(trace.trigger_states)
-                print(f"Std dev sweep point {ii + 1}/{n}: std = {std_arr[ii]} FS")
+                if self.multitone:
+                    print(
+                        f"Std dev sweep point {ii + 1}/{n}: std = "
+                        f"{np.array2string(std_arr[ii], precision=4)} FS"
+                    )
+                else:
+                    print(
+                        f"Std dev sweep point {ii + 1}/{n}: {freqs / 1e9:.6f} GHz, "
+                        f"std = {std_arr[ii]:.4e} FS"
+                    )
                 # Release the shared record before acquiring the next row.
                 del trace, traces
 
@@ -549,9 +596,15 @@ class StdDevSweep(GateBiasMeasurement):
             self.qc_files = qc_files
             self.raw_files = raw_files
             self._select_best()
+            if self.multitone:
+                where = (
+                    f"{np.array2string(np.asarray(self.best_freq) / 1e9, precision=6)} GHz, "
+                    f"std = {np.array2string(np.asarray(self.best_std), precision=4)} FS"
+                )
+            else:
+                where = f"{self.best_freq / 1e9:.6f} GHz, std = {self.best_std:.4e} FS"
             print(
-                f"Max std dev at {np.asarray(self.best_freq) / 1e9} GHz, "
-                f"std = {self.best_std} FS "
+                f"Max std dev at {where} "
                 f"(gated on Presto digital output {describe_trigger_states(self.trigger_states)})"
             )
 
@@ -567,10 +620,21 @@ class StdDevSweep(GateBiasMeasurement):
     ) -> Tuple[List[QCTrace], List[str], str]:
         """Acquire one sweep row and save a folded QC record for each tone.
 
-        Multitone rows share one raw file; the QC records retain its column index so
-        loading and re-folding a winning trace selects the same device.
+        A 1-D point is a plain ``QCTrace.run``. A multitone row builds its shared stream
+        through the same :meth:`~GateBiasMeasurement._make_timestream` and acquires it through
+        the same :meth:`~GateBiasMeasurement._run_gated_ramp` as ``QCTrace``, then hands one
+        column to each per-device trace via ``QCTrace._adopt_stream``. The QC records keep
+        the column index, so loading and re-folding a winning trace selects the same device.
+
+        :param step: Row index, for the log line and the notes.
+        :param freqs: The row's readout frequencies -- a scalar for a 1-D sweep.
+        :param bias: The open gate-bias generator.
+        :param run_kwargs: Presto connection keywords for ``TimeStream.run``.
+        :returns: ``(traces, qc_paths, raw_path)``.
+
         """
         traces = []
+        n = len(self.readout_freqs)
         amplitudes = np.atleast_1d(self.amp)
         for tone, freq in enumerate(np.atleast_1d(freqs)):
             traces.append(
@@ -591,7 +655,7 @@ class StdDevSweep(GateBiasMeasurement):
                     device=self.device,
                     filter=self.filter,
                     notes=self._notes(
-                        f"Std dev sweep point {step + 1}/{len(self.readout_freqs)}"
+                        f"Std dev sweep point {step + 1}/{n}"
                         + (f", {self.tone_labels[tone]}" if self.multitone else "")
                     ),
                 )
@@ -600,47 +664,34 @@ class StdDevSweep(GateBiasMeasurement):
             path = traces[0].run(bias, **run_kwargs)
             return traces, [path], traces[0].qc_file
 
-        states = traces[0]._resolve_run_trigger_states(bias)
-        signed_if = np.asarray(freqs) - self.lo_freq
-        stream = TimeStream(
-            lo_freq=self.lo_freq,
-            if_freqs=np.abs(signed_if),
-            is_usb=signed_if >= 0,
-            amp=self.amp,
-            df=self.sampling_frequency,
-            pixel_counts=bias.samples_for_periods(
+        # Settle the routing before the acquisition, as QCTrace.run does: a bad routing should
+        # abort here rather than surface as a flat trace on every device at once.
+        states = self._resolve_run_trigger_states(bias)
+        row = np.asarray(freqs, dtype=np.float64)
+        signed_if = row - self.lo_freq
+        stream = self._make_timestream(
+            bias.samples_for_periods(
                 self.num_periods,
                 self.sampling_frequency,
                 freq_hz=self.ramp_freq_hz,
                 discard_ms=self.discard_start_ms,
             ),
-            output_port=self.output_port,
-            input_port=self.input_port,
-            dither=self.dither,
-            device=self.device,
-            filter=self.filter,
-            notes=self._notes(f"Multitone std dev sweep point {step + 1}"),
             external_trigger=states,
-            discard_start_ms=self.discard_start_ms,
+            notes=f"Multitone std dev sweep point {step + 1}/{n}",
+            lo_freq=self.lo_freq,
+            if_freqs=np.abs(signed_if),
+            is_usb=signed_if >= 0,
+            amp=self.amp,
         )
-        try:
-            bias.sawtooth(
-                vpp=self.ramp_vpp,
-                freq_hz=self.ramp_freq_hz,
-                offset_v=self.ramp_offset_v,
-                symmetry_pct=self.ramp_symmetry_pct,
-                gated=True,
-            )
-            stream.attach(bias=bias)
-            raw_path = stream.run(**run_kwargs)
-        finally:
-            bias.output = False
+        print(
+            f"Std dev sweep point {step + 1}/{n}: gating the ramp on Presto digital output "
+            f"{describe_trigger_states(states)}, LO {self.lo_freq / 1e9:.6f} GHz, "
+            f"{self.n_tones} tones from {row.min() / 1e9:.6f} to {row.max() / 1e9:.6f} GHz"
+        )
+        raw_path = self._run_gated_ramp(bias, stream, run_kwargs)
         paths = []
         for tone, trace in enumerate(traces):
-            trace._qc_stream = stream
-            trace.qc_file = raw_path
-            trace.trigger_states = states.copy()
-            trace.fold(tone=tone)
+            trace._adopt_stream(stream, raw_path, states, tone)
             paths.append(trace.save())
         return traces, paths, raw_path
 
@@ -730,7 +781,9 @@ class StdDevSweep(GateBiasMeasurement):
         The I, Q and principal-axis curves are always drawn; the ranked curve is drawn on top
         when it is neither of those (``quantity="complex"`` or ``"abs"``). Frequencies are
         plotted in ascending order whatever order they were acquired in. Multitone scans
-        have one labeled panel per column, with an independently selected maximum.
+        have one labeled panel per column, with an independently selected maximum, laid out
+        on a near-square grid so a 13-device scan is a 4-by-4 page rather than a 13-panel
+        column.
 
         :param title: Figure title. Defaults to naming the device and the statistic.
         :raises RuntimeError: If the sweep has not been run to completion, or loaded.
@@ -741,14 +794,18 @@ class StdDevSweep(GateBiasMeasurement):
 
         import matplotlib.pyplot as plt
 
+        ncols = math.ceil(math.sqrt(self.n_tones))
+        nrows = math.ceil(self.n_tones / ncols)
         fig, axes = plt.subplots(
-            self.n_tones,
-            1,
+            nrows,
+            ncols,
             squeeze=False,
-            figsize=(8, 4 * self.n_tones),
+            figsize=(7 * ncols, 4.5 * nrows),
             tight_layout=True,
         )
-        for tone, ax in enumerate(axes[:, 0]):
+        for ax in axes.flat[self.n_tones :]:
+            fig.delaxes(ax)
+        for tone, ax in enumerate(axes.flat[: self.n_tones]):
             freqs = self.readout_freqs[:, tone] if self.multitone else self.readout_freqs
             curves = {
                 name: getattr(self, name)[:, tone] if self.multitone else getattr(self, name)

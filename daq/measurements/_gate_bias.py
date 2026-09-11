@@ -1,37 +1,48 @@
 # -*- coding: utf-8 -*-
-"""Shared machinery for the gate-biased single-tone readout measurements.
+"""Shared machinery for the gate-biased readout measurements.
 
 :class:`~daq.measurements.qc_trace.QCTrace`, :class:`~daq.measurements.bias_hunt.BiasHunt`
 and :class:`~daq.measurements.sweep_std_dev.StdDevSweep` are separate measurements -- one
 sweeps the gate with a ramp and folds the response, one parks the gate at a series of constant
 voltages and ranks them, one repeats the ramp at a series of readout frequencies and ranks
-those -- but they read the device out the same way: one tone at a caller-supplied frequency,
-through the same Presto ports, at the same sample rate, driven by an
-:class:`~daq.instruments.function_generator.Agilent33220A` on the gate.
+those -- but they read the device out the same way: through the same Presto ports, at the
+same sample rate, driven by an :class:`~daq.instruments.function_generator.Agilent33220A` on
+the gate. Normally that is one tone at zero IF on a caller-supplied frequency; a multitone
+``StdDevSweep`` reads several devices at once through the same builder with a fixed LO.
 
-This module holds only that shared readout and the shared ramp, so the measurements differ in
-their own files by exactly what makes them different measurements.
+This module holds only that shared readout, the shared ramp, the trigger routing and the
+gated-ramp acquisition sequence, so the measurements differ in their own files by exactly what
+makes them different measurements.
 """
 
 from __future__ import annotations
 
 import math
 import warnings
-from typing import Optional
+from typing import Any, Dict, Optional
+
+import numpy as np
+import numpy.typing as npt
 
 from .._base import Base
-from ..triggers import TriggerAny
+from ..instruments import Agilent33220A
+from ..triggers import (
+    TriggerAny,
+    describe_trigger_states,
+    resolve_trigger_states,
+    trigger_for,
+)
 from .timestream import TimeStream
 
 
 class GateBiasMeasurement(Base):
-    """Base for a single-tone readout of a gate-biased device.
+    """Base for a readout of a gate-biased device.
 
     Not a measurement in its own right: it validates and stores the readout parameters the
     concrete measurements share, and builds the :class:`~daq.measurements.timestream.TimeStream`
     they all acquire through. Subclasses call :meth:`_init_readout` from ``__init__`` and then
     add whatever their own step needs; the ones that sweep the gate with a ramp also call
-    :meth:`_init_ramp`.
+    :meth:`_init_ramp` and acquire through :meth:`_run_gated_ramp`.
     """
 
     def _init_readout(
@@ -202,26 +213,38 @@ class GateBiasMeasurement(Base):
         *,
         external_trigger: TriggerAny,
         notes: str,
+        lo_freq: Optional[float] = None,
+        if_freqs: Optional[npt.ArrayLike] = None,
+        is_usb: Optional[npt.ArrayLike] = None,
+        amp: Optional[npt.ArrayLike] = None,
     ) -> TimeStream:
-        """Build a single-tone time stream at :attr:`readout_freq`.
+        """Build the time stream a gate-bias measurement acquires through.
 
-        The tone is placed at zero IF on the Presto's own LO, so the readout frequency is the
-        mixer frequency and no sideband bookkeeping is needed.
+        By default a single tone at zero IF on the Presto's own LO at :attr:`readout_freq`, so
+        the readout frequency is the mixer frequency and no sideband bookkeeping is needed. The
+        keyword overrides build a multitone stream instead -- a fixed *lo_freq* with one
+        *if_freqs*/*is_usb*/*amp* entry per tone -- through the same port, rate, trigger and
+        discard settings, so the two configurations cannot drift apart.
 
         :param pixel_counts: Number of samples to acquire, including the discarded start.
         :param external_trigger: Which Presto digital output ports assert a trigger. ``False``
             for an ungated acquisition; for a gated ramp, the ports the bias generator is
             wired to.
         :param notes: Step description for the sub-measurement's note.
+        :param lo_freq: Mixer frequency in hertz. Defaults to :attr:`readout_freq`.
+        :param if_freqs: Per-tone IF in hertz. Defaults to a single zero-IF tone.
+        :param is_usb: Per-tone sideband selection. Defaults to ``TimeStream``'s all-USB.
+        :param amp: Per-tone drive in DAC full scale. Defaults to :attr:`amp`.
         :returns: The configured time stream.
 
         """
         return TimeStream(
-            lo_freq=self.readout_freq,
-            if_freqs=[0.0],
+            lo_freq=self.readout_freq if lo_freq is None else lo_freq,
+            if_freqs=[0.0] if if_freqs is None else if_freqs,
+            is_usb=is_usb,
             df=self.sampling_frequency,
             pixel_counts=pixel_counts,
-            amp=self.amp,
+            amp=self.amp if amp is None else amp,
             output_port=self.output_port,
             input_port=self.input_port,
             dither=self.dither,
@@ -230,6 +253,112 @@ class GateBiasMeasurement(Base):
             notes=self._notes(notes),
             external_trigger=external_trigger,
             discard_start_ms=self.discard_start_ms,
+        )
+
+    def _run_gated_ramp(
+        self,
+        bias: Agilent33220A,
+        stream: TimeStream,
+        run_kwargs: Dict[str, Any],
+    ) -> str:
+        """Run *stream* under this measurement's gated sawtooth and de-energise the gate.
+
+        The one place the ramp-under-acquisition sequence lives: put the generator into the
+        gated ramp, record its settings on the stream, acquire, and force the output off --
+        on the exception path too, so no bias is left on the device whatever happened. The
+        stream must already carry the trigger routing that gates the ramp.
+
+        :param bias: The open gate-bias generator.
+        :param stream: The configured time stream to acquire.
+        :param run_kwargs: Presto connection keywords for ``TimeStream.run``.
+        :returns: Path of the time stream's HDF5 file.
+
+        """
+        try:
+            bias.sawtooth(
+                vpp=self.ramp_vpp,
+                freq_hz=self.ramp_freq_hz,
+                offset_v=self.ramp_offset_v,
+                symmetry_pct=self.ramp_symmetry_pct,
+                gated=True,
+            )
+            stream.attach(bias=bias)
+            return stream.run(**run_kwargs)
+        finally:
+            bias.output = False
+
+    # ------------------------------------------------------------------ trigger routing
+
+    @staticmethod
+    def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
+        """Resolve *trigger_states* and refuse a routing that gates nothing.
+
+        A gated ramp with no port asserted is exactly the silent failure the folding
+        measurements cannot afford: the generator holds its burst start level, the acquisition
+        succeeds, and the trace is flat because the gate never moved. ``False`` and all-zero
+        states are therefore rejected rather than run.
+
+        :param trigger_states: Anything :func:`~daq.triggers.resolve_trigger_states` accepts.
+        :raises ValueError: If the states are invalid, or gate no port at all.
+        :returns: The resolved per-port states.
+
+        """
+        states = resolve_trigger_states(trigger_states)
+        if not states.any():
+            raise ValueError(
+                f"trigger_states={trigger_states!r} gates no digital output port, so the "
+                "QC-trace ramp would never run: the generator would hold its burst start "
+                "level and the acquisition would record a static bias instead of a swept "
+                "one. Pass the port that gates the bias generator (True or [1] for port 1), "
+                "or leave trigger_states unset to take it from the generator's own "
+                "trigger_port."
+            )
+        return states
+
+    def _resolve_run_trigger_states(self, bias: Agilent33220A) -> npt.NDArray[np.int64]:
+        """Decide which ports gate this run.
+
+        Reads the caller's own argument (``_trigger_states_arg``), never the states a previous
+        run resolved, so the default ("ask the generator") holds on every run of an object --
+        including one restored by ``load``, whose stored routing describes the run that
+        produced the file rather than the bench in front of you now.
+
+        :param bias: The gate-bias generator this run is using.
+        :raises ValueError: If the routing gates no port, or the generator does not declare
+            a ``trigger_port``.
+        :returns: The resolved per-port states.
+
+        """
+        if self._trigger_states_arg is not None:
+            states = self._check_trigger_states(self._trigger_states_arg)
+        else:
+            states = self._check_trigger_states(trigger_for(bias))
+        self._warn_if_generator_ungated(states, bias)
+        return states
+
+    @staticmethod
+    def _warn_if_generator_ungated(states: npt.NDArray[np.int64], bias: Agilent33220A) -> None:
+        """Warn when the routing does not assert the port the generator says it is on.
+
+        Only an explicit *trigger_states* can produce this: it is the one remaining way to
+        gate a port while the ramp waits on another, which the acquisition records as a
+        static bias. A warning rather than an error, since the override may be deliberate --
+        an instrument whose declared ``trigger_port`` is itself wrong.
+
+        :param states: The resolved per-port states for this run.
+        :param bias: The gate-bias generator this run is using.
+
+        """
+        port = getattr(bias, "trigger_port", None)
+        if port is None or (port <= states.size and states[port - 1]):
+            return
+        warnings.warn(
+            f"The QC trace gates {describe_trigger_states(states)}, but the bias generator "
+            f"reports trigger_port={port}, which is not among them. Its gated ramp will wait "
+            "on a port nothing asserts and the acquisition will record a static bias. Correct "
+            "the generator's wiring (bias.trigger_port, or DAQ_FGEN_TRIGGER_PORT) or include "
+            f"port {port} in trigger_states.",
+            stacklevel=3,
         )
 
     def _stream_samples(self, duration_s: float) -> int:

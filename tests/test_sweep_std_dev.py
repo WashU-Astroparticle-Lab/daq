@@ -15,9 +15,10 @@ real ``QCTrace`` folding, the real save/load round trip and the plot:
   calibrated power per point, and a loaded sweep re-reads the generator when re-run;
 - invalid configurations are refused before any hardware is touched.
 
-The single-tone ``TimeStream`` swap targets ``daq.measurements._gate_bias``; the multitone
-swap targets ``daq.measurements.sweep_std_dev``. Additional checks cover independent winners,
-sidebands, per-tone amplitudes, shared raw records, stored QC tone indices and 13-device scans.
+Both the single-tone and the multitone paths build their stream through the shared
+``daq.measurements._gate_bias`` builder, so one ``TimeStream`` swap there covers both.
+Additional checks cover independent winners, sidebands, per-tone amplitudes, shared raw
+records, stored QC tone indices and 13-device scans.
 
 Requires ``presto`` to be importable (``StdDevSweep`` imports it transitively); no hardware and
 no network. The database calls are stubbed and the data folder pointed at a temporary directory,
@@ -571,7 +572,8 @@ check("a trace without the chosen record raises RuntimeError", missing == 2)
 
 # ---------------------------------------------------------------- simultaneous tones
 
-sweep_mod.TimeStream = FakeTimeStream
+# No second swap: the multitone stream is built by the same _gate_bias builder as the 1-D one,
+# so the swap above is what the multitone checks exercise too.
 SCALES.update({3.1e9: (4, 1), 3.2e9: (1, 1), 3.3e9: (1, 5)})
 grid = np.column_stack([FREQS, np.asarray(FREQS) + 400e6])
 multi = make(readout_freqs=grid, amp=[0.01, 0.02], tone_labels=["lower", "upper"])
@@ -657,6 +659,20 @@ winning_trace.fold(streams[2])
 check(
     "loaded QC trace re-folds its stored tone by default",
     np.allclose(winning_trace.avg_iq, expected_iq),
+)
+# A QC record describes one device: folding another device's column into it, or a column the
+# stream does not have, is refused rather than silently rewriting the record's identity.
+refused_folds = 0
+for bad_tone in (0, 5, -1):
+    try:
+        winning_trace.fold(streams[2], tone=bad_tone)
+    except ValueError:
+        refused_folds += 1
+check(
+    "fold() refuses a tone at another frequency or outside the stream, keeping its own",
+    refused_folds == 3
+    and winning_trace.tone == 1
+    and np.allclose(winning_trace.avg_iq, expected_iq),
 )
 check(
     "each row saves one shared raw stream and one QC record per tone",
@@ -809,7 +825,7 @@ for params in (
     dict(tone_labels=["one"]),
     dict(tone_labels="ab"),
     dict(tone_labels=["", "two"]),
-    dict(readout_freqs=[np.linspace(2.7e9, 2.8e9, 193)], amp=0.001),
+    dict(readout_freqs=[np.linspace(2.7e9, 2.8e9, 97)], amp=0.001),
 ):
     try:
         make(**dict(dict(readout_freqs=grid), **params))
@@ -817,6 +833,14 @@ for params in (
     except ValueError:
         pass
 check("invalid multitone plans are refused before acquisition", not bad_multi, str(bad_multi))
+# presto spends two of its 192 lock-in channels per input tone, so 96 is the most one port
+# demodulates; the constructor must accept exactly that many and refuse one more (above).
+try:
+    make(readout_freqs=[np.linspace(2.7e9, 2.8e9, 96)], amp=0.001)
+    accepted_96 = True
+except ValueError:
+    accepted_96 = False
+check("96 tones, presto's per-port demodulation limit, are accepted", accepted_96)
 
 owned_multi_bias = FakeBias()
 sweep_mod.Agilent33220A = lambda: owned_multi_bias

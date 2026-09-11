@@ -119,9 +119,12 @@ class Base:
                 f"WARN: Database unavailable ({e}). "
                 "Using timestamp-based numbering."
             )
-            # Use timestamp as fallback number (format: YYYYMMDDHHMMSS)
+            # Use timestamp as fallback number (format: YYYYMMDDHHMMSSffffff). Microseconds
+            # are needed: a multitone StdDevSweep saves one qc_trace record per tone with
+            # nothing in between, and a second-resolution number would give every tone the
+            # same path, each overwriting the last.
             timestamp = datetime.now()
-            number = timestamp.strftime("%Y%m%d%H%M%S")
+            number = timestamp.strftime("%Y%m%d%H%M%S%f")
             db_available = False
         
         # Generate filename if not provided
@@ -330,15 +333,18 @@ class Base:
                     )
 
             # StdDevSweep: scalar drive for a 1-D sweep, or one drive per column
-            # of a multitone frequency matrix. Preserve the frequency grid's shape.
+            # of a multitone frequency matrix. Preserve the frequency grid's shape. The
+            # calibration is zero-IF single-tone provenance either way; see StdDevSweep.
             if hasattr(self, "amp") and hasattr(self, "readout_freqs"):
                 freqs = np.asarray(getattr(self, "readout_freqs"))
                 amps = np.broadcast_to(np.asarray(getattr(self, "amp")), freqs.shape)
                 document["power_dbm_arr"] = (
-                    np.array([
-                        float(amp_to_power_dbm(f * 1e-9, a))
-                        for f, a in zip(freqs.flat, amps.flat)
-                    ])
+                    np.array(
+                        [
+                            float(amp_to_power_dbm(f * 1e-9, a))
+                            for f, a in zip(freqs.flat, amps.flat)
+                        ]
+                    )
                     .reshape(freqs.shape)
                     .tolist()
                 )
