@@ -1,4 +1,4 @@
-"""Offline verification of ``StdDevSweep``: one ``QCTrace`` per readout frequency, ranked.
+"""Offline verification of single-tone and simultaneous multitone ``StdDevSweep``.
 
 The sweep composes ``QCTrace`` and inherits its readout, ramp and trigger handling, so these
 checks swap ``TimeStream`` in the shared readout module for a synthetic response and drive the
@@ -15,8 +15,9 @@ real ``QCTrace`` folding, the real save/load round trip and the plot:
   calibrated power per point, and a loaded sweep re-reads the generator when re-run;
 - invalid configurations are refused before any hardware is touched.
 
-Note the ``TimeStream`` swap targets ``daq.measurements._gate_bias``, not this measurement's own
-module: the readout builder every gate-bias measurement acquires through lives there.
+The single-tone ``TimeStream`` swap targets ``daq.measurements._gate_bias``; the multitone
+swap targets ``daq.measurements.sweep_std_dev``. Additional checks cover independent winners,
+sidebands, per-tone amplitudes, shared raw records, stored QC tone indices and 13-device scans.
 
 Requires ``presto`` to be importable (``StdDevSweep`` imports it transitively); no hardware and
 no network. The database calls are stubbed and the data folder pointed at a temporary directory,
@@ -90,6 +91,7 @@ class FakeTimeStream:
 
     instances = []
     fail_at = None
+    fail_on_acquisition = None
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
@@ -102,7 +104,10 @@ class FakeTimeStream:
 
     def run(self, **kwargs):
         self.run_kwargs = kwargs
-        if self.kwargs["lo_freq"] == FakeTimeStream.fail_at:
+        if (
+            self.kwargs["lo_freq"] == FakeTimeStream.fail_at
+            or len(FakeTimeStream.instances) == FakeTimeStream.fail_on_acquisition
+        ):
             raise RuntimeError("simulated acquisition failure")
         n = self.kwargs["pixel_counts"] - round(self.kwargs["discard_start_ms"] * 1e-3 * self.df)
         per = int(round(self.df / RAMP_HZ))
@@ -111,8 +116,11 @@ class FakeTimeStream:
         # number of whole blocks fits the record).
         wave = (k % per) / per
         offsets = np.where((k // per) % 2, -0.2, 0.2)
-        scale_i, scale_q = SCALES[self.kwargs["lo_freq"]]
-        self.signal = (0.01 * (scale_i + 1j * scale_q) * wave + offsets).reshape(-1, 1)
+        signs = np.where(self.kwargs.get("is_usb", [True]), 1, -1)
+        self.signal_freqs = self.kwargs["lo_freq"] + signs * np.asarray(self.kwargs["if_freqs"])
+        self.signal = np.column_stack(
+            [0.01 * complex(*SCALES[freq]) * wave + offsets for freq in self.signal_freqs]
+        )
         path = os.path.join(tmp.name, f"raw-{len(FakeTimeStream.instances)}.h5")
         with h5py.File(path, "w") as h5f:
             h5f["signal"] = self.signal
@@ -499,7 +507,7 @@ refused = []
 for kwargs in (
     dict(readout_freqs=[]),
     dict(readout_freqs=2.8e9),
-    dict(readout_freqs=[[2.8e9]]),
+    dict(readout_freqs=[[[2.8e9]]]),
     dict(readout_freqs=[np.nan]),
     dict(readout_freqs=[np.inf]),
     dict(readout_freqs=[-1.0]),
@@ -560,6 +568,301 @@ for sweep_obj, trace in (
     except RuntimeError:
         missing += 1
 check("a trace without the chosen record raises RuntimeError", missing == 2)
+
+# ---------------------------------------------------------------- simultaneous tones
+
+sweep_mod.TimeStream = FakeTimeStream
+SCALES.update({3.1e9: (4, 1), 3.2e9: (1, 1), 3.3e9: (1, 5)})
+grid = np.column_stack([FREQS, np.asarray(FREQS) + 400e6])
+multi = make(readout_freqs=grid, amp=[0.01, 0.02], tone_labels=["lower", "upper"])
+bias = FakeBias()
+multi_path = run(multi, bias, presto_address="test-presto", ext_ref_clk=True)
+expected = SIGMA * np.sqrt([[5, 17], [10, 2], [5, 26]])
+check("multitone uses one acquisition per row, not per device", len(FakeTimeStream.instances) == 3)
+check(
+    "multitone principal curves rank each device independently",
+    np.allclose(multi.std_arr, expected) and np.array_equal(multi.best_freq, [2.8e9, 3.3e9]),
+)
+check(
+    "multitone diagnostic shapes follow the frequency matrix",
+    multi.principal_axes.shape == (3, 2, 2) and multi.sample_counts.shape == (3, 2),
+)
+check(
+    "multitone uses the tuned sample rate for each fold",
+    np.all(multi.sample_counts == PER) and np.all(multi.sampling_frequencies == TUNED_FS),
+)
+streams = FakeTimeStream.instances
+check(
+    "multitone LO and signed sidebands reconstruct every physical frequency",
+    all(np.array_equal(stream.signal_freqs, row) for stream, row in zip(streams, grid))
+    and all(np.array_equal(stream.kwargs["is_usb"], [False, True]) for stream in streams),
+)
+check(
+    "per-tone drive is not split or rescaled",
+    all(np.array_equal(stream.kwargs["amp"], [0.01, 0.02]) for stream in streams),
+)
+check(
+    "multitone forwards trigger routing, timing and connection parameters",
+    all(
+        np.array_equal(stream.kwargs["external_trigger"], [0, 1])
+        and stream.kwargs["pixel_counts"] == 110
+        and stream.kwargs["discard_start_ms"] == DISCARD_MS
+        and stream.run_kwargs["presto_address"] == "test-presto"
+        and stream.run_kwargs["ext_ref_clk"]
+        for stream in streams
+    ),
+)
+check("multitone bias output is off after acquisition", not bias.output and not bias.closed)
+check(
+    "multitone metadata preserves frequency, curve and power matrix shapes",
+    documents[-1]["readout_freqs"] == grid.tolist()
+    and np.shape(documents[-1]["power_dbm_arr"]) == grid.shape
+    and documents[-1]["tone_labels"] == ["lower", "upper"],
+)
+from daq.calibrations import amp_to_power_dbm
+
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    expected_power = [
+        [float(amp_to_power_dbm(f / 1e9, a)) for f, a in zip(row, multi.amp)] for row in grid
+    ]
+check(
+    "power calibration pairs each frequency with its own tone amplitude",
+    np.allclose(documents[-1]["power_dbm_arr"], expected_power),
+)
+loaded = StdDevSweep.load(multi_path)
+check(
+    "multitone HDF5 restores matrices, labels, amplitudes, LO and independent winners",
+    np.array_equal(loaded.std_arr, multi.std_arr)
+    and np.array_equal(loaded.principal_axes, multi.principal_axes)
+    and np.array_equal(loaded.best_freq, multi.best_freq)
+    and np.array_equal(loaded.amp, multi.amp)
+    and loaded.lo_freq == multi.lo_freq
+    and loaded.tone_labels == multi.tone_labels
+    and loaded.qc_files == multi.qc_files
+    and loaded.raw_files == multi.raw_files
+    and loaded.best_qc_file == multi.best_qc_file,
+)
+from daq import QCTrace
+
+winning_trace = QCTrace.load(loaded.best_qc_file[1])
+check(
+    "winning QC record names its shared raw file and tone",
+    winning_trace.tone == 1
+    and winning_trace.qc_file == multi.raw_files[2]
+    and winning_trace.readout_freq == 3.3e9,
+)
+expected_iq = winning_trace.avg_iq.copy()
+winning_trace.fold(streams[2])
+check(
+    "loaded QC trace re-folds its stored tone by default",
+    np.allclose(winning_trace.avg_iq, expected_iq),
+)
+check(
+    "each row saves one shared raw stream and one QC record per tone",
+    len(multi.raw_files) == 3
+    and np.shape(multi.qc_files) == (3, 2)
+    and all(
+        QCTrace.load(path).qc_file == multi.raw_files[row]
+        for row, paths in enumerate(multi.qc_files)
+        for path in paths
+    ),
+)
+fig = loaded.analyze()
+check(
+    "multitone plot contains one labeled panel and maximum per device",
+    len(fig.axes) == 2
+    and [ax.get_title() for ax in fig.axes] == ["lower", "upper"]
+    and all(np.all(np.diff(ax.lines[0].get_xdata()) >= 0) for ax in fig.axes),
+)
+plt.close("all")
+
+raw_multi = make(readout_freqs=grid, amp=0.01, trace_source="raw", ddof=1)
+run(raw_multi, FakeBias())
+check(
+    "scalar multitone amplitude broadcasts to each tone", np.array_equal(raw_multi.amp, [0.01] * 2)
+)
+check(
+    "raw multitone std uses each selected column without mixing devices",
+    np.allclose(
+        raw_multi.std_arr,
+        [
+            [
+                np.sqrt(np.linalg.eigvalsh(np.cov(np.vstack([z.real, z.imag])))[-1])
+                for z in stream.signal.T
+            ]
+            for stream in FakeTimeStream.instances
+        ],
+    ),
+)
+for quantity in ("complex", "real", "imag", "abs"):
+    choice = make(readout_freqs=grid, quantity=quantity, trace_source="raw")
+    run(choice, FakeBias())
+    reference = []
+    for stream in FakeTimeStream.instances:
+        z = stream.signal
+        values = {"complex": z, "real": z.real, "imag": z.imag, "abs": np.abs(z)}[quantity]
+        reference.append(np.std(values, axis=0))
+    check(
+        f"multitone raw {quantity} statistic agrees with numpy",
+        np.allclose(choice.std_arr, reference),
+    )
+
+# Every tone's arbitrary IQ rotation must preserve its curve and winner.
+saved_scales = SCALES.copy()
+for i, freq in enumerate(grid.flat):
+    value = complex(*SCALES[freq]) * np.exp(1j * (0.4 + i * 0.7))
+    SCALES[freq] = (value.real, value.imag)
+rotated_multi = make(readout_freqs=grid, ddof=0)
+run(rotated_multi, FakeBias())
+check(
+    "independent IQ rotations preserve every multitone principal curve",
+    np.allclose(rotated_multi.std_arr, expected, rtol=1e-12)
+    and np.array_equal(rotated_multi.best_freq, multi.best_freq),
+)
+SCALES.clear()
+SCALES.update(saved_scales)
+
+loaded.std_arr[:] = 0
+loaded._select_best()
+check(
+    "multitone ties and zero curves choose first row independently",
+    np.array_equal(loaded.best_freq, grid[0]) and np.all(loaded.best_std == 0),
+)
+check(
+    "zero variation is flagged for each device",
+    all(
+        any("not meaningful" in text.get_text() for text in ax.texts)
+        for ax in loaded.analyze().axes
+    ),
+)
+plt.close("all")
+single_row = make(readout_freqs=grid[:1], lo_freq=3e9)
+run(single_row, FakeBias())
+check(
+    "a one-row multitone scan returns one frequency per device",
+    np.array_equal(single_row.best_freq, grid[0]) and single_row.lo_freq == 3e9,
+)
+one_column = make(readout_freqs=np.array(FREQS)[:, None])
+run(one_column, FakeBias())
+check(
+    "a one-column matrix keeps matrix result semantics",
+    one_column.std_arr.shape == (3, 1) and one_column.best_freq.shape == (1,),
+)
+
+bias = FakeBias(trigger_port=3)
+run(loaded, bias)
+check(
+    "a loaded multitone sweep re-reads the generator routing",
+    np.array_equal(loaded.trigger_states, [0, 0, 1]),
+)
+explicit = make(readout_freqs=grid, trigger_states=[0, 1, 1])
+run(explicit, FakeBias())
+check(
+    "multitone respects an explicit trigger override",
+    all(
+        np.array_equal(stream.kwargs["external_trigger"], [0, 1, 1])
+        for stream in FakeTimeStream.instances
+    ),
+)
+
+FakeTimeStream.fail_at = loaded.lo_freq
+try:
+    run(loaded, bias)
+    failed = False
+except RuntimeError:
+    failed = True
+FakeTimeStream.fail_at = None
+check(
+    "a failed multitone re-run clears all results and turns off the bias",
+    failed
+    and not bias.output
+    and loaded.std_arr is None
+    and loaded.best_freq is None
+    and loaded.qc_files is None
+    and loaded.raw_files is None,
+)
+for label, call in (("save", loaded.save), ("analyze", loaded.analyze)):
+    try:
+        call()
+        refused = False
+    except RuntimeError:
+        refused = True
+    check(f"{label} refuses an incomplete multitone scan", refused)
+
+bad_multi = []
+for params in (
+    dict(amp=[0.1]),
+    dict(amp=[0.1, 0.2, 0.3]),
+    dict(amp=[0.5, 0.5]),
+    dict(amp=0.6),
+    dict(amp=[0, 0.1]),
+    dict(amp=[-0.1, 0.1]),
+    dict(amp=[np.nan, 0.1]),
+    dict(amp=[0.1, np.inf]),
+    dict(lo_freq=np.nan),
+    dict(lo_freq=-1),
+    dict(lo_freq=2e9),
+    dict(readout_freqs=[[2e9, 3e9]]),
+    dict(readout_freqs=[[2.8e9, 2.8e9]]),
+    dict(readout_freqs=[[]]),
+    dict(tone_labels=["one"]),
+    dict(tone_labels="ab"),
+    dict(tone_labels=["", "two"]),
+    dict(readout_freqs=[np.linspace(2.7e9, 2.8e9, 193)], amp=0.001),
+):
+    try:
+        make(**dict(dict(readout_freqs=grid), **params))
+        bad_multi.append(str(params))
+    except ValueError:
+        pass
+check("invalid multitone plans are refused before acquisition", not bad_multi, str(bad_multi))
+
+owned_multi_bias = FakeBias()
+sweep_mod.Agilent33220A = lambda: owned_multi_bias
+partial = make(readout_freqs=grid)
+before_files = set(os.listdir(tmp.name))
+FakeTimeStream.fail_on_acquisition = 2
+try:
+    run(partial)
+    failed = False
+except RuntimeError:
+    failed = True
+FakeTimeStream.fail_on_acquisition = None
+new_qc_files = [
+    name for name in set(os.listdir(tmp.name)) - before_files if name.endswith("-qc_trace.h5")
+]
+check(
+    "a later multitone acquisition failure preserves completed QC files and closes owned bias",
+    failed
+    and len(new_qc_files) == 2
+    and owned_multi_bias.closed
+    and not owned_multi_bias.output
+    and partial.std_arr is None
+    and partial.best_freq is None,
+)
+with h5py.File(multi.qc_files[0][0], "a") as old_qc:
+    del old_qc.attrs["tone"]
+check(
+    "QC records predating tone metadata still load as tone zero",
+    QCTrace.load(multi.qc_files[0][0]).tone == 0,
+)
+
+# The user's 13-device plan must still acquire only one stream per offset.
+centers = 2.7e9 + np.arange(13) * 10e6
+thirteen_grid = centers[None, :] + np.array([-1e6, 0, 1e6])[:, None]
+for row in thirteen_grid:
+    for freq in row:
+        SCALES[freq] = (1, 2)
+thirteen = make(readout_freqs=thirteen_grid, amp=0.02)
+run(thirteen, FakeBias())
+check(
+    "13 devices share three acquisitions for three offsets",
+    len(FakeTimeStream.instances) == 3
+    and thirteen.std_arr.shape == (3, 13)
+    and thirteen.best_freq.shape == (13,)
+    and all(stream.signal.shape[1] == 13 for stream in FakeTimeStream.instances),
+)
 
 tmp.cleanup()
 

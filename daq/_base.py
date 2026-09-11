@@ -329,15 +329,19 @@ class Base:
                         amp_to_power_dbm(getattr(self, "readout_freq") * 1e-9, amp_val)
                     )
 
-            # StdDevSweep: scalar amp repeated at every readout frequency of the sweep. The
-            # calibration takes one frequency at a time.
+            # StdDevSweep: scalar drive for a 1-D sweep, or one drive per column
+            # of a multitone frequency matrix. Preserve the frequency grid's shape.
             if hasattr(self, "amp") and hasattr(self, "readout_freqs"):
-                amp_val = getattr(self, "amp")
-                if np.isscalar(amp_val):
-                    document["power_dbm_arr"] = [
-                        float(amp_to_power_dbm(f * 1e-9, amp_val))
-                        for f in np.asarray(getattr(self, "readout_freqs"))
-                    ]
+                freqs = np.asarray(getattr(self, "readout_freqs"))
+                amps = np.broadcast_to(np.asarray(getattr(self, "amp")), freqs.shape)
+                document["power_dbm_arr"] = (
+                    np.array([
+                        float(amp_to_power_dbm(f * 1e-9, a))
+                        for f, a in zip(freqs.flat, amps.flat)
+                    ])
+                    .reshape(freqs.shape)
+                    .tolist()
+                )
 
             # TimeStream: per-tone amp array at the selected sideband frequency
             # (lo_freq + if_freqs for USB, lo_freq - if_freqs for LSB)

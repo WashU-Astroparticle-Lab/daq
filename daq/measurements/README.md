@@ -702,8 +702,9 @@ time -- each folded trace is reduced to its standard deviation over the ramp per
 `best_freq` is the frequency with the largest spread. That is the operating point for a
 subsequent `QCTrace` or `BiasHunt`.
 
-Like its two siblings it inherits `GateBiasMeasurement`, so the readout, ramp and trigger
-handling are `QCTrace`'s; it adds only the sweep and the statistic.
+It inherits `GateBiasMeasurement` for ramp/readout validation. One-dimensional inputs use
+`QCTrace` acquisitions; a frequency matrix uses shared multitone `TimeStream` acquisitions
+with the same gated ramp and per-device statistics.
 
 The default `quantity="principal"` measures the spread along the folded trace's **principal
 axis**: the I/Q samples are centred, their 2-by-2 covariance diagonalised, and the standard
@@ -739,6 +740,71 @@ best_trace.analyze()
 restored = StdDevSweep.load(path)
 restored.analyze()             # the summary alone suffices; no hardware, no raw files
 ```
+
+**Simultaneous multitone optimization**: pass `readout_freqs` with shape
+`(n_steps, n_tones)`. Each row is acquired once, with one probe per device; each column
+retains the same device identity across rows. Offsets need not be identical between columns.
+For example, a common 51-point offset scan of 13 resonances takes 51 raw acquisitions,
+compared with 663 when scanning the devices separately. Transfer, folding and file writing
+still scale with tone count, so this is an acquisition-count reduction, not a measured
+runtime speedup. All devices share the gate ramp, sample rate and RF input/output port pair.
+
+```python
+from daq.calibrations import power_dbm_to_amp
+
+# centers_hz is your 13-element array from the reference frequency sweeps.
+offsets_hz = np.linspace(-250e3, 250e3, 51)
+frequency_grid = centers_hz[None, :] + offsets_hz[:, None]
+amps = np.array([
+    power_dbm_to_amp(freq / 1e9, -100 + 63)  # -37 dBm at Presto, per tone
+    for freq in centers_hz
+])
+scan = StdDevSweep(
+    readout_freqs=frequency_grid, amp=amps,
+    output_port=1, input_port=1,
+    ramp_vpp=0.4, ramp_offset_v=0.2, ramp_freq_hz=5e3,
+    sampling_frequency=100e3, num_periods=1000,
+    quantity="principal", trace_source="folded",
+    tone_labels=[f"Device {i}" for i in range(len(centers_hz))],
+    device="my-QPD-array",
+)
+path = scan.run()
+scan.analyze()                       # one std-versus-frequency panel per device
+optimal_freqs_hz = scan.best_freq.copy()  # one independent optimum per column
+best_trace = QCTrace.load(scan.best_qc_file[3])
+best_trace.analyze()                 # folded trace of device 3 at its own optimum
+
+from daq import TimeStream
+raw = TimeStream.load(best_trace.qc_file)
+best_trace.fold(raw)                 # stored tone index selects device 3 automatically
+```
+
+The LO defaults to the midpoint of the entire frequency matrix; pass `lo_freq=...` to fix it
+explicitly. USB/LSB selection is automatic and every frequency must satisfy
+`abs(freq - lo_freq) < 500e6`. Each row must have distinct physical frequencies and no more
+than 192 tones. A scalar `amp` is broadcast **to each tone**, or supply one amplitude per
+column; all amplitudes must be positive and their sum must stay below 1 DAC full scale.
+They stay fixed across the scan and are never split or rescaled. The example calibrates
+drive at each center frequency; it does not recalibrate power at every offset.
+
+Principal axes are fitted independently at every row and column. Maxima may occur at
+different rows for different devices. The optional power scan remains an outer loop over
+`StdDevSweep` instances with different per-tone amplitudes.
+
+| Result | 1-D frequency input | 2-D frequency input |
+|---|---|---|
+| `std_arr`, diagnostic std arrays, `sample_counts` | `(n_steps,)` | `(n_steps, n_tones)` |
+| `principal_axes` | `(n_steps, 2)` | `(n_steps, n_tones, 2)` |
+| `best_freq`, `best_std` | scalar | `(n_tones,)` array |
+| `best_qc_file` | string | list of `n_tones` strings |
+| `qc_files` | list per step | nested list `[step][tone]` |
+| `raw_files`, `sampling_frequencies` | one entry per step | one entry per shared acquisition row |
+
+Each multitone row saves one shared raw timestream and one folded `QCTrace` per tone.
+Each QC record stores its `tone` index alongside the shared raw path. Frequency matrices,
+tone labels, amplitude vectors, diagnostic arrays, constituent paths and per-tone winners
+round-trip through `StdDevSweep.save/load`; the MongoDB `power_dbm_arr` follows the frequency
+matrix's shape. Existing 1-D files and calls retain their scalar winner and flat curve layout.
 
 `run(bias)` takes an already-open `Agilent33220A` or discovers one, exactly as `QCTrace.run`
 does, and the Presto connection parameters are keyword-only. The bias output is forced off on

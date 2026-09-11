@@ -167,6 +167,8 @@ class QCTrace(GateBiasMeasurement):
         # The acquisition itself, kept off the saved record (Base skips underscore-prefixed
         # attributes) and exposed through a read-only property.
         self._qc_stream: Optional[TimeStream] = None
+        self.tone = 0
+        """Column of the raw time stream represented by this folded trace."""
 
     # ------------------------------------------------------------------ constituent objects
 
@@ -330,7 +332,7 @@ class QCTrace(GateBiasMeasurement):
             )
             self._qc_stream.attach(bias=bias)
             self.qc_file = self._qc_stream.run(**run_kwargs)
-            self.fold()
+            self.fold(tone=0)
 
         # Saved after the bias is de-energised, so a failure here cannot leave it applied.
         return self.save(save_filename=save_filename)
@@ -341,7 +343,7 @@ class QCTrace(GateBiasMeasurement):
         *,
         period_s: Optional[float] = None,
         n_periods: Optional[int] = None,
-        tone: int = 0,
+        tone: Optional[int] = None,
     ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
         """Block-average the acquisition into a single ramp period.
 
@@ -369,7 +371,8 @@ class QCTrace(GateBiasMeasurement):
         :param period_s: Fold on this period in seconds instead of the ramp's.
         :param n_periods: Fold on the record divided into this many periods instead. Mutually
             exclusive with *period_s*.
-        :param tone: Which tone to fold; the acquisition is single-tone, so ``0``.
+        :param tone: Which tone to fold. Defaults to the stored :attr:`tone`, normally zero;
+            a multitone ``StdDevSweep`` saves one QC trace for each column of a shared stream.
         :raises RuntimeError: If no stream is available -- :meth:`load` restores the folded
             trace but not the raw record, so pass *stream* after loading.
         :raises TypeError: If *stream* carries no ``df``.
@@ -400,6 +403,8 @@ class QCTrace(GateBiasMeasurement):
         if period_s is None and n_periods is None:
             period_s = 1.0 / self.ramp_freq_hz
 
+        if tone is None:
+            tone = self.tone
         self.time_ms, self.avg_iq = fold_timestream(
             stream,
             fs,
@@ -407,6 +412,7 @@ class QCTrace(GateBiasMeasurement):
             n_periods=n_periods,
             tone=tone,
         )
+        self.tone = int(tone)
         # fold_timestream computes the block count and discards it. Recover it from the window
         # it produced, so the record carries the averaging actually achieved: the requested
         # num_periods over-states it whenever the record does not divide evenly.
@@ -464,6 +470,7 @@ class QCTrace(GateBiasMeasurement):
                 self.trigger_states = resolve_trigger_states(h5f["trigger_states"][()])  # type: ignore
 
             self.qc_file = attrs.get("qc_file", None)
+            self.tone = int(attrs.get("tone", 0))
             if "num_periods_folded" in attrs:
                 self.num_periods_folded = int(attrs["num_periods_folded"])  # type: ignore
             for name in ("time_ms", "avg_iq"):
@@ -505,6 +512,7 @@ class QCTrace(GateBiasMeasurement):
             self.time_ms,
             self.avg_iq,
             raw=self._qc_stream if raw else None,
+            tone=self.tone,
             ax=(ax_i, ax_q),
             title=title,
         )
