@@ -40,7 +40,7 @@ Calibrated power is added automatically:
 | Field | Measurement |
 |---|---|
 | `power_dbm` | `Sweep`, `SweepFreqAndDC`, `QCTrace`, `BiasHunt` (scalar); `TimeStream` (per-tone list) |
-| `power_dbm_arr` | `SweepPower` (drive power array) |
+| `power_dbm_arr` | `SweepPower` (drive power array); `StdDevSweep` (one power per readout frequency, following the shape of `readout_freqs`: a flat list for a 1-D sweep, a nested `[step][tone]` list for a multitone grid) |
 | `readout_power_dbm`, `control_power_dbm_arr` | `TwoTonePower` |
 
 Fit results are added when auto-fitting succeeds (`Sweep`; `QCTrace` and `BiasHunt` carry none

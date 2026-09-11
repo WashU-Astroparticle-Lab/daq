@@ -8,7 +8,6 @@ the fold of that record into a single period.
 
 from __future__ import annotations
 
-import warnings
 from contextlib import ExitStack
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,12 +17,7 @@ import numpy.typing as npt
 
 from ..analysis.folding import fold_timestream
 from ..instruments import Agilent33220A
-from ..triggers import (
-    TriggerAny,
-    describe_trigger_states,
-    resolve_trigger_states,
-    trigger_for,
-)
+from ..triggers import TriggerAny, describe_trigger_states, resolve_trigger_states
 from ._gate_bias import GateBiasMeasurement
 from .timestream import TimeStream
 
@@ -167,6 +161,8 @@ class QCTrace(GateBiasMeasurement):
         # The acquisition itself, kept off the saved record (Base skips underscore-prefixed
         # attributes) and exposed through a read-only property.
         self._qc_stream: Optional[TimeStream] = None
+        self.tone = 0
+        """Column of the raw time stream represented by this folded trace."""
 
     # ------------------------------------------------------------------ constituent objects
 
@@ -179,81 +175,32 @@ class QCTrace(GateBiasMeasurement):
         """
         return self._qc_stream
 
-    # ------------------------------------------------------------------ helpers
-
-    @staticmethod
-    def _check_trigger_states(trigger_states: TriggerAny) -> npt.NDArray[np.int64]:
-        """Resolve *trigger_states* and refuse a routing that gates nothing.
-
-        A gated ramp with no port asserted is exactly the silent failure this measurement
-        cannot afford: the generator holds its burst start level, the acquisition succeeds,
-        and the trace is flat because the gate never moved. ``False`` and all-zero states are
-        therefore rejected rather than run.
-
-        :param trigger_states: Anything :func:`~daq.triggers.resolve_trigger_states` accepts.
-        :raises ValueError: If the states are invalid, or gate no port at all.
-        :returns: The resolved per-port states.
-
-        """
-        states = resolve_trigger_states(trigger_states)
-        if not states.any():
-            raise ValueError(
-                f"trigger_states={trigger_states!r} gates no digital output port, so the "
-                "QC-trace ramp would never run: the generator would hold its burst start "
-                "level and the acquisition would record a static bias instead of a swept "
-                "one. Pass the port that gates the bias generator (True or [1] for port 1), "
-                "or leave trigger_states unset to take it from the generator's own "
-                "trigger_port."
-            )
-        return states
-
-    def _resolve_run_trigger_states(self, bias: Agilent33220A) -> npt.NDArray[np.int64]:
-        """Decide which ports gate this run.
-
-        Reads the caller's own argument, never the states a previous run resolved, so the
-        default ("ask the generator") holds on every run of an object -- including one
-        restored by :meth:`load`, whose stored routing describes the run that produced the
-        file rather than the bench in front of you now.
-
-        :param bias: The gate-bias generator this run is using.
-        :raises ValueError: If the routing gates no port, or the generator does not declare
-            a ``trigger_port``.
-        :returns: The resolved per-port states.
-
-        """
-        if self._trigger_states_arg is not None:
-            states = self._check_trigger_states(self._trigger_states_arg)
-        else:
-            states = self._check_trigger_states(trigger_for(bias))
-        self._warn_if_generator_ungated(states, bias)
-        return states
-
-    @staticmethod
-    def _warn_if_generator_ungated(states: npt.NDArray[np.int64], bias: Agilent33220A) -> None:
-        """Warn when the routing does not assert the port the generator says it is on.
-
-        Only an explicit *trigger_states* can produce this: it is the one remaining way to
-        gate a port while the ramp waits on another, which the acquisition records as a
-        static bias. A warning rather than an error, since the override may be deliberate --
-        an instrument whose declared ``trigger_port`` is itself wrong.
-
-        :param states: The resolved per-port states for this run.
-        :param bias: The gate-bias generator this run is using.
-
-        """
-        port = getattr(bias, "trigger_port", None)
-        if port is None or (port <= states.size and states[port - 1]):
-            return
-        warnings.warn(
-            f"The QC trace gates {describe_trigger_states(states)}, but the bias generator "
-            f"reports trigger_port={port}, which is not among them. Its gated ramp will wait "
-            "on a port nothing asserts and the acquisition will record a static bias. Correct "
-            "the generator's wiring (bias.trigger_port, or DAQ_FGEN_TRIGGER_PORT) or include "
-            f"port {port} in trigger_states.",
-            stacklevel=3,
-        )
-
     # ------------------------------------------------------------------ acquisition
+
+    def _adopt_stream(
+        self,
+        stream: TimeStream,
+        qc_file: str,
+        trigger_states: npt.NDArray[np.int64],
+        tone: int,
+    ) -> None:
+        """Take a just-run time stream as this trace's acquisition and fold it.
+
+        Used by :meth:`run` for the trace's own single-tone stream and by
+        :class:`~daq.measurements.sweep_std_dev.StdDevSweep` to hand one column of a shared
+        multitone stream to each of its per-device traces, so a QC record is built the same
+        way whichever measurement acquired the raw data.
+
+        :param stream: The acquired time stream.
+        :param qc_file: Path of the stream's HDF5 file.
+        :param trigger_states: The resolved routing the stream was gated on.
+        :param tone: Column of *stream* this trace represents.
+
+        """
+        self._qc_stream = stream
+        self.qc_file = qc_file
+        self.trigger_states = resolve_trigger_states(trigger_states)
+        self.fold(tone=tone)
 
     def run(
         self,
@@ -311,14 +258,7 @@ class QCTrace(GateBiasMeasurement):
             )
             print(f"QC trace: reading out at {self.readout_freq / 1e9:.6f} GHz")
 
-            bias.sawtooth(
-                vpp=self.ramp_vpp,
-                freq_hz=self.ramp_freq_hz,
-                offset_v=self.ramp_offset_v,
-                symmetry_pct=self.ramp_symmetry_pct,
-                gated=True,
-            )
-            self._qc_stream = self._make_timestream(
+            stream = self._make_timestream(
                 bias.samples_for_periods(
                     self.num_periods,
                     self.sampling_frequency,
@@ -328,9 +268,8 @@ class QCTrace(GateBiasMeasurement):
                 external_trigger=self.trigger_states,
                 notes="Gated sawtooth QC trace",
             )
-            self._qc_stream.attach(bias=bias)
-            self.qc_file = self._qc_stream.run(**run_kwargs)
-            self.fold()
+            path = self._run_gated_ramp(bias, stream, run_kwargs)
+            self._adopt_stream(stream, path, self.trigger_states, tone=0)
 
         # Saved after the bias is de-energised, so a failure here cannot leave it applied.
         return self.save(save_filename=save_filename)
@@ -341,7 +280,7 @@ class QCTrace(GateBiasMeasurement):
         *,
         period_s: Optional[float] = None,
         n_periods: Optional[int] = None,
-        tone: int = 0,
+        tone: Optional[int] = None,
     ) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
         """Block-average the acquisition into a single ramp period.
 
@@ -369,12 +308,18 @@ class QCTrace(GateBiasMeasurement):
         :param period_s: Fold on this period in seconds instead of the ramp's.
         :param n_periods: Fold on the record divided into this many periods instead. Mutually
             exclusive with *period_s*.
-        :param tone: Which tone to fold; the acquisition is single-tone, so ``0``.
+        :param tone: Which tone to fold. Defaults to the stored :attr:`tone`, normally zero;
+            a multitone ``StdDevSweep`` saves one QC trace for each column of a shared stream.
+            The column must exist in *stream*, and when the stream reports its tone
+            frequencies (``signal_freqs``) the chosen column must sit at this trace's
+            :attr:`readout_freq` -- a QC record describes one device, and folding another
+            device's column into it would leave ``avg_iq`` and ``readout_freq`` disagreeing.
         :raises RuntimeError: If no stream is available -- :meth:`load` restores the folded
             trace but not the raw record, so pass *stream* after loading.
         :raises TypeError: If *stream* carries no ``df``.
-        :raises ValueError: If both *period_s* and *n_periods* are given, or the record is
-            too short to hold one period.
+        :raises ValueError: If both *period_s* and *n_periods* are given, the record is too
+            short to hold one period, *tone* is not a column of *stream*, or that column's
+            frequency is not this trace's :attr:`readout_freq`.
         :returns: ``(time_ms, avg_iq)``, as :func:`~daq.analysis.folding.fold_timestream`.
 
         """
@@ -400,6 +345,25 @@ class QCTrace(GateBiasMeasurement):
         if period_s is None and n_periods is None:
             period_s = 1.0 / self.ramp_freq_hz
 
+        if tone is None:
+            tone = self.tone
+        tone = int(tone)
+        signal = np.asarray(stream.signal)
+        n_tones = signal.shape[1] if signal.ndim == 2 else 1
+        if not 0 <= tone < n_tones:
+            raise ValueError(
+                f"tone={tone} is not a column of the time stream, which holds {n_tones} tone(s)"
+            )
+        signal_freqs = getattr(stream, "signal_freqs", None)
+        if signal_freqs is not None and np.size(signal_freqs) == n_tones:
+            tone_freq = float(np.ravel(signal_freqs)[tone])
+            if not np.isclose(tone_freq, self.readout_freq, rtol=0.0, atol=1.0):
+                raise ValueError(
+                    f"tone {tone} of the time stream is at {tone_freq / 1e9:.6f} GHz, but this "
+                    f"QC trace reads out at {self.readout_freq / 1e9:.6f} GHz. A QC record "
+                    "describes one device; fold the column that matches its readout_freq, or "
+                    "build a QCTrace at the other frequency."
+                )
         self.time_ms, self.avg_iq = fold_timestream(
             stream,
             fs,
@@ -407,10 +371,11 @@ class QCTrace(GateBiasMeasurement):
             n_periods=n_periods,
             tone=tone,
         )
+        self.tone = tone
         # fold_timestream computes the block count and discards it. Recover it from the window
         # it produced, so the record carries the averaging actually achieved: the requested
         # num_periods over-states it whenever the record does not divide evenly.
-        n_samples = np.asarray(stream.signal).shape[0]
+        n_samples = signal.shape[0]
         self.num_periods_folded = int(n_samples // self.avg_iq.shape[1])
         return self.time_ms, self.avg_iq
 
@@ -464,6 +429,7 @@ class QCTrace(GateBiasMeasurement):
                 self.trigger_states = resolve_trigger_states(h5f["trigger_states"][()])  # type: ignore
 
             self.qc_file = attrs.get("qc_file", None)
+            self.tone = int(attrs.get("tone", 0))
             if "num_periods_folded" in attrs:
                 self.num_periods_folded = int(attrs["num_periods_folded"])  # type: ignore
             for name in ("time_ms", "avg_iq"):
@@ -505,6 +471,7 @@ class QCTrace(GateBiasMeasurement):
             self.time_ms,
             self.avg_iq,
             raw=self._qc_stream if raw else None,
+            tone=self.tone,
             ax=(ax_i, ax_q),
             title=title,
         )
