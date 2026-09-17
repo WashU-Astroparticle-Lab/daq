@@ -426,28 +426,19 @@ class StdDevSweep(GateBiasMeasurement):
     def _principal_axis(z: npt.NDArray[np.complexfloating]) -> npt.NDArray[np.floating]:
         """Return the unit direction in the I/Q plane along which *z* spreads the most.
 
-        The largest-eigenvalue eigenvector of the *centred* I/Q covariance. The divisor of the
-        covariance (``N`` or ``N - ddof``) scales both eigenvalues alike and so does not move
-        the eigenvector, which is why *ddof* plays no part here. An eigenvector's sign is
-        arbitrary; it is fixed so the larger component is positive, purely so the saved axis is
-        deterministic. When the two eigenvalues are equal the direction is ambiguous, but the
-        spread along it is not.
+        Thin alias for :func:`daq.analysis.qc_periods.principal_axis`, which owns the
+        definition (the largest-eigenvalue eigenvector of the centred I/Q covariance, sign
+        fixed so the larger component is positive) so the per-period digitisation and this
+        sweep's ranking cannot disagree about the axis.
 
         :param z: Complex samples.
         :raises ValueError: If the covariance is not finite.
         :returns: ``[I, Q]`` unit vector.
 
         """
-        centered = z - z.mean()
-        iq = np.vstack((centered.real, centered.imag))
-        covariance = (iq @ iq.T) / z.size
-        if not np.all(np.isfinite(covariance)):
-            raise ValueError("The I/Q covariance is not finite")
-        _, vectors = np.linalg.eigh(covariance)
-        axis = vectors[:, -1]
-        if axis[np.argmax(np.abs(axis))] < 0:
-            axis = -axis
-        return axis
+        from ..analysis.qc_periods import principal_axis
+
+        return principal_axis(z)[0]
 
     def _select_best(self) -> None:
         """Pick the frequency with the largest :attr:`std_arr`; the first one on an exact tie.
