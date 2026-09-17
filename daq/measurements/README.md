@@ -86,6 +86,16 @@ results.
 - `discard_start_ms`: Milliseconds of startup junk dropped from the in-memory
   time-axis arrays after `run()`/`load()` (default `25.0`; set `0` to keep
   everything). The saved HDF5 keeps the full, untrimmed acquisition.
+- `save_arrays`: Which per-sample arrays the HDF5 file keeps — `"signal"` (default:
+  the per-tone selected sideband, what every analysis reads), `"pixels"` (the
+  `pixel_i`/`pixel_q` demodulator pair; `load()` rebuilds `lsb`/`usb`/`signal` from it
+  exactly, and it additionally holds each tone's image sideband as an off-resonance
+  reference), or `"all"` (every array — the historical file, five times the size of
+  `"signal"`). The in-memory object after `run()` always holds all five.
+- `save_dtype`: On-disk dtype of those arrays, `"complex64"` (default) or
+  `"complex128"`. presto returns complex128, but a 14-bit ADC's demodulated samples
+  carry nothing below a 24-bit mantissa. At 100 kHz × 13 tones the defaults make a
+  10 s file 104 MB instead of 1.04 GB.
 - `external_trigger`: Which Presto digital output ports assert a trigger during the
   acquisition, used to gate external instruments. `False` (default) triggers nothing;
   `True` is shorthand for `[1]` (port 1 only). Prefer `trigger_for(bias, led)`, which
@@ -923,7 +933,10 @@ All `run()` methods accept:
 All measurements save data in HDF5 format with:
 - **Automatic Filenaming**: `{number}-{device}-{type}.h5`
 - **Metadata Storage**: All parameters stored as HDF5 attributes
-- **Data Arrays**: Measurement data stored as HDF5 datasets
+- **Data Arrays**: Measurement data stored as HDF5 datasets. `TimeStream` stores only
+  the per-sample arrays its `save_arrays` names (default `signal`, as complex64) and
+  declares the choice in the file's attributes; `load()` sets the arrays a file does
+  not hold to `None`, and a file from before the attribute existed loads as `"all"`.
 - **Source Code**: Original measurement script saved for reference
 
 ---
