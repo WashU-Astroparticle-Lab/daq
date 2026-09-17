@@ -1125,7 +1125,8 @@ from daq.analysis.led_response import find_pulse_comb, average_pulse, fold_event
 from daq.analysis.resonator import resonator_phase, dtheta_to_dx
 
 kid = resonator_phase(ts.signal[:, kid_tone], sweep.fit_results, ts.signal_freqs[kid_tone])
-comb = find_pulse_comb(kid["dtheta"], ts.df, led_period_s)      # phase from the *folded* profile
+comb = find_pulse_comb(kid["dtheta"], ts.df, led_period_s,
+                       remove_period_s=1 / ramp_freq_hz)         # phase from the *folded* profile, gate pickup removed
 t, pulse, pulse_std, n = average_pulse(kid["dtheta"], ts.df, comb.times, pre_s=1e-3, post_s=5e-3)
 dx_pulse = dtheta_to_dx(pulse, sweep.fit_results, ts.signal_freqs[kid_tone],
                         sweep=(sweep.freq_arr, sweep.resp_arr))  # fractional resonance shift

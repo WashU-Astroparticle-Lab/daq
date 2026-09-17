@@ -76,6 +76,7 @@ def find_pulse_comb(
     *,
     onset_fraction: float = 0.5,
     record_start_s: float = 0.0,
+    remove_period_s: Optional[float] = None,
 ) -> Comb:
     """Locate a periodic pulse train of known period in a marker trace.
 
@@ -98,6 +99,13 @@ def find_pulse_comb(
     :param onset_fraction: Fraction of the extremum defining the onset on the leading edge.
     :param record_start_s: Time of ``x[0]`` in the record's own axis (e.g. the discarded
         start), added to every returned time.
+    :param remove_period_s: A periodicity to subtract before folding -- the gate period,
+        ``1 / ramp_freq_hz``. A marker read out beside a ramped array carries the ramp's
+        pickup, and when the flash period is a whole number of gate periods that pickup folds
+        coherently at *every* multiple of the gate period, so the finder locks onto it
+        wherever the flash is weaker than the ripple. The mean fold at this period is tiled
+        and subtracted; the flash, incommensurate with the gate at the sample level only
+        through its jitter, survives while the ripple does not.
     :returns: A :class:`Comb`.
 
     """
@@ -106,6 +114,12 @@ def find_pulse_comb(
         raise ValueError("x must be a finite 1-D array")
     if not 0.0 < onset_fraction <= 1.0:
         raise ValueError("onset_fraction must be in (0, 1]")
+    if remove_period_s is not None:
+        if not (np.isfinite(remove_period_s) and 0 < remove_period_s < period_s):
+            raise ValueError("remove_period_s must be positive and shorter than period_s")
+        _, ripple, n_gate = _fold_mean(x, fs, remove_period_s)
+        ripple -= ripple.mean()
+        x = x - np.tile(ripple, n_gate + 1)[: x.size]
     t, folded, n = _fold_mean(x, fs, period_s)
     profile = folded - np.median(folded)
     k = int(np.argmax(np.abs(profile)))

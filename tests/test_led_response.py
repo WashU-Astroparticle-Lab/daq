@@ -84,6 +84,47 @@ check("pure noise is not detected", not quiet.detected, f"folded SNR {quiet.snr_
 shifted = lr.find_pulse_comb(x[100:], FS, PERIOD, record_start_s=100 / FS)
 check("record_start_s offsets the returned times", abs(shifted.phase_s - PHASE) <= 1.5 / FS)
 
+# ---------------------------------------------------------------- gate ripple
+# A marker beside a ramped array carries the gate pickup. The flash period is a whole number
+# of gate periods, so the ripple folds coherently at every gate-period phase and a weak flash
+# loses to it. remove_period_s subtracts the gate fold first.
+GATE = 1 / 5e3
+ripple = 2.5e-4 * np.sin(2 * np.pi * t / GATE) + 1e-4 * np.sin(4 * np.pi * t / GATE + 0.3)
+x_weak = NOISE * rng.standard_normal(n) + ripple
+for t0 in onsets_true:
+    i = int(round(t0 * FS))
+    m = min(template.size, n - i)
+    x_weak[i : i + m] += 0.25 * template[:m]  # single-flash SNR 0.75, folded ~7.5
+# Noise plus ripple, no flash: without removal the ripple alone "detects" a train (the real
+# failure mode -- a dark file scoring a folded SNR far above the acceptance threshold); with
+# the gate fold removed it does not.
+x_ripple_only = NOISE * rng.standard_normal(n) + ripple
+fooled = lr.find_pulse_comb(x_ripple_only, FS, PERIOD)
+cleaned_quiet = lr.find_pulse_comb(x_ripple_only, FS, PERIOD, remove_period_s=GATE)
+check(
+    "ripple alone is 'detected' without removal and not with it",
+    fooled.snr_folded >= 5.0 and not cleaned_quiet.detected,
+    f"SNR {fooled.snr_folded:.1f} -> {cleaned_quiet.snr_folded:.1f}",
+)
+cleaned = lr.find_pulse_comb(x_weak, FS, PERIOD, remove_period_s=GATE)
+check(
+    "with the gate fold removed the weak flash is found",
+    abs(cleaned.phase_s - PHASE) <= 2 / FS,
+    f"phase {cleaned.phase_s * 1e3:.3f} ms, SNR {cleaned.snr_folded:.1f}",
+)
+strong = lr.find_pulse_comb(x + ripple, FS, PERIOD, remove_period_s=GATE)
+check(
+    "removal leaves a strong flash's phase and SNR intact",
+    abs(strong.phase_s - PHASE) <= 1.5 / FS and abs(strong.snr_folded / comb.snr_folded - 1) < 0.3,
+    f"SNR {strong.snr_folded:.1f} vs {comb.snr_folded:.1f}",
+)
+for bad in (PERIOD, -1.0, 0.0):
+    try:
+        lr.find_pulse_comb(x, FS, PERIOD, remove_period_s=bad)
+        check(f"remove_period_s={bad} is refused", False)
+    except ValueError:
+        check(f"remove_period_s={bad} is refused", True)
+
 # ---------------------------------------------------------------- average pulse
 
 tt, mean, std, n_win = lr.average_pulse(x, FS, comb.times, pre_s=0.5e-3, post_s=2e-3)
