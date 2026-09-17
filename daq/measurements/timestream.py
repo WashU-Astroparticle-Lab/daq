@@ -62,6 +62,8 @@ __all__ = [
     "DEFAULT_BIAS_PREFIX",
     "DEFAULT_QUANTITY",
     "FloatAny",
+    "DEFAULT_SAVE_ARRAYS",
+    "DEFAULT_SAVE_DTYPE",
     "MAX_TRIGGER_PORTS",
     "SAVE_ARRAYS",
     "SAVE_DTYPES",
@@ -115,6 +117,9 @@ SAVE_DTYPES: Tuple[str, ...] = ("complex64", "complex128")
 presto returns complex128, but the ADC is 14-bit and the demodulated samples carry nothing
 below complex64's 24-bit mantissa, so the default halves the file again at no cost.
 """
+
+DEFAULT_SAVE_ARRAYS: str = "signal"
+DEFAULT_SAVE_DTYPE: str = "complex64"
 
 
 class TimeStream(Base):
@@ -180,8 +185,8 @@ class TimeStream(Base):
         notes: Optional[str] = None,
         external_trigger: TriggerAny = False,
         discard_start_ms: float = 25.0,
-        save_arrays: str = "signal",
-        save_dtype: str = "complex64",
+        save_arrays: str = DEFAULT_SAVE_ARRAYS,
+        save_dtype: str = DEFAULT_SAVE_DTYPE,
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)

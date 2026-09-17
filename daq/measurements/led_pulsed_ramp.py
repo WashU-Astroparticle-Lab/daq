@@ -17,7 +17,13 @@ from ..instruments import DC2200, Agilent33220A
 from ..triggers import TriggerAny, describe_trigger_states, resolve_trigger_states
 from ._gate_bias import GateBiasMeasurement
 from .sweep_std_dev import MAX_IF_HZ, MAX_TONES
-from .timestream import TimeStream
+from .timestream import (
+    DEFAULT_SAVE_ARRAYS,
+    DEFAULT_SAVE_DTYPE,
+    SAVE_ARRAYS,
+    SAVE_DTYPES,
+    TimeStream,
+)
 
 __all__ = ["LEDPulsedRamp"]
 
@@ -245,8 +251,15 @@ class LEDPulsedRamp(GateBiasMeasurement):
             None if trigger_states is None else self._check_trigger_states(trigger_states)
         )
         self.trigger_states = self._trigger_states_arg
-        self.save_arrays = save_arrays
-        self.save_dtype = save_dtype
+        # Resolved here rather than left as None: the record stores what the stream wrote,
+        # and Base._save cannot store a None.
+        self.save_arrays = DEFAULT_SAVE_ARRAYS if save_arrays is None else str(save_arrays)
+        self.save_dtype = DEFAULT_SAVE_DTYPE if save_dtype is None else str(save_dtype)
+        if self.save_arrays not in SAVE_ARRAYS or self.save_dtype not in SAVE_DTYPES:
+            raise ValueError(
+                f"save_arrays must be one of {sorted(SAVE_ARRAYS)} and save_dtype one of "
+                f"{list(SAVE_DTYPES)}, got {self.save_arrays!r}, {self.save_dtype!r}"
+            )
 
         # Results - replaced by run()
         self.raw_file = None
