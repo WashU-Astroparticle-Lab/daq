@@ -48,6 +48,9 @@ __all__ = [
     "fit_notch",
     "readout_environmental_term",
     "resonator_tools_available",
+    "resonator_phase",
+    "sweep_theta_table",
+    "dtheta_to_dx",
 ]
 
 #: Relative tolerance for the self-consistency check in :func:`fit_notch`. The
@@ -195,8 +198,7 @@ def readout_environmental_term(
                 f"fr = {fr / 1e9:.6f} GHz, which assumes it was acquired on resonance. "
                 f"{remedy} to normalize at the frequency actually used. Data taken off "
                 "resonance instead keeps an uncorrected cable-delay phase "
-                "2*pi*(f_ro - fr)*tau, which rotates it rigidly about the origin."
-                + sensitivity,
+                "2*pi*(f_ro - fr)*tau, which rotates it rigidly about the origin." + sensitivity,
                 stacklevel=stacklevel,
             )
         if freq_arr is not None:
@@ -431,3 +433,201 @@ def fit_notch(
     port.fitresults.update(extras)
 
     return port
+
+
+# ---------------------------------------------------------------- resonator phase (KID)
+
+
+def _fitresults_of(fit: Any) -> Dict[str, Any]:
+    """Accept a ``fit_notch`` ``fitresults`` mapping or a measurement carrying one."""
+    if isinstance(fit, dict):
+        return fit
+    results = getattr(fit, "fit_results", None)
+    if not isinstance(results, dict):
+        raise TypeError("fit must be a fit_notch fitresults mapping or a fitted Sweep")
+    return results
+
+
+def _canonical_circle(fit: Dict[str, Any]) -> Tuple[float, float, float, float]:
+    """Return ``(center, radius, fr, Ql)`` of the notch circle in the calibrated frame.
+
+    After dividing out the environmental term and ``e^{i phi0}``, the notch response is
+    ``1 - d / (1 + 2i Ql (f/fr - 1))`` with ``d = Ql / |Qc|``: a circle through the
+    off-resonance point ``(1, 0)`` with centre ``1 - d/2`` on the real axis and radius ``d/2``.
+    """
+    ql = float(fit["Ql"])
+    d = ql / float(fit["absQc"])
+    return 1.0 - d / 2.0, d / 2.0, float(fit["fr"]), ql
+
+
+def _canonical_theta(freq: npt.ArrayLike, fit: Dict[str, Any]) -> npt.NDArray[np.floating]:
+    """Model phase angle about the canonical circle's centre at *freq*."""
+    center, _, fr, ql = _canonical_circle(fit)
+    d = 2.0 * (1.0 - center)
+    x = np.asarray(freq, dtype=np.float64) / fr - 1.0
+    tsz = 1.0 - d / (1.0 + 2j * ql * x)
+    return np.angle(tsz - center)
+
+
+def resonator_phase(
+    ts: npt.ArrayLike,
+    fit: Any,
+    readout_freq: float,
+    *,
+    warn: bool = True,
+) -> Dict[str, Any]:
+    """Express single-frequency readout data as phase and radius on the resonator circle.
+
+    The KID's coordinate system, after ``straxion``'s ``DxRecords``: put the data on the
+    calibrated notch circle (:func:`fit_notch`'s environmental term evaluated **at the readout
+    frequency**, then ``e^{i phi0}`` divided out -- the same normalisation as
+    :func:`~daq.analysis.noise.from_elec_to_reson`), and measure the angle about the circle's
+    centre with the off-resonance point at ``theta = 0`` and the resonance at ``pi``. A
+    frequency shift of the resonator moves the point along the circle, so ``dtheta`` is the
+    frequency-like channel and the fractional radius ``dr`` the dissipation-like one. No new
+    circle fit: ``fit_notch`` already is one, and its calibration is exact for a notch.
+
+    ``dtheta`` is measured from the **model's** angle at *readout_freq*, not from the data's
+    mean, so a slow drift of the operating point is visible rather than subtracted; subtract a
+    per-file baseline downstream if that is wanted. Convert to a fractional frequency shift with
+    :func:`dtheta_to_dx`.
+
+    :param ts: Complex readout samples, any shape (one tone).
+    :param fit: A :func:`fit_notch` ``fitresults`` mapping, or a fitted ``Sweep``.
+    :param readout_freq: Frequency in hertz *ts* was acquired at (``signal_freqs[tone]``).
+    :param warn: Forwarded to :func:`readout_environmental_term`.
+    :returns: ``theta`` (rad, in ``(-pi, pi]``), ``dtheta`` (rad, wrapped to ``(-pi, pi]``),
+        ``dr`` (``|tsz - c| / r - 1``), ``theta_ro`` (the model angle at *readout_freq*),
+        ``tsz`` (the calibrated complex samples), ``center``, ``radius``.
+
+    """
+    results = _fitresults_of(fit)
+    readout_freq = validate_readout_freq(readout_freq)
+    env_ro = readout_environmental_term(
+        results, readout_freq, warn=warn, caller="resonator_phase", stacklevel=3
+    )
+    z = np.asarray(ts, dtype=np.complex128)
+    tsz = (z / env_ro - 1.0) / np.exp(1j * float(results["phi0"])) + 1.0
+    center, radius, _, _ = _canonical_circle(results)
+    theta = np.angle(tsz - center)
+    theta_ro = float(_canonical_theta(readout_freq, results))
+    dtheta = np.angle(np.exp(1j * (theta - theta_ro)))
+    dr = np.abs(tsz - center) / radius - 1.0
+    return {
+        "theta": theta,
+        "dtheta": dtheta,
+        "dr": dr,
+        "theta_ro": theta_ro,
+        "tsz": tsz,
+        "center": center,
+        "radius": radius,
+    }
+
+
+def sweep_theta_table(
+    freq_arr: npt.NDArray[np.float64],
+    resp_arr: npt.NDArray[np.complex128],
+    fit: Any,
+) -> Tuple[npt.NDArray[np.floating], npt.NDArray[np.floating]]:
+    """Return the measured ``(theta, freq)`` table of a sweep on the canonical circle.
+
+    Each sweep point is normalised by its own environmental term and put on the circle exactly
+    as :func:`resonator_phase` does with single-frequency data, so the table maps a phase to
+    the frequency that produced it *in the data*. The angle is taken on ``[0, 2 pi)``, where
+    it is continuous through the resonance (``pi``) and falls monotonically with frequency --
+    far above resonance near 0, far below near ``2 pi``.
+
+    Only the monotonic stretch around the resonance is kept: walking outward from the point
+    nearest ``pi``, the table stops at the first reversal on either side. A shallow notch
+    normalised with an imperfectly fitted cable delay folds its far-off tails back across
+    ``theta = 0`` (the delay residual rotates them about the origin, which on a small circle
+    is a large angle about the centre), and a folded table would map one angle to two
+    frequencies. Queries outside the kept stretch clamp to its ends.
+
+    :param freq_arr: Sweep frequencies in hertz.
+    :param resp_arr: Complex S21 at those frequencies.
+    :param fit: The sweep's :func:`fit_notch` ``fitresults`` (or the fitted ``Sweep``).
+    :returns: ``(theta, freq)``, both 1-D, ``theta`` strictly increasing and ``freq``
+        strictly decreasing.
+
+    """
+    results = _fitresults_of(fit)
+    freq_arr = np.asarray(freq_arr, dtype=np.float64)
+    order = np.argsort(freq_arr)
+    freq = freq_arr[order]
+    env = environmental_term(
+        freq,
+        results["environmental_amp_norm"],
+        results["environmental_alpha"],
+        results["environmental_delay"],
+    )
+    tsz = (np.asarray(resp_arr, dtype=np.complex128)[order] / env - 1.0) / np.exp(
+        1j * float(results["phi0"])
+    ) + 1.0
+    center, _, _, _ = _canonical_circle(results)
+    theta = np.mod(np.angle(tsz - center), 2.0 * np.pi)
+    k0 = int(np.argmin(np.abs(theta - np.pi)))
+    right = k0
+    while right + 1 < theta.size and theta[right + 1] < theta[right]:
+        right += 1
+    left = k0
+    while left - 1 >= 0 and theta[left - 1] > theta[left]:
+        left -= 1
+    segment = slice(left, right + 1)
+    # Ascending theta for interpolation; frequency then descends.
+    return theta[segment][::-1].copy(), freq[segment][::-1].copy()
+
+
+def dtheta_to_dx(
+    dtheta: npt.ArrayLike,
+    fit: Any,
+    readout_freq: float,
+    *,
+    sweep: Optional[Tuple[npt.ArrayLike, npt.ArrayLike]] = None,
+) -> npt.NDArray[np.floating]:
+    """Convert a phase excursion on the resonator circle to a fractional resonance shift.
+
+    A resonator shifted by ``delta_fr`` and read at ``f_ro`` looks like the unshifted one read
+    at ``f_ro - delta_fr``, so inverting the phase-versus-frequency relation gives the shift:
+    ``dx = delta_fr / fr = (f_ro - f(theta)) / fr``. Negative for a resonance that moved
+    **down** -- the sign of a photon absorbed by a KID. The full nonlinearity of the circle is
+    kept, which a pulse that swings a good fraction of the linewidth needs.
+
+    Two sources of ``f(theta)``:
+
+    - **the sweep itself** (``sweep=(freq_arr, resp_arr)``, recommended): the measured
+      ``theta(f)`` table of :func:`sweep_theta_table`, interpolated -- ``straxion``'s
+      dtheta -> frequency map. Exact wherever the sweep sampled, independent of how well the
+      fit's ``Ql`` describes the line shape;
+    - **the fitted model** (``sweep=None``): on the canonical circle
+      ``2 Ql (f/fr - 1) = cot(theta / 2)`` exactly, so the phase inverts in closed form. Exact
+      far off the swept span, but only as good as the fit's ``Ql`` -- and upstream
+      ``resonator_tools`` overestimates ``Ql`` on a *shallow* notch (18 % at
+      ``Ql/|Qc| = 0.05``, 6 % at 0.17, none at 0.67, on noiseless synthetic data), which a
+      KID read out at a few percent dip depth is. The sweep table does not inherit that bias;
+      the operating point ``theta_ro`` used by :func:`resonator_phase` does, so
+      ``dtheta`` carries a constant offset which the *sweep* path removes by construction only
+      when the same fit and readout frequency are used throughout. Prefer the sweep.
+
+    :param dtheta: Phase excursions in radians from :func:`resonator_phase`.
+    :param fit: The same fit the phases were computed with.
+    :param readout_freq: The readout frequency the phases were computed at.
+    :param sweep: ``(freq_arr, resp_arr)`` of the sweep *fit* came from.
+    :returns: Fractional resonance shift, same shape as *dtheta*.
+
+    """
+    results = _fitresults_of(fit)
+    readout_freq = validate_readout_freq(readout_freq)
+    _, _, fr, ql = _canonical_circle(results)
+    dtheta = np.asarray(dtheta, dtype=np.float64)
+    # Absolute angle on the circle: dtheta is measured from the model's operating point, and
+    # both paths invert the *absolute* angle, so that convention drops out.
+    theta = float(_canonical_theta(readout_freq, results)) + dtheta
+    if sweep is not None:
+        theta_tab, freq_tab = sweep_theta_table(sweep[0], sweep[1], results)
+        f_equiv = np.interp(np.mod(theta, 2.0 * np.pi), theta_tab, freq_tab)
+        return (readout_freq - f_equiv) / fr
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x = 1.0 / np.tan(theta / 2.0) / (2.0 * ql)
+    f_equiv = fr * (1.0 + x)
+    return (readout_freq - f_equiv) / fr
