@@ -1096,15 +1096,46 @@ The Mattis-Bardeen module uses the following built-in constants (aluminum):
 
 ## Per-period digitisation (`qc_periods.py`)
 
-The home of the sawtooth-bin std analysis. So far it owns the I/Q principal axis every
-consumer shares:
+The sawtooth-bin analysis: one state per gate period. Numpy only (scipy for the cut).
 
 ```python
-from daq.analysis.qc_periods import principal_axis, project
+from daq.analysis.qc_periods import period_std, two_mode_cut, classify_periods, state_onsets
 
-axis, origin = principal_axis(ts.signal[:, tone])   # [I, Q] unit vector, complex mean
-x = project(ts.signal[:, tone], axis, origin)       # real series along it
+ps = period_std(ts.signal, ts.df, 1 / ramp_freq_hz)      # per-file principal axis per tone, ddof=1
+# ps.std[n_periods, n_tones], ps.time_edges_s, ps.counts, ps.axis, ps.origin
+
+cut = two_mode_cut(dark_std_for_device)                   # pool the night's dark files per device
+if cut.resolved:                                          # never a forced threshold
+    states = classify_periods(ps.std[:, tone], cut.cut)   # 1 suppressed (event), 0 normal, -1 unknown
+    onsets = state_onsets(states, ps.time_edges_s)[0]     # 0 -> 1 transitions, seconds
 ```
 
-`StdDevSweep` ranks on this same axis. It is the covariance's principal direction, not
-`qpd`'s two-blob discrimination axis — a ramped QC trace is a curve, not two clusters.
+`principal_axis(z)` / `project(z, axis, origin)` are the shared I/Q axis (`StdDevSweep` ranks on
+it too). Period edges are timestamps rounded per period, so a non-integral `fs / ramp` never
+drifts. The cut is the reference heuristic (midpoint of two resolved modes in a smoothed
+histogram) with a 5 % prominence floor: a suppressed population below a few percent of periods
+is reported as unresolved, not thresholded.
+
+## LED response (`led_response.py`)
+
+Locate a software-started flash train on a marker tone, average its pulse, fold events on it.
+
+```python
+from daq.analysis.led_response import find_pulse_comb, average_pulse, fold_events, folded_event_rate
+from daq.analysis.resonator import resonator_phase, dtheta_to_dx
+
+kid = resonator_phase(ts.signal[:, kid_tone], sweep.fit_results, ts.signal_freqs[kid_tone])
+comb = find_pulse_comb(kid["dtheta"], ts.df, led_period_s)      # phase from the *folded* profile
+t, pulse, pulse_std, n = average_pulse(kid["dtheta"], ts.df, comb.times, pre_s=1e-3, post_s=5e-3)
+dx_pulse = dtheta_to_dx(pulse, sweep.fit_results, ts.signal_freqs[kid_tone],
+                        sweep=(sweep.freq_arr, sweep.resp_arr))  # fractional resonance shift
+
+events = ps.centers_s[states == 1]                                # suppressed periods = events
+folded, n_cycles = fold_events(events, comb.phase_s, led_period_s, ts.signal.shape[0] / ts.df)
+rate, err, edges = folded_event_rate(folded, n_cycles, led_period_s, bins=250)  # one gate period per bin
+```
+
+Pool a night by concatenating `folded` and summing `n_cycles` across files. `comb.snr_single`
+and `comb.snr_folded` say whether the marker resolved single flashes or only the fold;
+`comb.detected` is the folded SNR ≥ 5. The `dtheta_to_dx` sweep table is preferred over the
+closed form because `resonator_tools` overestimates `Ql` on shallow notches (see CLAUDE.md).
