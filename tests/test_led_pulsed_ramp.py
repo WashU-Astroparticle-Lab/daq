@@ -372,10 +372,13 @@ check("per-tone amplitudes forwarded", np.asarray(kw["amp"]).tolist() == [0.01, 
 check(
     "storage settings forwarded", kw["save_arrays"] == "pixels" and kw["save_dtype"] == "complex128"
 )
-run(make())
+m_default = make()
+run(m_default)
 check(
-    "storage keys are left to TimeStream's defaults when unset",
-    "save_arrays" not in FakeTimeStream.instances[0].kwargs,
+    "storage defaults are resolved and forwarded explicitly (the record must store them)",
+    FakeTimeStream.instances[0].kwargs["save_arrays"] == "signal"
+    and FakeTimeStream.instances[0].kwargs["save_dtype"] == "complex64"
+    and (m_default.save_arrays, m_default.save_dtype) == ("signal", "complex64"),
 )
 check("sample count covers the duration", kw["pixel_counts"] == int(round(0.02 * FS)))
 check("discard defaults to zero", kw["discard_start_ms"] == 0.0)
