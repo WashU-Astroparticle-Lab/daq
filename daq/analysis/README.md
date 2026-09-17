@@ -1093,3 +1093,18 @@ The Mattis-Bardeen module uses the following built-in constants (aluminum):
 | `Boltz_k` | 8.617e-5 | eV/K | Boltzmann constant |
 | `N_0` | 1.72e28 | m^-3 eV^-1 | Single-spin density of states |
 | `Planck_h` | 4.136e-15 | eV s | Planck constant |
+
+## Per-period digitisation (`qc_periods.py`)
+
+The home of the sawtooth-bin std analysis. So far it owns the I/Q principal axis every
+consumer shares:
+
+```python
+from daq.analysis.qc_periods import principal_axis, project
+
+axis, origin = principal_axis(ts.signal[:, tone])   # [I, Q] unit vector, complex mean
+x = project(ts.signal[:, tone], axis, origin)       # real series along it
+```
+
+`StdDevSweep` ranks on this same axis. It is the covariance's principal direction, not
+`qpd`'s two-blob discrimination axis — a ramped QC trace is a curve, not two clusters.

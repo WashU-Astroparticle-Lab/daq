@@ -86,6 +86,16 @@ results.
 - `discard_start_ms`: Milliseconds of startup junk dropped from the in-memory
   time-axis arrays after `run()`/`load()` (default `25.0`; set `0` to keep
   everything). The saved HDF5 keeps the full, untrimmed acquisition.
+- `save_arrays`: Which per-sample arrays the HDF5 file keeps — `"signal"` (default:
+  the per-tone selected sideband, what every analysis reads), `"pixels"` (the
+  `pixel_i`/`pixel_q` demodulator pair; `load()` rebuilds `lsb`/`usb`/`signal` from it
+  exactly, and it additionally holds each tone's image sideband as an off-resonance
+  reference), or `"all"` (every array — the historical file, five times the size of
+  `"signal"`). The in-memory object after `run()` always holds all five.
+- `save_dtype`: On-disk dtype of those arrays, `"complex64"` (default) or
+  `"complex128"`. presto returns complex128, but a 14-bit ADC's demodulated samples
+  carry nothing below a 24-bit mantissa. At 100 kHz × 13 tones the defaults make a
+  10 s file 104 MB instead of 1.04 GB.
 - `external_trigger`: Which Presto digital output ports assert a trigger during the
   acquisition, used to gate external instruments. `False` (default) triggers nothing;
   `True` is shorthand for `[1]` (port 1 only). Prefer `trigger_for(bias, led)`, which
@@ -890,6 +900,56 @@ completes.
 
 ---
 
+### 9. LEDPulsedRamp (`led_pulsed_ramp.py`)
+
+**Purpose**: One gated gate-ramp time stream of every device, recorded while a DC2200
+fires a train of LED flashes — the acquisition unit of an LED-response campaign.
+
+**Key Features**:
+- Multitone: every tone in `readout_freqs` read out at once (fixed LO, automatic sideband,
+  per-tone amplitude), through the same builder as `StdDevSweep`'s rows
+- The ramp is gated on the bias generator's own Presto port, as `QCTrace` does
+- The LED runs the DC2200's **internal** pulse engine, started by a software write inside
+  `TimeStream.run(on_acquire=…)` — immediately before the pixels are requested. Not a
+  hardware sync: the flash phase must be read off the data (a KID tone in the record)
+- `led_current_a=0` is a **dark** file: the same acquisition, LED never enabled
+- **Never asserts the LED's trigger port** — in pulse mode the DC2200's modulation SMA is
+  an *output*, so a routing that includes it is refused before any hardware moves
+- Checks the DC2200 current limit against `expected_led_limit_a` (pulse amplitude is a
+  percentage of that front-panel limit) and the protection flags before arming the ramp;
+  LED and gate outputs forced off on every exit path
+
+**Key Parameters** (keyword-only after the four Presto arguments):
+- `readout_freqs`, `amp`: one frequency and one drive per tone (scalar `amp` broadcast)
+- `duration_s`: usable record length after the discarded start
+- `led_on_s`, `led_period_s`, `led_current_a`: the flash train; `led_period_s` should be a
+  whole number of gate periods (warned otherwise)
+- `expected_led_limit_a`, `led_terminal`: what the DC2200 must read back / which output
+- `ramp_vpp`, `ramp_freq_hz`, `sampling_frequency`: required, no lab defaults
+- `discard_start_ms`: defaults to `0` — the flashes start at sample zero
+- `lo_freq`, `tone_labels`, `save_arrays`, `save_dtype`, `trigger_states`
+
+```python
+from daq import Agilent33220A, DC2200, LEDPulsedRamp
+
+with Agilent33220A() as bias, DC2200() as led:
+    rec = LEDPulsedRamp(
+        readout_freqs=freqs, amp=amps, output_port=1, input_port=1,
+        duration_s=5.0, led_on_s=100e-6, led_period_s=50e-3, led_current_a=0.099,
+        expected_led_limit_a=0.2, led_terminal=2,
+        ramp_vpp=0.4, ramp_freq_hz=5e3, sampling_frequency=1e5,
+        tone_labels=labels, device="B260416-NG-D2", filter=chain,
+    )
+    rec.run(bias, led)          # stream saved with attach(led=, led_plan=, host=, bias=)
+    rec.analyze(window_s=0.2)   # quick look: principal-axis projection per tone
+dark = LEDPulsedRamp(..., led_current_a=0.0)   # same acquisition, LED never enabled
+```
+
+`run()` returns the path of the `led_pulsed_ramp` record (tone list, LED plan, `dark`,
+routing, `raw_file`, tuned `df_tuned`/`n_samples`, host stamps); the stream is at
+`rec.raw_file` and, until the object goes away, on `rec.led_stream`. `load()` restores the
+record, not the stream.
+
 ## Common Parameters
 
 All measurements share these common parameters:
@@ -923,7 +983,10 @@ All `run()` methods accept:
 All measurements save data in HDF5 format with:
 - **Automatic Filenaming**: `{number}-{device}-{type}.h5`
 - **Metadata Storage**: All parameters stored as HDF5 attributes
-- **Data Arrays**: Measurement data stored as HDF5 datasets
+- **Data Arrays**: Measurement data stored as HDF5 datasets. `TimeStream` stores only
+  the per-sample arrays its `save_arrays` names (default `signal`, as complex64) and
+  declares the choice in the file's attributes; `load()` sets the arrays a file does
+  not hold to `None`, and a file from before the attribute existed loads as `"all"`.
 - **Source Code**: Original measurement script saved for reference
 
 ---

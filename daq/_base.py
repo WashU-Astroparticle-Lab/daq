@@ -2,7 +2,7 @@
 
 from datetime import datetime
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import h5py
 import numpy as np
@@ -90,6 +90,32 @@ class Base:
                 written.append(attribute)
             attached[name] = tuple(written)
 
+    def _hdf5_skip(self) -> Set[str]:
+        """Attribute names :meth:`_save` leaves out of the HDF5 file.
+
+        A measurement stores every public attribute by default. A subclass whose in-memory
+        state holds arrays that are exact recomputations of others -- ``TimeStream`` and its
+        sidebands -- overrides this so the file carries the information once rather than
+        several times over. The attributes stay on the object; only the file is affected.
+
+        :returns: The names to skip. Empty here.
+
+        """
+        return set()
+
+    def _hdf5_dataset(self, name: str, value: Any) -> Any:
+        """Return what :meth:`_save` writes for the array attribute *name*.
+
+        The default stores the attribute as it is. A subclass can narrow the on-disk dtype
+        here without touching the object the method is called on.
+
+        :param name: The attribute's name.
+        :param value: The attribute's value.
+        :returns: The array handed to ``h5py``.
+
+        """
+        return value
+
     def _save(self, script_path: str, save_filename: Optional[str] = None) -> str:
         script_path = os.path.realpath(script_path)
         
@@ -146,6 +172,7 @@ class Base:
             for ii, line in enumerate(source_code):
                 ds[ii] = line
             
+            skip = self._hdf5_skip()
             for attribute in self.__dict__:
                 try:
                     if attribute.startswith("_"):
@@ -154,13 +181,16 @@ class Base:
                         # fit_results is a nested dict used for DB logging only
                         # and may contain non-HDF5 compatible objects
                         continue
+                    if attribute in skip:
+                        continue
                     if attribute in ["jpa_params", "clear"]:
                         h5f.attrs[attribute] = str(self.__dict__[attribute])
                     elif np.isscalar(self.__dict__[attribute]):
                         h5f.attrs[attribute] = self.__dict__[attribute]
                     else:
                         h5f.create_dataset(
-                            attribute, data=self.__dict__[attribute]
+                            attribute,
+                            data=self._hdf5_dataset(attribute, self.__dict__[attribute]),
                         )
                 except Exception as err:
                     print(f"WARN: unable to save {attribute}: {err}")

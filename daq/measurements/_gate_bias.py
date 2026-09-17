@@ -217,6 +217,8 @@ class GateBiasMeasurement(Base):
         if_freqs: Optional[npt.ArrayLike] = None,
         is_usb: Optional[npt.ArrayLike] = None,
         amp: Optional[npt.ArrayLike] = None,
+        save_arrays: Optional[str] = None,
+        save_dtype: Optional[str] = None,
     ) -> TimeStream:
         """Build the time stream a gate-bias measurement acquires through.
 
@@ -235,9 +237,17 @@ class GateBiasMeasurement(Base):
         :param if_freqs: Per-tone IF in hertz. Defaults to a single zero-IF tone.
         :param is_usb: Per-tone sideband selection. Defaults to ``TimeStream``'s all-USB.
         :param amp: Per-tone drive in DAC full scale. Defaults to :attr:`amp`.
+        :param save_arrays: Which time-axis arrays the stream writes to HDF5. Defaults to
+            ``TimeStream``'s own default; see :data:`~daq.measurements.timestream.SAVE_ARRAYS`.
+        :param save_dtype: On-disk dtype of those arrays. Defaults likewise.
         :returns: The configured time stream.
 
         """
+        storage = {
+            key: value
+            for key, value in (("save_arrays", save_arrays), ("save_dtype", save_dtype))
+            if value is not None
+        }
         return TimeStream(
             lo_freq=self.readout_freq if lo_freq is None else lo_freq,
             if_freqs=[0.0] if if_freqs is None else if_freqs,
@@ -253,6 +263,7 @@ class GateBiasMeasurement(Base):
             notes=self._notes(notes),
             external_trigger=external_trigger,
             discard_start_ms=self.discard_start_ms,
+            **storage,
         )
 
     def _run_gated_ramp(

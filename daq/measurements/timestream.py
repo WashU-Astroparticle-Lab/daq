@@ -4,7 +4,7 @@ TimeStream measurement class for acquiring time-domain data with multiple freque
 """
 
 import warnings
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple, Union
 
 import h5py
 import numpy as np
@@ -63,6 +63,9 @@ __all__ = [
     "DEFAULT_QUANTITY",
     "FloatAny",
     "MAX_TRIGGER_PORTS",
+    "SAVE_ARRAYS",
+    "SAVE_DTYPES",
+    "TIME_AXIS_ARRAYS",
     "TimeStream",
     "TriggerAny",
     "resolve_trigger_states",
@@ -82,17 +85,53 @@ def _as_text(value: Any) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+TIME_AXIS_ARRAYS: Tuple[str, ...] = ("signal", "usb", "lsb", "pixel_i", "pixel_q")
+"""The per-sample arrays a stream holds, each of shape ``(n_samples, n_tones)``.
+
+``pixel_i``/``pixel_q`` are the two ADC demodulators, ``lsb``/``usb`` an exact 2x2 combination
+of them (:func:`presto.utils.untwist_downconversion`), and ``signal`` the sideband ``is_usb``
+selects per tone. One acquisition, stored five ways.
+"""
+
+SAVE_ARRAYS: Dict[str, Tuple[str, ...]] = {
+    "signal": ("signal",),
+    "pixels": ("pixel_i", "pixel_q"),
+    "all": TIME_AXIS_ARRAYS,
+}
+"""Which of :data:`TIME_AXIS_ARRAYS` each ``save_arrays`` choice writes to HDF5.
+
+``"signal"`` (the default) keeps the per-tone selected sideband, which is what every analysis
+in the repo consumes. ``"pixels"`` keeps the demodulator pair, from which ``load()`` rebuilds
+the sidebands and ``signal`` exactly -- the only extra information is each tone's *image*
+sideband at ``LO -/+ IF``, an off-resonance reference for
+:func:`~daq.analysis.noise.remove_correlated_noise`. ``"all"`` is the historical file with
+every array, five times the size of ``"signal"`` for nothing an analysis can use. The
+in-memory object is the same in all three cases; only the file differs.
+"""
+
+SAVE_DTYPES: Tuple[str, ...] = ("complex64", "complex128")
+"""On-disk dtypes for the time-axis arrays.
+
+presto returns complex128, but the ADC is 14-bit and the demodulated samples carry nothing
+below complex64's 24-bit mantissa, so the default halves the file again at no cost.
+"""
+
+
 class TimeStream(Base):
-    _CONSTRUCTOR_ATTRS = frozenset({
-        "lo_freq",
-        "df",
-        "pixel_counts",
-        "output_port",
-        "input_port",
-        "dither",
-        "discard_start_ms",
-        "external_trigger",
-    })
+    _CONSTRUCTOR_ATTRS = frozenset(
+        {
+            "lo_freq",
+            "df",
+            "pixel_counts",
+            "output_port",
+            "input_port",
+            "dither",
+            "discard_start_ms",
+            "external_trigger",
+            "save_arrays",
+            "save_dtype",
+        }
+    )
     """HDF5 attributes :meth:`load` consumes itself, and must not restore a second time.
 
     Everything *else* in a saved file's attributes belongs to something other than the
@@ -141,6 +180,8 @@ class TimeStream(Base):
         notes: Optional[str] = None,
         external_trigger: TriggerAny = False,
         discard_start_ms: float = 25.0,
+        save_arrays: str = "signal",
+        save_dtype: str = "complex64",
     ) -> None:
         self.lo_freq = lo_freq
         self.if_freqs = np.asarray(if_freqs, dtype=np.float64)
@@ -190,6 +231,13 @@ class TimeStream(Base):
         # in-memory time-axis arrays after run()/load() (the saved HDF5 keeps the
         # full acquisition). Set to 0 to keep everything.
         self.discard_start_ms = float(discard_start_ms)
+        # What run() writes to HDF5 -- see SAVE_ARRAYS / SAVE_DTYPES. The five
+        # time-axis arrays are one acquisition stored five ways, so the default
+        # keeps only `signal`, as complex64: a tenth of the historical file with
+        # nothing any analysis in the repo uses lost. The in-memory arrays after
+        # run() are untouched by either setting.
+        self.save_arrays = str(save_arrays)
+        self.save_dtype = str(save_dtype)
 
         # Data arrays - set by run method
         self.freq_arr = None
@@ -216,6 +264,27 @@ class TimeStream(Base):
         self.check_amp()
         self.check_sideband()
         self.check_discard()
+        self.check_save()
+
+    def check_save(self) -> None:
+        if self.save_arrays not in SAVE_ARRAYS:
+            raise ValueError(
+                f"save_arrays must be one of {sorted(SAVE_ARRAYS)}, got {self.save_arrays!r}"
+            )
+        if self.save_dtype not in SAVE_DTYPES:
+            raise ValueError(
+                f"save_dtype must be one of {list(SAVE_DTYPES)}, got {self.save_dtype!r}"
+            )
+
+    def _hdf5_skip(self) -> Set[str]:
+        """Leave out the time-axis arrays :attr:`save_arrays` does not keep."""
+        return set(TIME_AXIS_ARRAYS) - set(SAVE_ARRAYS[self.save_arrays])
+
+    def _hdf5_dataset(self, name: str, value: Any) -> Any:
+        """Write the time-axis arrays as :attr:`save_dtype`; everything else as is."""
+        if name in TIME_AXIS_ARRAYS and value is not None:
+            return np.asarray(value).astype(self.save_dtype, copy=False)
+        return value
 
     def check_amp(self) -> None:
         assert self.amp.shape == self.if_freqs.shape, (
@@ -287,7 +356,7 @@ class TimeStream(Base):
                 f"discard_start_ms={self.discard_start_ms} ms drops {n_discard} of "
                 f"{n_samples} samples at df={self.df} Hz; leaves fewer than 2 samples"
             )
-        for attr in ("signal", "usb", "lsb", "pixel_i", "pixel_q"):
+        for attr in TIME_AXIS_ARRAYS:
             arr = getattr(self, attr, None)
             if arr is not None:
                 setattr(self, attr, arr[n_discard:])
@@ -437,6 +506,13 @@ class TimeStream(Base):
                 external_trigger = bool(h5f.attrs["external_trigger"])
             else:
                 external_trigger = False
+            # Files written before save_arrays existed hold every array, as complex128.
+            save_arrays = (
+                _as_text(h5f.attrs["save_arrays"]) if "save_arrays" in h5f.attrs else "all"
+            )
+            save_dtype = (
+                _as_text(h5f.attrs["save_dtype"]) if "save_dtype" in h5f.attrs else "complex128"
+            )
 
             if_freqs: npt.NDArray[np.float64] = h5f["if_freqs"][()]  # type: ignore
             amp: npt.NDArray[np.float64] = h5f["amp"][()]  # type: ignore
@@ -497,6 +573,8 @@ class TimeStream(Base):
             dither=dither,
             external_trigger=external_trigger,
             discard_start_ms=discard_start_ms,
+            save_arrays=save_arrays,
+            save_dtype=save_dtype,
         )
 
         # Restore data arrays
@@ -510,8 +588,13 @@ class TimeStream(Base):
         self.signal = signal
         self.signal_freqs = signal_freqs
 
+        # A "pixels" file holds the demodulator pair only; the sidebands are the same
+        # exact combination run() computes from it.
+        if self.lsb is None and self.usb is None and pixel_i is not None and pixel_q is not None:
+            self.lsb, self.usb = untwist_downconversion(self.pixel_i, self.pixel_q)
         # Reconstruct the per-tone selected sideband for files saved before
-        # `signal`/`signal_freqs` existed (defaults to all-USB on those files).
+        # `signal`/`signal_freqs` existed (defaults to all-USB on those files), and
+        # for "pixels" files.
         if self.signal is None and self.usb is not None and self.lsb is not None:
             self.signal = np.where(self.is_usb[np.newaxis, :], self.usb, self.lsb)
         if self.signal_freqs is None and freqs_usb is not None and freqs_lsb is not None:

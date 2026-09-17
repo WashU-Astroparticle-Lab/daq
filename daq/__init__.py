@@ -8,6 +8,7 @@ from .calibrations import (
 from .instruments import Agilent33220A, DC2200, InstrumentError
 from .measurements import (
     BiasHunt,
+    LEDPulsedRamp,
     QCTrace,
     StdDevSweep,
     Sweep,
@@ -28,6 +29,7 @@ __all__ = [
     "DC2200",
     "InstrumentError",
     "BiasHunt",
+    "LEDPulsedRamp",
     "QCTrace",
     "StdDevSweep",
     "Sweep",
