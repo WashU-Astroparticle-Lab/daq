@@ -6,6 +6,8 @@ checked against are committed under ``daq/calibrations/source_data/``.
 """
 
 import csv
+import hashlib
+import tempfile
 import importlib.util
 import sys
 import warnings
@@ -54,75 +56,192 @@ def warned(fn):
 # ---------------------------------------------------------------------------
 # The model reproduces the measurements it was built from, wherever they are verifiable.
 # ---------------------------------------------------------------------------
-with np.load(REPO_ROOT / "daq" / "calibrations" / "power_calibration.npz") as asset:
-    tolerance_db = float(asset["floor_tolerance_db"])
-    cal_freqs = np.asarray(asset["frequency_ghz"])
-    cal_floors = np.asarray(asset["amp_floor"])
-
+with np.load(REPO_ROOT / "daq/calibrations/power_calibration.npz") as asset_file:
+    asset = {key: asset_file[key].copy() for key in asset_file.files}
+cal_freqs = asset["frequency_ghz"]
+cal_floors = asset["amp_floor"]
+tolerance_db = float(asset["floor_tolerance_db"])
+source_dir = REPO_ROOT / "daq/calibrations/source_data/2026-10-12"
+builder_spec = importlib.util.spec_from_file_location("calibration_builder", REPO_ROOT / "scripts/build_power_calibration.py")
+builder = importlib.util.module_from_spec(builder_spec)
+builder_spec.loader.exec_module(builder)
+warnings.simplefilter("ignore", CalibrationWarning)
 measurements = defaultdict(list)
-for path in sorted((REPO_ROOT / "daq" / "calibrations" / "source_data").glob("*combined*.csv")):
-    with path.open(newline="", encoding="utf-8-sig") as stream:
-        for row in csv.DictReader(stream):
-            measurements[float(row["freq_ghz"])].append(
-                (float(row["amp"]), float(row["power_dbm"]))
-            )
-check("source measurements are committed", len(measurements) >= 2, f"{len(measurements)} freqs")
+for row in builder.read_measurements(source_dir):
+    measurements[float(row["frequency_mhz"]) / 1000].append((
+        float(row["amplitude"]), float(row["median_peak_power_dbm"]),
+        row["review_signal_or_timing"] == "True"))
 check(
-    "every calibrated frequency has source data",
-    all(f in measurements for f in cal_freqs),
+    "251 unfiltered nodes; 14,200 selected observations",
+    len(measurements) == 251 and sum(map(len, measurements.values())) == 14200,
 )
-
+check("all calibration nodes have source measurements", set(cal_freqs) == set(measurements))
+check(
+    "source checksums match packaged provenance",
+    all(
+        hashlib.sha256((source_dir / str(name)).read_bytes()).hexdigest() == sha
+        for name, sha in zip(asset["source_files"], asset["source_sha256"])
+    ),
+)
 worst = 0.0
-n_verified = 0
-n_warned_above_floor = 0
-n_silent_below_floor = 0
-for frequency, points in sorted(measurements.items()):
-    floor = min_verified_amp(frequency)
-    for amplitude, measured in points:
-        modeled, n_warn = warned(lambda: amp_to_power_dbm(frequency, amplitude))
+n_verified = n_warned_above_floor = n_silent_below_floor = n_flagged_above_floor = 0
+for f, points in sorted(measurements.items()):
+    floor = min_verified_amp(f)
+    for amplitude, measured, flagged in points:
+        modeled, n_warn = warned(lambda: amp_to_power_dbm(f, amplitude))
         if amplitude >= floor:
             n_verified += 1
-            worst = max(worst, measured - modeled)
+            worst = max(worst, abs(measured - modeled))
             n_warned_above_floor += n_warn
+            n_flagged_above_floor += flagged
         else:
             n_silent_below_floor += n_warn == 0
 check(
-    "model reproduces every measurement above the verified floor",
+    "verified measurements agree with model on BOTH sides",
     worst <= tolerance_db,
-    f"{n_verified} points, worst measured-minus-model {worst:.3f} dB <= {tolerance_db:g} dB",
+    f"{n_verified} points, worst absolute residual {worst:.6f} dB",
 )
-check("no warning is raised above the verified floor", n_warned_above_floor == 0)
-check("every point below the verified floor warns", n_silent_below_floor == 0)
+check("no acquisition review flags above empirical floor", n_flagged_above_floor == 0)
+check("no warning above empirical floor", n_warned_above_floor == 0)
+check("every point below empirical floor warns", n_silent_below_floor == 0)
 check(
-    "verified floors lie inside the measured amplitude span",
-    np.all(cal_floors > 0.0) and np.all(cal_floors < 1.0),
-    f"{cal_floors.min():.4f} to {cal_floors.max():.4f}",
+    "floors stay within measured amplitude range",
+    np.all(cal_floors >= 0.001) and np.all(cal_floors < 1),
+)
+check(
+    "low-band full-scale reading is reproduced",
+    abs(amp_to_power_dbm(0.1, 1) - 4.355325698852539) < 0.03,
+)
+check("9 GHz full-scale reading is reproduced", abs(amp_to_power_dbm(9, 1) - (-11.373)) < 0.1)
+
+# Every measured node, including the transition endpoints, survives Hz roundoff.
+check(
+    "all exact measured nodes reproduce the fitted asset",
+    all(amp_to_power_dbm(float(f), 1) == p for f, p in zip(cal_freqs, asset["power_dbm_at_amp_1"])),
+)
+check(
+    "Hz conversion preserves every measured node",
+    all(
+        amp_to_power_dbm_hz(float(f) * 1e9, 1) == p
+        for f, p in zip(cal_freqs, asset["power_dbm_at_amp_1"])
+    ),
+)
+check(
+    "adjacent-ULP roundoff preserves measured transition nodes",
+    all(
+        amp_to_power_dbm(float(np.nextafter(f, np.inf)), 1) == p
+        for f, p in zip(cal_freqs, asset["power_dbm_at_amp_1"])
+    ),
+)
+allowed = asset["interpolation_allowed"]
+allowed_ok = blocked_ok = floors_ok = True
+for i, ok in enumerate(allowed):
+    f = float((cal_freqs[i] + cal_freqs[i + 1]) / 2)
+    if ok:
+        expected = (asset["power_dbm_at_amp_1"][i] + asset["power_dbm_at_amp_1"][i + 1]) / 2
+        allowed_ok &= np.isclose(amp_to_power_dbm(f, 1), expected)
+        floors_ok &= min_verified_amp(f) == max(cal_floors[i : i + 2])
+    else:
+        blocked_ok &= all(
+            raises(fn)
+            for fn in (
+                lambda: amp_to_power_dbm(f, 0.1),
+                lambda: power_dbm_to_amp(f, -20),
+                lambda: amp_to_power_dbm_hz(f * 1e9, 0.1),
+                lambda: min_verified_amp(f),
+            )
+        )
+check("all allowed intervals interpolate between adjacent measured nodes", allowed_ok)
+check("all rejected intervals fail in BOTH conversions and floor query", blocked_ok)
+check("off-grid floors use the more conservative neighbor", floors_ok)
+check("issue69: 8 GHz jump is not blended", raises(lambda: amp_to_power_dbm(7.975, 1)))
+check(
+    "issue69: narrow 7 GHz mode interval is not skipped",
+    raises(lambda: amp_to_power_dbm(7.025, 1))
+    and np.isfinite(amp_to_power_dbm(7.05, 1))
+    and np.isfinite(amp_to_power_dbm(7.1, 1)),
+)
+check(
+    "switch endpoint uncertainty also rejects the other side",
+    raises(lambda: amp_to_power_dbm(8.025, 1)),
+)
+check("new gap is usable away from the 2.4 GHz switch", np.isfinite(amp_to_power_dbm(2.35, 0.1)))
+check("gap switch remains excluded", raises(lambda: amp_to_power_dbm(2.39, 0.1)))
+check("single-anchor nodes expose amplitude bounds", calibrations.verified_amp_range(.12) == (.1,.1))
+check("sparse amplitude checks expose their range", calibrations.verified_amp_range(.1) == (.01,1.) and calibrations.verified_amp_range(1.) == (.01,1.))
+for amplitude in [.01, .5, 1.]:
+    value, count = warned(lambda: amp_to_power_dbm(.12, amplitude))
+    inverse, inverse_count = warned(lambda: power_dbm_to_amp(.12, value))
+    check(f"single-anchor estimate warns both directions at {amplitude}", count==1 and inverse_count==1 and np.isclose(inverse,amplitude))
+value,count=warned(lambda:amp_to_power_dbm(.12,.1))
+inverse,inverse_count=warned(lambda:power_dbm_to_amp(.12,value))
+check("exact anchor forward/inverse does not spuriously warn", count==0 and inverse_count==0 and np.isclose(inverse,.1))
+check("filtered low-band table excluded", "low_power.csv" not in asset["source_files"] and "unfiltered" in str(asset["reference_plane"]))
+for name,freq_col,power_col in [("low_amplitude_checks.csv","frequency_mhz","median_peak_power_dbm"),("high_validation.csv","frequency_ghz","measured_power_dbm")]:
+    with (source_dir/name).open(newline="") as stream: checks=list(csv.DictReader(stream))
+    errors=[]
+    for r in checks:
+        f=float(r[freq_col])/(1000 if freq_col=="frequency_mhz" else 1)
+        errors.append(abs(float(r[power_col])-amp_to_power_dbm(f,float(r["amplitude"]))))
+    check("held-out hardware agreement: "+name,max(errors)<.2, f"max {max(errors):.6f} dB")
+
+check(
+    "all measured frequencies forward/inverse round-trip above floor",
+    all(
+        np.isclose(power_dbm_to_amp(float(f), amp_to_power_dbm(float(f), 0.1)), 0.1)
+        for f in cal_freqs
+    ),
 )
 
-# ---------------------------------------------------------------------------
-# Golden values at 2.8 GHz from the shipped asset (they move if the asset is rebuilt).
-# ---------------------------------------------------------------------------
-# A measured source-data point at 2.8 GHz. The four-corner grid this replaced returned
-# -51.4 dBm for it, 20 dB below the -31.44 dBm the analyzer read.
-measured_amp = 0.0390693993705461
-measured_power, n_warn = warned(lambda: amp_to_power_dbm(2.8, measured_amp))
+# Rebuilding from committed source must reproduce all arrays, not just rounded examples.
+builder_spec = importlib.util.spec_from_file_location(
+    "calibration_builder", REPO_ROOT / "scripts/build_power_calibration.py"
+)
+builder = importlib.util.module_from_spec(builder_spec)
+builder_spec.loader.exec_module(builder)
+rebuilt = builder.build_calibration(source_dir)
 check(
-    "2.8 GHz measured point is preserved",
-    np.isclose(measured_power, -31.44, atol=0.05) and n_warn == 0,
-    f"{measured_power:.4f} dBm",
+    "packaged asset rebuilds exactly from source",
+    set(rebuilt) == set(asset) and all(np.array_equal(rebuilt[k], asset[k]) for k in asset),
 )
 
-amp_minus_32, n_warn = warned(lambda: power_dbm_to_amp(2.8, -32.0))
-check(
-    "-32 dBm maps to the expected voltage fraction",
-    np.isclose(amp_minus_32, 0.03654, atol=5e-5) and n_warn == 0,
-    f"{amp_minus_32:.8f}",
-)
-check(
-    "thirteen -32 dBm tones remain below the conservative amplitude limit",
-    13.0 * amp_minus_32 < 1.0,
-    f"sum={13.0 * amp_minus_32:.6f}",
-)
+# Corruption, missing interval flags and obsolete assets must never enable interpolation.
+original_path = calibrations._DATA_PATH
+invalid_cases = {
+    "obsolete filtered schema": {"schema_version": np.array(2)},
+    "wrong schema type/value": {"schema_version": np.array(3.5)},
+    "nonfinite power": {"power_dbm_at_amp_1": np.full(len(cal_freqs), np.nan)},
+    "unordered frequencies": {"frequency_ghz": cal_freqs[::-1]},
+    "bad amplitude floor": {"amp_floor": np.zeros(len(cal_freqs))},
+    "bad amplitude ceiling": {"amp_ceiling": np.zeros(len(cal_freqs))},
+    "nonfinite amplitude ceiling": {"amp_ceiling": np.full(len(cal_freqs),np.nan)},
+    "wrong interval count": {"interpolation_allowed": np.ones(len(cal_freqs), dtype=bool)},
+    "nonboolean intervals": {"interpolation_allowed": allowed.astype(float)},
+}
+with tempfile.TemporaryDirectory() as temp:
+    try:
+        calibrations._DATA_PATH = Path(temp) / "calibration.npz"
+        for label, changes in invalid_cases.items():
+            np.savez_compressed(calibrations._DATA_PATH, **{**asset, **changes})
+            calibrations._load_calibration.cache_clear()
+            check(
+                "reject asset: " + label, raises(lambda: amp_to_power_dbm(2.8, 0.1), RuntimeError)
+            )
+        for missing in ("schema_version", "interpolation_allowed", "amp_floor", "amp_ceiling"):
+            np.savez_compressed(
+                calibrations._DATA_PATH, **{k: v for k, v in asset.items() if k != missing}
+            )
+            calibrations._load_calibration.cache_clear()
+            check(
+                "reject missing " + missing,
+                raises(lambda: amp_to_power_dbm(2.8, 0.1), RuntimeError),
+            )
+        calibrations._DATA_PATH.write_bytes(b"not a numpy archive")
+        calibrations._load_calibration.cache_clear()
+        check("reject corrupt asset", raises(lambda: amp_to_power_dbm(2.8, 0.1), RuntimeError))
+    finally:
+        calibrations._DATA_PATH = original_path
+        calibrations._load_calibration.cache_clear()
 
 # ---------------------------------------------------------------------------
 # The law itself.
@@ -172,14 +291,16 @@ _, n_warn = warned(lambda: amp_to_power_dbm(2.8, floor_28))
 check("amplitude exactly at the floor does not warn", n_warn == 0)
 check(
     "floor between calibrated frequencies is the larger neighbour",
-    min_verified_amp(2.9) == max(min_verified_amp(2.8), min_verified_amp(3.05)),
+    min_verified_amp(2.875) == max(min_verified_amp(2.85), min_verified_amp(2.9)),
 )
 
 # ---------------------------------------------------------------------------
 # Hardware limits and bad input are rejected outright.
 # ---------------------------------------------------------------------------
 for label, fn in (
-    ("out-of-range frequency is rejected", lambda: amp_to_power_dbm(2.0, 0.1)),
+    ("out-of-range frequency is rejected", lambda: amp_to_power_dbm(9.01, 0.1)),
+    ("below measured band is rejected", lambda: amp_to_power_dbm(0.09, 0.1)),
+    ("inverse underflow is rejected", lambda: power_dbm_to_amp(2.8, -1e6)),
     ("non-finite frequency is rejected", lambda: amp_to_power_dbm(float("nan"), 0.1)),
     ("zero amplitude is rejected", lambda: amp_to_power_dbm(2.8, 0.0)),
     ("amplitude above full scale is rejected", lambda: amp_to_power_dbm(2.8, 1.5)),

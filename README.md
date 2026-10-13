@@ -99,31 +99,46 @@ daq/
 `daq/utils.py` is a backward-compatible facade; new code should use `daq.config` and
 `daq.time_utils`.
 
-Power calibration is exported at top level — `amp_to_power_dbm(freq_ghz, amp)` and
-`power_dbm_to_amp(freq_ghz, power_dbm)` — so a measurement can be set up in dBm
-(`amp=power_dbm_to_amp(5.0, -20.0)`). Here `amp` is a full-scale voltage
-fraction, so its power dependence is `20 log10(amp)`; `SweepPower` and
-`TwoTonePower` label their axes with the calibration. Any `0 < |amp| <= 1` converts, but
-below `min_verified_amp(freq_ghz)` — the amplitude where the spectrum analyzer's own floor
-started hiding the tone during calibration — the conversion is an extrapolation of that law
-and raises a `CalibrationWarning` to say so.
+Power calibration is exported at top level: `amp_to_power_dbm(freq_ghz, amp)`,
+`amp_to_power_dbm_hz(freq_hz, amp)`, `power_dbm_to_amp(freq_ghz, power_dbm)`,
+`min_verified_amp(freq_ghz)` and `verified_amp_range(freq_ghz)`.
+The unfiltered v2 model uses **251 measured frequency nodes from 0.1 to 9 GHz**.
+Power is at the **analyzer input through the measurement cable**, without cable-loss
+correction. Amplitude is a dimensionless voltage fraction.
 
-The spectrum-analyzer sweeps the asset was built from are committed under
-`daq/calibrations/source_data/`. Regenerate the packaged asset—and optionally its diagnostic
-figure—with:
+The model is `P(A) = P1(f) + 20*log10(abs(A))`. The old filtered low-band powers are
+excluded. Direct unfiltered amplitude-0.1 anchors supply most low-band nodes; **98 nodes
+have only that amplitude measured**. Both conversions return estimates with
+`CalibrationWarning` outside their empirical amplitude bounds. Checks at 0.1 and 1 GHz
+support 0.01–1; 151 gap/high-band nodes have dense amplitude sweeps with quality floors.
 
-```bash
-python scripts/build_power_calibration.py --diagnostic-plot docs/power_calibration_diagnostic.png
+All measured nodes work. Twenty open intervals are excluded from frequency interpolation
+because they overlap coarse DAC-switch uncertainty windows or contain adjacent model-level
+jumps >1 dB. Excluded queries raise `ValueError`; other interpolation remains an estimate.
+
+```python
+from daq import amp_to_power_dbm, power_dbm_to_amp, verified_amp_range
+
+power = amp_to_power_dbm(5.2, 0.1)  # GHz, dimensionless amplitude -> dBm
+amplitude = power_dbm_to_amp(5.2, -20.0)
+supported_range = verified_amp_range(5.2)
 ```
 
-Two more figures document the calibration and can be regenerated the same way:
-`docs/power_calibration_interpolation.png` (`scripts/plot_power_calibration_interpolation.py`)
-shows how the conversions behave at frequencies with no calibration data — the interpolated
-full-scale power and verified floor across the band, every DAC-configuration switch, and nine
-off-grid frequencies drawn between their calibrated neighbours — and is the plot to check after
-any rebuild. `docs/power_calibration_before_after.png`
-(`scripts/plot_power_calibration_before_after.py`) compares it with the four-corner grid it
-replaced.
+See [calibration details and limits](docs/power_calibration_update.md). Twenty-four independent
+hardware spot observations differ from the model by at most 0.166 dB; this is not a full-band
+accuracy specification. Rebuild and validate offline (NumPy only):
+
+```bash
+python scripts/build_power_calibration.py
+python tests/test_calibrations.py
+python scripts/validate_power_calibration_update.py
+```
+
+Current sources and hashes are under `daq/calibrations/source_data/2026-10-12/` and in the
+NPZ asset. `python scripts/plot_power_calibration_update.py` regenerates the current figure
+(requires matplotlib). Historical filtered October 2 low-band data and March artifacts are
+retained separately; they are not inputs to the current model. Install the module and asset
+together. This update has not been installed on the hardware computer.
 
 ## Tests
 
