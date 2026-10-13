@@ -348,6 +348,8 @@ sp.analyze(norm=True, portrait=True)
 
 **Analysis**: 2D response heatmap (with the fitted `fr` overlaid as a scatter),
 plus best-fit `fr` and `Qi` (diag. corrected) vs. drive power with error bars.
+Pass `sp.analyze(show_errorbars=False)` to hide the error bars on both fitted
+parameter plots when the uncertainties are unreliable. Error bars are shown by default.
 Drive powers whose fit fails are omitted automatically.
 
 ---
