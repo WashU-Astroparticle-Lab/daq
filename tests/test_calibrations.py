@@ -1,6 +1,6 @@
 """Offline regression tests for the packaged DAC power and fridge-loss calibrations.
 
-Run from the repository root with ``python tests/test_calibrations.py``.  Needs only numpy: the
+Run from the repository root with ``python tests/test_calibrations.py``. Needs numpy and scipy: the
 module is loaded by path so ``presto`` is never imported, and the source measurements it is
 checked against are committed under ``daq/calibrations/source_data/``.
 """
@@ -196,20 +196,26 @@ for label, fn in (
 fridge_path = REPO_ROOT / "daq/calibrations/source_data/Empty_Line_port_2_-_2026-06-15.s2p"
 fridge_data = np.loadtxt(fridge_path, comments=["#", "!"])
 check(
-    "fridge loss reproduces all measured S21 magnitudes with attenuation positive",
-    np.allclose(nominal_fridge_loss(fridge_data[:, 0]), -fridge_data[:, 3], rtol=0, atol=1e-10),
+    "raw fridge loss reproduces all measured S21 magnitudes with attenuation positive",
+    np.allclose(
+        nominal_fridge_loss(fridge_data[:, 0], smooth=False),
+        -fridge_data[:, 3],
+        rtol=0,
+        atol=1e-10,
+    ),
 )
 check(
     "fridge-loss endpoints accept Hz and return a scalar float",
     isinstance(nominal_fridge_loss(1e10), float)
-    and np.isclose(nominal_fridge_loss(1e5), 72.0394968383)
-    and np.isclose(nominal_fridge_loss(1e10), 78.4864410019),
+    and np.isclose(nominal_fridge_loss(1e5, smooth=False), 72.0394968383)
+    and np.isclose(nominal_fridge_loss(1e10, smooth=False), 78.4864410019)
+    and np.all(np.isfinite(nominal_fridge_loss([1e5, 1e10]))),
 )
 midpoint_hz = (fridge_data[280, 0] + fridge_data[281, 0]) / 2
 check(
-    "fridge loss interpolates in dB between measured frequencies",
+    "raw fridge loss interpolates in dB between measured frequencies",
     np.isclose(
-        nominal_fridge_loss(midpoint_hz),
+        nominal_fridge_loss(midpoint_hz, smooth=False),
         -(fridge_data[280, 3] + fridge_data[281, 3]) / 2,
         rtol=0,
         atol=1e-10,
@@ -224,10 +230,51 @@ check(
         [nominal_fridge_loss(f) for f in fridge_grid.ravel()],
     ),
 )
+smoothed = nominal_fridge_loss(fridge_data[:, 0])
+check(
+    "smoothing is enabled by default and changes the measured ripple",
+    np.array_equal(smoothed, nominal_fridge_loss(fridge_data[:, 0], smooth=True))
+    and not np.allclose(smoothed, -fridge_data[:, 3]),
+)
+check(
+    "smoothing reduces point-to-point curvature of the measured curve",
+    np.std(np.diff(smoothed, n=2)) < 0.2 * np.std(np.diff(-fridge_data[:, 3], n=2)),
+)
+check(
+    "smoothed result interpolates between adjacent smoothed calibration values",
+    np.isclose(
+        nominal_fridge_loss(midpoint_hz), (smoothed[280] + smoothed[281]) / 2, rtol=0, atol=1e-10
+    ),
+)
+# A cubic trend must survive the cubic filter, including its edge fits. An alternating
+# perturbation should be suppressed. Swap only the source fixture and restore the cache.
+original_loader = calibrations._load_fridge_loss
+synthetic_freqs = np.linspace(1e5, 1e10, 101)
+x = np.linspace(-1, 1, 101)
+trend = 70 + 2 * x + x**2 + 0.5 * x**3
+try:
+    calibrations._load_fridge_loss = lambda: (synthetic_freqs, trend)
+    calibrations._smoothed_fridge_loss.cache_clear()
+    check(
+        "smoothing preserves a cubic trend including both band edges",
+        np.allclose(nominal_fridge_loss(synthetic_freqs), trend, rtol=0, atol=1e-10),
+    )
+    noisy = trend + 0.5 * (-1.0) ** np.arange(101)
+    calibrations._load_fridge_loss = lambda: (synthetic_freqs, noisy)
+    calibrations._smoothed_fridge_loss.cache_clear()
+    check(
+        "smoothing suppresses a synthetic alternating perturbation",
+        np.sqrt(np.mean((nominal_fridge_loss(synthetic_freqs) - trend) ** 2)) < 0.1,
+    )
+finally:
+    calibrations._load_fridge_loss = original_loader
+    calibrations._smoothed_fridge_loss.cache_clear()
+
 for bad_freq in (0.0, -1.0, 2.8, 9e4, 1.001e10, np.nan, np.inf, [2.8e9, np.nan], [2.8e9, 1.1e10]):
     check(
         f"fridge loss rejects invalid frequency {bad_freq}",
-        raises(lambda: nominal_fridge_loss(bad_freq)),
+        raises(lambda: nominal_fridge_loss(bad_freq))
+        and raises(lambda: nominal_fridge_loss(bad_freq, smooth=False)),
     )
 
 failed = [label for label, ok in results if not ok]

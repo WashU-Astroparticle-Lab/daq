@@ -68,14 +68,28 @@ def _load_fridge_loss() -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64
     return frequency_hz, loss_db
 
 
-def nominal_fridge_loss(freq_hz: FloatArray) -> FloatArray:
+@lru_cache(maxsize=1)
+def _smoothed_fridge_loss() -> npt.NDArray[np.float64]:
+    """Smooth the uniformly spaced measurement in dB, including polynomial edge fits."""
+    from scipy.signal import savgol_filter
+
+    _, loss_db = _load_fridge_loss()
+    return savgol_filter(loss_db, window_length=21, polyorder=3, mode="interp")
+
+
+def nominal_fridge_loss(freq_hz: FloatArray, *, smooth: bool = True) -> FloatArray:
     """Return nominal fridge insertion loss in dB at a frequency in Hz.
 
-    Linearly interpolates ``-S21_dB`` from the empty-line port-2 measurement dated
-    2026-06-15. This is the loss of the measured path, with no additional correction
+    Smooths ``-S21_dB`` from the empty-line port-2 measurement dated 2026-06-15 with a
+    21-point cubic Savitzky-Golay filter in dB, then linearly interpolates. The window
+    spans about 200 MHz; edges use polynomial fits (``mode="interp"``). Smoothing is
+    applied to the full calibration before evaluating the requested frequencies.
+    This is the loss of the measured path, with no additional correction
     for the input/output lines. Subtract it from source power in dBm to apply that loss.
 
     :param freq_hz: Frequency in Hz, scalar or array, from 1e5 to 1e10 inclusive.
+    :param smooth: Apply smoothing by default. Set to ``False`` to interpolate the
+        original measured dB values exactly, without smoothing.
     :returns: Loss in dB (positive for attenuation), a float for scalar input or an
         array with the input shape.
     :raises ValueError: If any frequency is non-finite or outside the measured band.
@@ -91,6 +105,8 @@ def nominal_fridge_loss(freq_hz: FloatArray) -> FloatArray:
             f"Frequency must be within the measured fridge-loss range "
             f"[{measured_freqs[0]:g}, {measured_freqs[-1]:g}] Hz."
         )
+    if smooth:
+        loss_db = _smoothed_fridge_loss()
     result = np.interp(frequencies, measured_freqs, loss_db)
     return float(result) if frequencies.ndim == 0 else result
 
