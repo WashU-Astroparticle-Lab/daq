@@ -1,4 +1,4 @@
-"""Offline regression tests for the packaged DAC power calibration.
+"""Offline regression tests for the packaged DAC power and fridge-loss calibrations.
 
 Run from the repository root with ``python tests/test_calibrations.py``.  Needs only numpy: the
 module is loaded by path so ``presto`` is never imported, and the source measurements it is
@@ -25,6 +25,7 @@ amp_to_power_dbm = calibrations.amp_to_power_dbm
 amp_to_power_dbm_hz = calibrations.amp_to_power_dbm_hz
 power_dbm_to_amp = calibrations.power_dbm_to_amp
 min_verified_amp = calibrations.min_verified_amp
+nominal_fridge_loss = calibrations.nominal_fridge_loss
 CalibrationWarning = calibrations.CalibrationWarning
 
 results = []
@@ -188,6 +189,46 @@ for label, fn in (
     ("non-finite power is rejected", lambda: power_dbm_to_amp(2.8, float("inf"))),
 ):
     check(label, raises(fn))
+
+# ---------------------------------------------------------------------------
+# Fridge loss: measured S21, frequency units, interpolation and valid band.
+# ---------------------------------------------------------------------------
+fridge_path = REPO_ROOT / "daq/calibrations/source_data/Empty_Line_port_2_-_2026-06-15.s2p"
+fridge_data = np.loadtxt(fridge_path, comments=["#", "!"])
+check(
+    "fridge loss reproduces all measured S21 magnitudes with attenuation positive",
+    np.allclose(nominal_fridge_loss(fridge_data[:, 0]), -fridge_data[:, 3], rtol=0, atol=1e-10),
+)
+check(
+    "fridge-loss endpoints accept Hz and return a scalar float",
+    isinstance(nominal_fridge_loss(1e10), float)
+    and np.isclose(nominal_fridge_loss(1e5), 72.0394968383)
+    and np.isclose(nominal_fridge_loss(1e10), 78.4864410019),
+)
+midpoint_hz = (fridge_data[280, 0] + fridge_data[281, 0]) / 2
+check(
+    "fridge loss interpolates in dB between measured frequencies",
+    np.isclose(
+        nominal_fridge_loss(midpoint_hz),
+        -(fridge_data[280, 3] + fridge_data[281, 3]) / 2,
+        rtol=0,
+        atol=1e-10,
+    ),
+)
+fridge_grid = np.array([[1e5, midpoint_hz], [1e10, 2.8e9]])
+check(
+    "fridge-loss array input retains its shape and matches scalar calls",
+    nominal_fridge_loss(fridge_grid).shape == fridge_grid.shape
+    and np.allclose(
+        nominal_fridge_loss(fridge_grid).ravel(),
+        [nominal_fridge_loss(f) for f in fridge_grid.ravel()],
+    ),
+)
+for bad_freq in (0.0, -1.0, 2.8, 9e4, 1.001e10, np.nan, np.inf, [2.8e9, np.nan], [2.8e9, 1.1e10]):
+    check(
+        f"fridge loss rejects invalid frequency {bad_freq}",
+        raises(lambda: nominal_fridge_loss(bad_freq)),
+    )
 
 failed = [label for label, ok in results if not ok]
 print(f"\n{len(results) - len(failed)}/{len(results)} passed")
