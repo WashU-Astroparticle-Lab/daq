@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Power calibration utilities.
+"""Power calibration and nominal fridge-loss utilities.
 
 ``amp`` is the DAC voltage amplitude as a fraction of full scale, so at a fixed frequency the
 output power follows
@@ -31,6 +31,7 @@ import numpy as np
 import numpy.typing as npt
 
 _DATA_PATH = Path(__file__).parent / "power_calibration.npz"
+_FRIDGE_LOSS_PATH = Path(__file__).parent / "source_data" / "Empty_Line_port_2_-_2026-06-15.s2p"
 
 FloatArray = Union[float, npt.NDArray[np.floating]]
 _Calibration = Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArray[np.float64]]
@@ -38,6 +39,76 @@ _Calibration = Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64], npt.NDArr
 
 class CalibrationWarning(UserWarning):
     """A conversion fell outside the region the calibration measurements verify."""
+
+
+@lru_cache(maxsize=1)
+def _load_fridge_loss() -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Read the packaged port-2 measurement (Hz, S-parameters in dB/angle)."""
+    try:
+        with _FRIDGE_LOSS_PATH.open(encoding="utf-8") as stream:
+            if stream.readline().strip().upper() != "# HZ S DB R 50":
+                raise ValueError("Expected the packaged Hz/dB Touchstone format.")
+            data = np.loadtxt(stream, comments="!", ndmin=2)
+        if data.shape[0] < 2 or data.shape[1] != 9:
+            raise ValueError("Expected frequency and four dB/angle pairs per row.")
+        frequency_hz = data[:, 0]
+        # The file labels its pairs S11, S21, S12, S22; loss is minus S21 in dB.
+        loss_db = -data[:, 3]
+        if not (
+            np.all(np.isfinite(frequency_hz))
+            and np.all(np.isfinite(loss_db))
+            and np.all(frequency_hz > 0.0)
+            and np.all(np.diff(frequency_hz) > 0.0)
+        ):
+            raise ValueError("Expected finite losses and positive, increasing frequencies.")
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(
+            f"Could not load a valid fridge-loss calibration from '{_FRIDGE_LOSS_PATH}'."
+        ) from exc
+    return frequency_hz, loss_db
+
+
+@lru_cache(maxsize=1)
+def _smoothed_fridge_loss() -> npt.NDArray[np.float64]:
+    """Smooth the uniformly spaced measurement in dB, including polynomial edge fits."""
+    from scipy.signal import savgol_filter
+
+    _, loss_db = _load_fridge_loss()
+    return savgol_filter(loss_db, window_length=21, polyorder=3, mode="interp")
+
+
+def nominal_fridge_loss(freq_hz: FloatArray, *, smooth: bool = True) -> FloatArray:
+    """Return nominal fridge insertion loss in dB at a frequency in Hz.
+
+    Smooths ``-S21_dB`` from the empty-line port-2 measurement dated 2026-06-15 with a
+    21-point cubic Savitzky-Golay filter in dB, then linearly interpolates. The window
+    spans about 200 MHz; edges use polynomial fits (``mode="interp"``). Smoothing is
+    applied to the full calibration before evaluating the requested frequencies.
+    This is the loss of the measured path, with no additional correction
+    for the input/output lines. Subtract it from source power in dBm to apply that loss.
+
+    :param freq_hz: Frequency in Hz, scalar or array, from 1e5 to 1e10 inclusive.
+    :param smooth: Apply smoothing by default. Set to ``False`` to interpolate the
+        original measured dB values exactly, without smoothing.
+    :returns: Loss in dB (positive for attenuation), a float for scalar input or an
+        array with the input shape.
+    :raises ValueError: If any frequency is non-finite or outside the measured band.
+        No extrapolation is performed.
+    :raises RuntimeError: If the packaged measurement is missing or invalid.
+    """
+    frequencies = np.asarray(freq_hz, dtype=np.float64)
+    if not np.all(np.isfinite(frequencies)):
+        raise ValueError("Frequency must be finite.")
+    measured_freqs, loss_db = _load_fridge_loss()
+    if np.any((frequencies < measured_freqs[0]) | (frequencies > measured_freqs[-1])):
+        raise ValueError(
+            f"Frequency must be within the measured fridge-loss range "
+            f"[{measured_freqs[0]:g}, {measured_freqs[-1]:g}] Hz."
+        )
+    if smooth:
+        loss_db = _smoothed_fridge_loss()
+    result = np.interp(frequencies, measured_freqs, loss_db)
+    return float(result) if frequencies.ndim == 0 else result
 
 
 @lru_cache(maxsize=1)

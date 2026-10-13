@@ -90,7 +90,7 @@ daq/
 ├── analysis/       resonator fits, noise PSDs, folding, plotting, Mattis-Bardeen
 ├── instruments/    VISA drivers: Agilent33220A (gate bias), DC2200 (LED)
 ├── db/             MongoDB logging and querying
-├── calibrations/   amp <-> dBm power calibration
+├── calibrations/   amp <-> dBm power calibration and nominal fridge loss
 ├── triggers.py     which Presto digital port gates which instrument
 ├── config.py       runtime configuration
 └── _base.py        Base: HDF5 + MongoDB save, attach() for auxiliary instrument state
@@ -124,6 +124,28 @@ off-grid frequencies drawn between their calibrated neighbours — and is the pl
 any rebuild. `docs/power_calibration_before_after.png`
 (`scripts/plot_power_calibration_before_after.py`) compares it with the four-corner grid it
 replaced.
+
+`nominal_fridge_loss(freq_hz)` returns the nominal fridge loss in **dB**, with frequency
+in **Hz** (scalar or array). By default it smooths `-S21_dB` from the packaged
+`Empty_Line_port_2_-_2026-06-15.s2p` measurement using a 21-point cubic Savitzky–Golay
+filter in dB (about a 200 MHz window), then linearly interpolates over 1e5–1e10 Hz.
+Edges use polynomial fits.
+Smoothing is applied to the full calibration, independently of the requested frequencies.
+Pass `smooth=False` for the original unsmoothed interpolation. Non-finite or
+out-of-range frequencies raise `ValueError`; there is no extrapolation. This represents
+the full measured empty-line path, without separating input and output line losses.
+
+```python
+from daq import nominal_fridge_loss, amp_to_power_dbm
+
+loss_db = nominal_fridge_loss(2.8e9)  # smoothed by default
+raw_loss_db = nominal_fridge_loss(2.8e9, smooth=False)
+power_after_path_dbm = amp_to_power_dbm(2.8, 0.1) - loss_db
+```
+
+The [fridge-loss validation plot](docs/nominal_fridge_loss.png) overlays all measured
+points, compares smoothed and raw curves, and shows the changes introduced by smoothing.
+Regenerate it with `python scripts/plot_nominal_fridge_loss.py`.
 
 ## Tests
 

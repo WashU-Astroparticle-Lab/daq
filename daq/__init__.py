@@ -3,6 +3,7 @@ from .calibrations import (
     amp_to_power_dbm,
     amp_to_power_dbm_hz,
     min_verified_amp,
+    nominal_fridge_loss,
     power_dbm_to_amp,
 )
 from .instruments import Agilent33220A, DC2200, InstrumentError
@@ -24,6 +25,7 @@ __all__ = [
     "amp_to_power_dbm",
     "amp_to_power_dbm_hz",
     "min_verified_amp",
+    "nominal_fridge_loss",
     "power_dbm_to_amp",
     "Agilent33220A",
     "DC2200",
