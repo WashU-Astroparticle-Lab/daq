@@ -1,0 +1,163 @@
+{
+  "calibration_id": "presto-port1-unfiltered-2026-10-12-v2",
+  "reference_plane": "Signal Hound SM200C analyzer input through the unfiltered measurement cable path; no external VLFX-2500+ filters, no cable-loss correction",
+  "measured_frequency_nodes": 251,
+  "selected_observations": 14200,
+  "amplitude_support": {
+    "dense_sweep": 151,
+    "single_anchor": 98,
+    "sparse_sweep_check": 2
+  },
+  "excluded_open_intervals_ghz": [
+    [
+      0.94,
+      0.96
+    ],
+    [
+      1.02,
+      1.04
+    ],
+    [
+      2.0,
+      2.02
+    ],
+    [
+      2.38,
+      2.4
+    ],
+    [
+      2.4,
+      2.42
+    ],
+    [
+      2.95,
+      3.0
+    ],
+    [
+      3.0,
+      3.05
+    ],
+    [
+      4.25,
+      4.3
+    ],
+    [
+      4.85,
+      4.9
+    ],
+    [
+      4.9,
+      4.95
+    ],
+    [
+      5.55,
+      5.6
+    ],
+    [
+      5.6,
+      5.65
+    ],
+    [
+      6.0,
+      6.05
+    ],
+    [
+      6.55,
+      6.6
+    ],
+    [
+      6.95,
+      7.0
+    ],
+    [
+      7.0,
+      7.05
+    ],
+    [
+      7.05,
+      7.1
+    ],
+    [
+      7.1,
+      7.15
+    ],
+    [
+      7.95,
+      8.0
+    ],
+    [
+      8.0,
+      8.05
+    ]
+  ],
+  "hardware_validation": {
+    "low_amplitude_checks.csv": {
+      "points": 15,
+      "max_abs_error_db": 0.1260356903076172,
+      "mean_signed_error_db": 0.0018251114151089118,
+      "residual_db": [
+        -0.09413719177246094,
+        0.04170417785644531,
+        0.019456863403320312,
+        0.021467208862304688,
+        0.020282745361328125,
+        -0.1260356903076172,
+        0.06182289123535156,
+        0.0069293975830078125,
+        0.006575584411621094,
+        -0.0020852088928222656,
+        -0.06088428108060384,
+        0.06629009636080596,
+        0.015396312791470024,
+        0.028142170030239555,
+        0.02245159538424346
+      ]
+    },
+    "high_validation.csv": {
+      "points": 9,
+      "max_abs_error_db": 0.165924072265625,
+      "mean_signed_error_db": -0.10611195034450954,
+      "residual_db": [
+        -0.165924072265625,
+        -0.03560829162597656,
+        -0.05012702941894531,
+        -0.15121078491210938,
+        -0.12697982788085938,
+        -0.12075996398925781,
+        -0.10239219665527344,
+        -0.08625030517578125,
+        -0.11575508117675781
+      ]
+    }
+  },
+  "leave_one_frequency_out": {
+    "low": {
+      "points": 93,
+      "absolute_error_db_median_p95_max": [
+        0.17222881317138672,
+        0.5106218338012697,
+        0.6687574386596671
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    },
+    "gap": {
+      "points": 16,
+      "absolute_error_db_median_p95_max": [
+        0.075416141626787,
+        0.2558338447492952,
+        0.29575149380430976
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    },
+    "high": {
+      "points": 106,
+      "absolute_error_db_median_p95_max": [
+        0.22205271142901584,
+        0.6886707002466408,
+        0.8845364108230127
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    }
+  },
+  "meaning": "Fit consistency and limited hardware spot checks, not a complete RF accuracy certification. Low-band single-anchor nodes use a model at other amplitudes and warn."
+}
