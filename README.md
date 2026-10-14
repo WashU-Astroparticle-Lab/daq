@@ -126,26 +126,38 @@ any rebuild. `docs/power_calibration_before_after.png`
 replaced.
 
 `nominal_fridge_loss(freq_hz)` returns the nominal fridge loss in **dB**, with frequency
-in **Hz** (scalar or array). By default it smooths `-S21_dB` from the packaged
-`Empty_Line_port_2_-_2026-06-15.s2p` measurement using a 21-point cubic Savitzky–Golay
-filter in dB (about a 200 MHz window), then linearly interpolates over 1e5–1e10 Hz.
-Edges use polynomial fits.
+in **Hz** (scalar or array). The default is the **input-line loss down to the mixing
+chamber (MC), measured at room temperature**, digitized from the **red** curve in
+the [supplied screenshot](docs/fridge_loss_to_mc_source.png). The packaged
+`fridge_loss_to_mc.csv` contains 201 points over 1e5–1e10 Hz. A 5-point cubic
+Savitzky–Golay filter in dB (about a 200 MHz window) precedes linear interpolation;
+edges use polynomial fits. This is a screenshot-derived approximation, with about
+0.04 dB per vertical pixel; that resolution is not a measurement uncertainty.
+The extraction bridges short occlusions by the yellow trace (up to about 69 MHz).
+
+Pass **`include_output=True`** to recover the previous result from the **cold
+loopback**, including the output line's contribution. This keeps the original
+`Empty_Line_port_2_-_2026-06-15.s2p` data and 21-point cubic filter unchanged.
+The two curves are separate measurements at different temperatures; their
+difference should not be interpreted as an isolated output-line calibration.
 Smoothing is applied to the full calibration, independently of the requested frequencies.
-Pass `smooth=False` for the original unsmoothed interpolation. Non-finite or
-out-of-range frequencies raise `ValueError`; there is no extrapolation. This represents
-the full measured empty-line path, without separating input and output line losses.
+Pass `smooth=False` for unsmoothed interpolation of the selected data. Both modes
+accept 1e5–1e10 Hz inclusive. Non-finite or out-of-range frequencies raise
+`ValueError`; there is no extrapolation.
 
 ```python
 from daq import nominal_fridge_loss, amp_to_power_dbm
 
-loss_db = nominal_fridge_loss(2.8e9)  # smoothed by default
+loss_db = nominal_fridge_loss(2.8e9)  # room-temperature input line to MC, smoothed
 raw_loss_db = nominal_fridge_loss(2.8e9, smooth=False)
-power_after_path_dbm = amp_to_power_dbm(2.8, 0.1) - loss_db
+loopback_loss_db = nominal_fridge_loss(2.8e9, include_output=True)  # previous default
+power_at_mc_dbm = amp_to_power_dbm(2.8, 0.1) - loss_db
 ```
 
-The [fridge-loss validation plot](docs/nominal_fridge_loss.png) overlays all measured
-points, compares smoothed and raw curves, and shows the changes introduced by smoothing.
-Regenerate it with `python scripts/plot_nominal_fridge_loss.py`.
+The [fridge-loss validation plot](docs/nominal_fridge_loss.png) compares both
+calibrations and overlays the extraction on the screenshot. Reproduce the CSV with
+`python scripts/digitize_fridge_loss.py` (requires Pillow), then regenerate the plot
+with `python scripts/plot_nominal_fridge_loss.py` (requires matplotlib).
 
 ## Tests
 

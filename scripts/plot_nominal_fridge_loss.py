@@ -1,7 +1,7 @@
-"""Compare nominal_fridge_loss against the original port-2 S21 measurement.
+"""Validate both fridge-loss sources and the red screenshot trace digitization.
 
-Run with ``python scripts/plot_nominal_fridge_loss.py`` from the repository root.
-The output is ``docs/nominal_fridge_loss.png``. All calls to the function use Hz.
+Run ``python scripts/plot_nominal_fridge_loss.py`` in the presto environment.
+Writes ``docs/nominal_fridge_loss.png``. Public function calls use Hz.
 """
 
 import importlib.util
@@ -13,124 +13,149 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
 
+from digitize_fridge_loss import BOTTOM, LEFT, RIGHT, SOURCE, TOP, digitize  # noqa: E402
+
 ROOT = Path(__file__).resolve().parents[1]
 spec = importlib.util.spec_from_file_location("calibrations", ROOT / "daq/calibrations/__init__.py")
 calibrations = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(calibrations)
 nominal_fridge_loss = calibrations.nominal_fridge_loss
 
-# Independently read the original file; columns are explicitly labelled in its header.
-source = ROOT / "daq/calibrations/source_data/Empty_Line_port_2_-_2026-06-15.s2p"
-data = np.loadtxt(source, comments=["#", "!"])
-frequency_hz, s21_db = data[:, 0], data[:, 3]
-dense_hz = np.linspace(frequency_hz[0], frequency_hz[-1], 20001)
-residual_db = nominal_fridge_loss(frequency_hz, smooth=False) + s21_db
-adjustment_db = nominal_fridge_loss(frequency_hz) + s21_db
-midpoints_hz = (frequency_hz[:-1] + frequency_hz[1:]) / 2
-midpoint_error = nominal_fridge_loss(midpoints_hz, smooth=False) + (s21_db[:-1] + s21_db[1:]) / 2
-assert np.max(np.abs(residual_db)) < 1e-10
-assert np.max(np.abs(midpoint_error)) < 1e-10
+input_data = np.loadtxt(ROOT / "daq/calibrations/source_data/fridge_loss_to_mc.csv", delimiter=",")
+loopback_data = np.loadtxt(
+    ROOT / "daq/calibrations/source_data/Empty_Line_port_2_-_2026-06-15.s2p",
+    comments=["#", "!"],
+)
+digitized_hz, digitized_db, red_x, red_y = digitize()
+assert np.array_equal(input_data[:, 0], digitized_hz)
+assert np.max(np.abs(input_data[:, 1] - digitized_db)) <= 5e-7
+
+for include_output, frequency_hz, loss_db in (
+    (False, input_data[:, 0], input_data[:, 1]),
+    (True, loopback_data[:, 0], -loopback_data[:, 3]),
+):
+    raw = nominal_fridge_loss(frequency_hz, smooth=False, include_output=include_output)
+    midpoint_hz = (frequency_hz[:-1] + frequency_hz[1:]) / 2
+    midpoint_db = nominal_fridge_loss(midpoint_hz, smooth=False, include_output=include_output)
+    assert np.max(np.abs(raw - loss_db)) < 1e-10
+    assert np.max(np.abs(midpoint_db - (loss_db[:-1] + loss_db[1:]) / 2)) < 1e-10
+    print(f"Raw source and midpoint recovery verified: {include_output=}")
 
 plt.rcParams.update({"font.size": 11, "axes.spines.top": False, "axes.spines.right": False})
-fig = plt.figure(figsize=(12, 9), layout="constrained")
-grid = fig.add_gridspec(2, 2, height_ratios=[1.35, 1])
+fig = plt.figure(figsize=(13, 11), layout="constrained")
+grid = fig.add_gridspec(3, 2, height_ratios=[1.25, 1.15, 1])
 full = fig.add_subplot(grid[0, :])
-zoom = fig.add_subplot(grid[1, 0])
-residual = fig.add_subplot(grid[1, 1])
-fig.suptitle("Nominal fridge loss from the measured port-2 transmission", fontsize=18)
+overlay = fig.add_subplot(grid[1, :])
+zoom = fig.add_subplot(grid[2, 0])
+adjustment = fig.add_subplot(grid[2, 1])
+fig.suptitle("Nominal fridge loss: input line to MC by default", fontsize=19)
 
+frequency_hz, input_db = input_data.T
+dense_hz = np.linspace(frequency_hz[0], frequency_hz[-1], 20001)
 full.plot(
-    dense_hz,
+    dense_hz / 1e9,
     nominal_fridge_loss(dense_hz),
-    color="#126a96",
-    lw=2.5,
-    zorder=4,
-    label="Default: smoothed loss (21-point cubic filter)",
+    color="#c72736",
+    lw=2,
+    label="Default: input to MC, measured at room temperature",
 )
 full.scatter(
-    frequency_hz,
-    -s21_db,
-    s=10,
-    facecolors="none",
-    edgecolors="#db7b23",
-    linewidths=0.6,
-    label=f"Original file: −S21 (all {len(frequency_hz):,} points)",
-    zorder=3,
+    frequency_hz / 1e9, input_db, s=9, color="#c72736", alpha=0.4, label="Digitized red trace"
 )
-full.set(title="Full measured band: 100 kHz to 10 GHz", ylabel="Loss [dB]", xlabel="Frequency [Hz]")
-full.legend(loc="upper left")
+full.plot(
+    dense_hz / 1e9,
+    nominal_fridge_loss(dense_hz, include_output=True),
+    color="#126a96",
+    lw=1.8,
+    label="include_output=True: previous cold loopback (input + output)",
+)
+full.plot(loopback_data[:, 0] / 1e9, -loopback_data[:, 3], color="#126a96", lw=0.5, alpha=0.25)
+full.set(xlabel="Frequency [GHz]", ylabel="Positive loss [dB]", xlim=(0, 10))
+full.legend(fontsize=10, loc="upper left")
 
-selected = (frequency_hz >= 2.5e9) & (frequency_hz <= 3.1e9)
-zoom_hz = np.linspace(2.5e9, 3.1e9, 1001)
-zoom.plot(zoom_hz, nominal_fridge_loss(zoom_hz), color="#126a96", lw=2, label="Smoothed (default)")
+# Crop only the displayed viewport, retaining exact source-image coordinates. The
+# recovered 201-point curve is drawn on the actual screenshot for visual validation.
+overlay.imshow(plt.imread(SOURCE), origin="upper")
+sample_x = LEFT + (frequency_hz - 1e5) / (1e10 - 1e5) * (RIGHT - LEFT)
+sample_y = TOP + (input_db - 45) / 50 * (BOTTOM - TOP)
+overlay.plot(
+    sample_x,
+    sample_y,
+    color="#56dcec",
+    lw=0.6,
+    marker="o",
+    markersize=2,
+    markerfacecolor="none",
+    markeredgewidth=0.5,
+    label="Extracted red trace (201 points)",
+)
+overlay.set(
+    xlim=(LEFT - 5, RIGHT + 5),
+    ylim=(875, 410),
+    aspect="auto",
+    title="Digitization check on the original screenshot (red and yellow retained)",
+)
+overlay.set_xticks(LEFT + np.arange(11) / 10 * (RIGHT - LEFT), labels=np.arange(11))
+loss_ticks = np.arange(60, 77, 5)
+overlay.set_yticks(TOP + (loss_ticks - 45) / 50 * (BOTTOM - TOP), labels=-loss_ticks)
+overlay.set(xlabel="Frequency [GHz]", ylabel="Screenshot S21 [dB]")
+overlay.legend(loc="upper right", fontsize=9)
+
+zoom_hz = np.linspace(2.5e9, 4.5e9, 2001)
 zoom.plot(
-    zoom_hz,
+    zoom_hz / 1e9, nominal_fridge_loss(zoom_hz), color="#c72736", lw=2, label="Smoothed default"
+)
+zoom.plot(
+    zoom_hz / 1e9,
     nominal_fridge_loss(zoom_hz, smooth=False),
-    color="#db7b23",
-    alpha=0.7,
+    color="#5b5555",
     lw=1,
-    label="Raw (smooth=False)",
+    linestyle="--",
+    label="smooth=False",
 )
-zoom.scatter(
-    frequency_hz[selected],
-    -s21_db[selected],
-    s=18,
-    facecolors="none",
-    edgecolors="#db7b23",
-    linewidths=0.8,
-    zorder=3,
-    label="_nolegend_",
-)
-example_hz = 2.8e9
-example_db = nominal_fridge_loss(example_hz)
-zoom.scatter([example_hz], [example_db], color="#934ba2", s=50, zorder=4)
+example_db = nominal_fridge_loss(2.8e9)
+zoom.scatter([2.8], [example_db], color="#c72736", s=25, zorder=3)
 zoom.annotate(
-    f"f = 2.8e9 Hz\nloss = {example_db:.6f} dB",
-    (example_hz, example_db),
-    xytext=(0.05, 0.85),
-    textcoords="axes fraction",
-    fontsize=10,
-    arrowprops={"arrowstyle": "-", "color": "#934ba2"},
+    f"2.8 GHz: {example_db:.2f} dB",
+    (2.8, example_db),
+    xytext=(2.6, 68.8),
+    arrowprops={"arrowstyle": "-", "color": "#c72736"},
 )
 zoom.set(
-    title="Zoom: smoothed versus raw loss",
-    xlabel="Frequency [Hz]",
-    ylabel="Loss [dB]",
-    xlim=(2.5e9, 3.1e9),
+    title="Input-to-MC loss near the operating band",
+    xlabel="Frequency [GHz]",
+    ylabel="Positive loss [dB]",
+    xlim=(2.5, 4.5),
 )
 zoom.legend(loc="lower right", fontsize=9)
 
-residual.plot(frequency_hz, adjustment_db, color="#126a96", lw=1, label="Smoothed − measured")
-residual.axhline(0, color="#db7b23", lw=1, linestyle="--", label="Raw − measured = 0")
-residual.set(
-    title="Effect of smoothing at measured frequencies",
-    xlabel="Frequency [Hz]",
-    ylabel="Change in loss [dB]",
-    ylim=(-3, 3),
+input_adjustment = nominal_fridge_loss(frequency_hz) - input_db
+adjustment.plot(frequency_hz / 1e9, input_adjustment, color="#c72736", lw=1)
+adjustment.axhline(0, color="#5b5555", lw=0.6)
+adjustment.set(
+    title="Input-trace smoothing adjustment (~200 MHz)",
+    xlabel="Frequency [GHz]",
+    ylabel="Smoothed − digitized loss [dB]",
 )
-residual.text(
-    0.05,
-    0.94,
-    f"Smoothing RMS change: {np.sqrt(np.mean(adjustment_db**2)):.3f} dB\n"
-    f"Max absolute change: {np.max(np.abs(adjustment_db)):.3f} dB",
-    transform=residual.transAxes,
+adjustment.text(
+    0.04,
+    0.96,
+    f"RMS change: {np.sqrt(np.mean(input_adjustment**2)):.3f} dB\n"
+    f"Maximum change: {np.max(np.abs(input_adjustment)):.3f} dB",
+    transform=adjustment.transAxes,
     va="top",
     fontsize=10,
 )
-residual.legend(loc="lower left", fontsize=9)
-for ax in (full, zoom, residual):
+for ax in (full, zoom, adjustment):
     ax.grid(alpha=0.2)
-    ax.ticklabel_format(axis="x", style="sci", scilimits=(0, 0), useOffset=False)
 fig.supxlabel(
-    "Source: Empty_Line_port_2_-_2026-06-15.s2p • loss = −S21_dB\n"
-    "Smoothing in dB over ~200 MHz; full measured path, with no separation of input/output losses.",
+    "Red-trace calibration is approximate: ~0.04 dB/pixel; short occlusions are interpolated.\n"
+    "Room-temperature input and cold loopback are separate measurements; their difference is not an output-line calibration.",
     fontsize=10,
 )
 output = ROOT / "docs/nominal_fridge_loss.png"
 fig.savefig(output, dpi=180)
 print(f"Saved {output}")
-print(f"Measured-point maximum error: {np.max(np.abs(residual_db)):.3g} dB")
-print(f"Midpoint maximum error: {np.max(np.abs(midpoint_error)):.3g} dB")
-
-print(f"Smoothing RMS change: {np.sqrt(np.mean(adjustment_db**2)):.6f} dB")
-print(f"Smoothing maximum change: {np.max(np.abs(adjustment_db)):.6f} dB")
+print(
+    f"At 2.8 GHz: default {example_db:.6f} dB; loopback {nominal_fridge_loss(2.8e9, include_output=True):.6f} dB"
+)
