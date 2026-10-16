@@ -102,31 +102,37 @@ daq/
 Power calibration is exported at top level: `amp_to_power_dbm(freq_ghz, amp)`,
 `amp_to_power_dbm_hz(freq_hz, amp)`, `power_dbm_to_amp(freq_ghz, power_dbm)`,
 `min_verified_amp(freq_ghz)` and `verified_amp_range(freq_ghz)`.
-The unfiltered v2 model uses **251 measured frequency nodes from 0.1 to 9 GHz**.
-Power is at the **analyzer input through the measurement cable**, without cable-loss
-correction. Amplitude is a dimensionless voltage fraction.
 
-The model is `P(A) = P1(f) + 20*log10(abs(A))`. The old filtered low-band powers are
-excluded. Direct unfiltered amplitude-0.1 anchors supply most low-band nodes; **98 nodes
-have only that amplitude measured**. Both conversions return estimates with
-`CalibrationWarning` outside their empirical amplitude bounds. Checks at 0.1 and 1 GHz
-support 0.01–1; 151 gap/high-band nodes have dense amplitude sweeps with quality floors.
+**0.1–2.1 GHz is calculated by filter offset:** 101 original filtered amplitude curves
+(50 points each) are shifted using the per-frequency unfiltered amplitude-0.1 scan.
+The runtime preserves supported measured curve shape by interpolating dBm versus log
+amplitude, and the inverse solves that same curve. These are estimates of unfiltered
+power, not direct unfiltered amplitude sweeps. Calls emit `FilterOffsetWarning`, a subtype
+of `CalibrationWarning`. The offset can include session/path changes and assumes a
+constant dB shift across amplitude. Negative offsets are retained and flagged.
 
-All measured nodes work. Twenty open intervals are excluded from frequency interpolation
-because they overlap coarse DAC-switch uncertainty windows or contain adjacent model-level
-jumps >1 dB. Excluded queries raise `ValueError`; other interpolation remains an estimate.
+Above 2.1 GHz, the existing direct unfiltered gap/high sweep models retain the
+`P(A)=P1(f)+20*log10(abs(A))` law. Altogether there are 251 frequency nodes from 0.1 to 9 GHz.
+All exact nodes are usable; 20 open frequency intervals reject interpolation around uncertain
+switches or large level jumps. Outside amplitude support, conversions warn and extrapolate
+20 dB/decade from the supported floor. Low-band support is conditional on the filter correction.
 
 ```python
 from daq import amp_to_power_dbm, power_dbm_to_amp, verified_amp_range
 
-power = amp_to_power_dbm(5.2, 0.1)  # GHz, dimensionless amplitude -> dBm
-amplitude = power_dbm_to_amp(5.2, -20.0)
-supported_range = verified_amp_range(5.2)
+power = amp_to_power_dbm(0.5, 0.1)  # GHz; emits FilterOffsetWarning
+amplitude = power_dbm_to_amp(0.5, power)
+bounds = verified_amp_range(0.5)
 ```
 
-See [calibration details and limits](docs/power_calibration_update.md). Twenty-four independent
-hardware spot observations differ from the model by at most 0.166 dB; this is not a full-band
-accuracy specification. Rebuild and validate offline (NumPy only):
+Power refers to analyzer input through the measurement cable, without cable-loss correction;
+amplitude is a dimensionless voltage fraction. Independent low-band checks (15 points) differ
+by at most 0.0392 dB and high-band checks (9 points) by 0.1660 dB. This is limited spot-check
+agreement, not a full-band accuracy guarantee. Corrected-point agreement is by construction.
+
+See [correction method and limits](docs/power_calibration_update.md) and the current inputs,
+offsets and full corrected table in `daq/calibrations/source_data/2026-10-16/`.
+Rebuild and validate offline with NumPy:
 
 ```bash
 python scripts/build_power_calibration.py
@@ -134,11 +140,9 @@ python tests/test_calibrations.py
 python scripts/validate_power_calibration_update.py
 ```
 
-Current sources and hashes are under `daq/calibrations/source_data/2026-10-12/` and in the
-NPZ asset. `python scripts/plot_power_calibration_update.py` regenerates the current figure
-(requires matplotlib). Historical filtered October 2 low-band data and March artifacts are
-retained separately; they are not inputs to the current model. Install the module and asset
-together. This update has not been installed on the hardware computer.
+`python scripts/plot_power_calibration_update.py` regenerates the current figures (matplotlib).
+The schema-4 asset and runtime must be deployed together. Earlier source directories and March
+figures are historical. This update has not been installed on the acquisition computer.
 
 ## Tests
 

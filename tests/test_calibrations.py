@@ -50,7 +50,7 @@ def warned(fn):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         result = fn()
-    return result, sum(issubclass(w.category, CalibrationWarning) for w in caught)
+    return result, sum(w.category is CalibrationWarning for w in caught)
 
 
 # ---------------------------------------------------------------------------
@@ -61,19 +61,25 @@ with np.load(REPO_ROOT / "daq/calibrations/power_calibration.npz") as asset_file
 cal_freqs = asset["frequency_ghz"]
 cal_floors = asset["amp_floor"]
 tolerance_db = float(asset["floor_tolerance_db"])
-source_dir = REPO_ROOT / "daq/calibrations/source_data/2026-10-12"
-builder_spec = importlib.util.spec_from_file_location("calibration_builder", REPO_ROOT / "scripts/build_power_calibration.py")
+source_dir = REPO_ROOT / "daq/calibrations/source_data/2026-10-16"
+builder_spec = importlib.util.spec_from_file_location(
+    "calibration_builder", REPO_ROOT / "scripts/build_power_calibration.py"
+)
 builder = importlib.util.module_from_spec(builder_spec)
 builder_spec.loader.exec_module(builder)
 warnings.simplefilter("ignore", CalibrationWarning)
 measurements = defaultdict(list)
 for row in builder.read_measurements(source_dir):
-    measurements[float(row["frequency_mhz"]) / 1000].append((
-        float(row["amplitude"]), float(row["median_peak_power_dbm"]),
-        row["review_signal_or_timing"] == "True"))
+    measurements[float(row["frequency_mhz"]) / 1000].append(
+        (
+            float(row["amplitude"]),
+            float(row["median_peak_power_dbm"]),
+            row["review_signal_or_timing"] == "True",
+        )
+    )
 check(
-    "251 unfiltered nodes; 14,200 selected observations",
-    len(measurements) == 251 and sum(map(len, measurements.values())) == 14200,
+    "251 nodes; 5,050 corrected low points and 14,050 direct gap/high points",
+    len(measurements) == 251 and sum(map(len, measurements.values())) == 19100,
 )
 check("all calibration nodes have source measurements", set(cal_freqs) == set(measurements))
 check(
@@ -97,7 +103,7 @@ for f, points in sorted(measurements.items()):
         else:
             n_silent_below_floor += n_warn == 0
 check(
-    "verified measurements agree with model on BOTH sides",
+    "supported source points agree; corrected points are not independent validation",
     worst <= tolerance_db,
     f"{n_verified} points, worst absolute residual {worst:.6f} dB",
 )
@@ -167,23 +173,48 @@ check(
 )
 check("new gap is usable away from the 2.4 GHz switch", np.isfinite(amp_to_power_dbm(2.35, 0.1)))
 check("gap switch remains excluded", raises(lambda: amp_to_power_dbm(2.39, 0.1)))
-check("single-anchor nodes expose amplitude bounds", calibrations.verified_amp_range(.12) == (.1,.1))
-check("sparse amplitude checks expose their range", calibrations.verified_amp_range(.1) == (.01,1.) and calibrations.verified_amp_range(1.) == (.01,1.))
-for amplitude in [.01, .5, 1.]:
-    value, count = warned(lambda: amp_to_power_dbm(.12, amplitude))
-    inverse, inverse_count = warned(lambda: power_dbm_to_amp(.12, value))
-    check(f"single-anchor estimate warns both directions at {amplitude}", count==1 and inverse_count==1 and np.isclose(inverse,amplitude))
-value,count=warned(lambda:amp_to_power_dbm(.12,.1))
-inverse,inverse_count=warned(lambda:power_dbm_to_amp(.12,value))
-check("exact anchor forward/inverse does not spuriously warn", count==0 and inverse_count==0 and np.isclose(inverse,.1))
-check("filtered low-band table excluded", "low_power.csv" not in asset["source_files"] and "unfiltered" in str(asset["reference_plane"]))
-for name,freq_col,power_col in [("low_amplitude_checks.csv","frequency_mhz","median_peak_power_dbm"),("high_validation.csv","frequency_ghz","measured_power_dbm")]:
-    with (source_dir/name).open(newline="") as stream: checks=list(csv.DictReader(stream))
-    errors=[]
+check(
+    "corrected low curves expose an amplitude range",
+    calibrations.verified_amp_range(0.12)[0] < 0.01
+    and calibrations.verified_amp_range(0.12)[1] == 1.0,
+)
+check(
+    "filtered low input and correction provenance retained",
+    "low_filtered_power.csv" in asset["source_files"]
+    and "filter offset" in str(asset["reference_plane"]),
+)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    value = amp_to_power_dbm(0.12, 0.1)
+    inverse = power_dbm_to_amp(0.12, value)
+check(
+    "both low-band conversions identify filter-offset estimates",
+    len(caught) == 2
+    and all(w.category is calibrations.FilterOffsetWarning for w in caught)
+    and np.isclose(inverse, 0.1),
+)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    amp_to_power_dbm(2.1, 0.1)
+check(
+    "2.1 GHz endpoint is explicitly corrected",
+    len(caught) == 1 and caught[0].category is calibrations.FilterOffsetWarning,
+)
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    amp_to_power_dbm(2.12, 0.1)
+check("direct gap does not emit correction warning", not caught)
+for name, freq_col, power_col in [
+    ("low_amplitude_checks.csv", "frequency_mhz", "median_peak_power_dbm"),
+    ("high_validation.csv", "frequency_ghz", "measured_power_dbm"),
+]:
+    with (source_dir / name).open(newline="") as stream:
+        checks = list(csv.DictReader(stream))
+    errors = []
     for r in checks:
-        f=float(r[freq_col])/(1000 if freq_col=="frequency_mhz" else 1)
-        errors.append(abs(float(r[power_col])-amp_to_power_dbm(f,float(r["amplitude"]))))
-    check("held-out hardware agreement: "+name,max(errors)<.2, f"max {max(errors):.6f} dB")
+        f = float(r[freq_col]) / (1000 if freq_col == "frequency_mhz" else 1)
+        errors.append(abs(float(r[power_col]) - amp_to_power_dbm(f, float(r["amplitude"]))))
+    check("held-out hardware agreement: " + name, max(errors) < 0.2, f"max {max(errors):.6f} dB")
 
 check(
     "all measured frequencies forward/inverse round-trip above floor",
@@ -205,16 +236,179 @@ check(
     set(rebuilt) == set(asset) and all(np.array_equal(rebuilt[k], asset[k]) for k in asset),
 )
 
+# Independent checks of the correction formula and curve-based inversion.
+original = builder.read_csv(source_dir / "low_filtered_power.csv")
+corrected = builder.read_csv(source_dir / "low_corrected_power.csv")
+offsets = builder.read_csv(source_dir / "low_filter_offsets.csv")
+check(
+    "all 5,050 original observations preserved in corrected table",
+    len(original) == len(corrected) == 5050
+    and all(
+        str(a["point_id"]) == str(b["point_id"])
+        and a["review_signal_or_timing"] == b["review_signal_or_timing"]
+        for a, b in zip(original, corrected)
+    ),
+)
+check(
+    "corrected table is exactly original plus recorded offset",
+    all(
+        abs(
+            float(b["median_peak_power_dbm"])
+            - float(a["median_peak_power_dbm"])
+            - float(b["filter_offset_db"])
+        )
+        < 1e-12
+        for a, b in zip(original, corrected)
+    ),
+)
+check(
+    "all offsets follow recorded anchor interpolation",
+    all(
+        abs(
+            float(r["filter_offset_db"])
+            - (
+                float(r["direct_unfiltered_anchor_dbm"])
+                - (
+                    (1 - float(r["upper_bracket_weight_log_amplitude"]))
+                    * float(r["filtered_bracket_low_power_dbm"])
+                    + float(r["upper_bracket_weight_log_amplitude"])
+                    * float(r["filtered_bracket_high_power_dbm"])
+                )
+            )
+        )
+        < 1e-12
+        for r in offsets
+    ),
+)
+check(
+    "three negative offsets retained without clamping",
+    sum(float(r["filter_offset_db"]) < 0 for r in offsets) == 3
+    and all(
+        (r["negative_offset"] == "True") == (float(r["filter_offset_db"]) < 0) for r in offsets
+    ),
+)
+anchors = builder.read_csv(source_dir / "low_anchor.csv")
+check(
+    "all 101 corrected curves pass through unfiltered anchors",
+    all(
+        abs(
+            amp_to_power_dbm(float(r["frequency_mhz"]) / 1000, 0.1)
+            - float(r["median_peak_power_dbm"])
+        )
+        < 1e-12
+        for r in anchors
+    ),
+)
+shape_ok = True
+inverse_ok = True
+for f in cal_freqs[cal_freqs <= 2.1]:
+    group = [
+        r
+        for r in corrected
+        if float(r["frequency_mhz"]) / 1000 == f and float(r["amplitude"]) >= min_verified_amp(f)
+    ]
+    aa = np.array([float(r["amplitude"]) for r in group])
+    pp = np.array([float(r["median_peak_power_dbm"]) for r in group])
+    shape_ok &= np.allclose(amp_to_power_dbm(float(f), aa), pp, rtol=0, atol=1e-12)
+    for j in range(len(aa) - 1):
+        amplitude = float(np.sqrt(aa[j] * aa[j + 1]))
+        expected = float((pp[j] + pp[j + 1]) / 2)
+        shape_ok &= abs(amp_to_power_dbm(float(f), amplitude) - expected) < 1e-12
+        inverse_ok &= abs(power_dbm_to_amp(float(f), expected) / amplitude - 1) < 1e-11
+check("low functions preserve supported corrected samples and between-sample shape", shape_ok)
+check("inverse solves the corrected curves between every supported pair", inverse_ok)
+check(
+    "low-band curve is not silently replaced by a 20 dB/decade line",
+    abs(amp_to_power_dbm(0.1, 0.01) - (amp_to_power_dbm(0.1, 0.1) - 20)) > 0.05,
+)
+roundtrip = True
+for i, ok in enumerate(allowed):
+    if ok:
+        f = float((cal_freqs[i] + cal_freqs[i + 1]) / 2)
+        for a in np.geomspace(min_verified_amp(f) / 2, 1, 9):
+            roundtrip &= abs(power_dbm_to_amp(f, amp_to_power_dbm(f, float(a))) / a - 1) < 1e-11
+check("all allowed off-grid curves invert consistently, including below-floor estimates", roundtrip)
+for f in [0.1, 0.12, 1.0, 2.1]:
+    floor = min_verified_amp(f)
+    value, nwarn = warned(lambda: amp_to_power_dbm(f, floor / 2))
+    inverse, nwarn_inverse = warned(lambda: power_dbm_to_amp(f, value))
+    check(
+        f"weak corrected tail extrapolates from quality floor at {f:g} GHz",
+        nwarn == nwarn_inverse == 1
+        and np.isclose(value, amp_to_power_dbm(f, floor) - 20 * np.log10(2))
+        and np.isclose(inverse, floor / 2),
+    )
+# Verify direct high/gap behavior against independently recomputed original analytic levels.
+direct_ok = True
+for f, points in measurements.items():
+    if f > 2.1:
+        fit = [p - 20 * np.log10(a) for a, p, flagged in points if a >= 0.1 and not flagged]
+        expected = float(np.median(fit))
+        direct_ok &= np.allclose(
+            amp_to_power_dbm(f, np.array([0.001, 0.01, 0.1, 0.5, 1.0])),
+            expected + 20 * np.log10([0.001, 0.01, 0.1, 0.5, 1.0]),
+            rtol=0,
+            atol=1e-12,
+        )
+check("direct gap/high model behavior preserved", direct_ok)
+overlap = [
+    r
+    for r in builder.read_csv(source_dir / "gap_power.csv")
+    if float(r["frequency_mhz"]) == 2100
+    and float(r["amplitude"]) >= min_verified_amp(2.1)
+    and r["review_signal_or_timing"] == "False"
+]
+overlap_error = max(
+    abs(float(r["median_peak_power_dbm"]) - amp_to_power_dbm(2.1, float(r["amplitude"])))
+    for r in overlap
+)
+check(
+    "independent direct 2.1-GHz sweep validates corrected endpoint",
+    len(overlap) == 42 and overlap_error < 0.2,
+    f"max {overlap_error:.6f} dB",
+)
+check(
+    "original filtered source bytes remain unchanged",
+    (source_dir / "low_filtered_power.csv").read_bytes()
+    == (source_dir.parent / "2026-10-02/low_power.csv").read_bytes(),
+)
+check(
+    "off-grid amplitude values blend the two actual curves",
+    all(
+        abs(
+            amp_to_power_dbm(float((cal_freqs[i] + cal_freqs[i + 1]) / 2), 0.1)
+            - (
+                amp_to_power_dbm(float(cal_freqs[i]), 0.1)
+                + amp_to_power_dbm(float(cal_freqs[i + 1]), 0.1)
+            )
+            / 2
+        )
+        < 1e-12
+        for i, ok in enumerate(allowed)
+        if ok
+    ),
+)
+
 # Corruption, missing interval flags and obsolete assets must never enable interpolation.
 original_path = calibrations._DATA_PATH
 invalid_cases = {
     "obsolete filtered schema": {"schema_version": np.array(2)},
+    "obsolete anchor-only schema": {"schema_version": np.array(3)},
     "wrong schema type/value": {"schema_version": np.array(3.5)},
     "nonfinite power": {"power_dbm_at_amp_1": np.full(len(cal_freqs), np.nan)},
     "unordered frequencies": {"frequency_ghz": cal_freqs[::-1]},
     "bad amplitude floor": {"amp_floor": np.zeros(len(cal_freqs))},
     "bad amplitude ceiling": {"amp_ceiling": np.zeros(len(cal_freqs))},
-    "nonfinite amplitude ceiling": {"amp_ceiling": np.full(len(cal_freqs),np.nan)},
+    "nonfinite amplitude ceiling": {"amp_ceiling": np.full(len(cal_freqs), np.nan)},
+    "missing curve row": {"curve_power_dbm": asset["curve_power_dbm"][:-1]},
+    "nonfinite curve": {"curve_power_dbm": np.full(asset["curve_power_dbm"].shape, np.nan)},
+    "unordered curve grid": {"curve_log_amplitude": asset["curve_log_amplitude"][::-1]},
+    "inconsistent curve endpoint": {"power_dbm_at_amp_1": asset["power_dbm_at_amp_1"] + 1},
+    "nonmonotonic supported curve": {
+        "curve_power_dbm": np.concatenate(
+            [asset["curve_power_dbm"][:, :-1][:, ::-1], asset["curve_power_dbm"][:, -1:]], axis=1
+        )
+    },
     "wrong interval count": {"interpolation_allowed": np.ones(len(cal_freqs), dtype=bool)},
     "nonboolean intervals": {"interpolation_allowed": allowed.astype(float)},
 }
@@ -227,7 +421,14 @@ with tempfile.TemporaryDirectory() as temp:
             check(
                 "reject asset: " + label, raises(lambda: amp_to_power_dbm(2.8, 0.1), RuntimeError)
             )
-        for missing in ("schema_version", "interpolation_allowed", "amp_floor", "amp_ceiling"):
+        for missing in (
+            "schema_version",
+            "interpolation_allowed",
+            "amp_floor",
+            "amp_ceiling",
+            "curve_log_amplitude",
+            "curve_power_dbm",
+        ):
             np.savez_compressed(
                 calibrations._DATA_PATH, **{k: v for k, v in asset.items() if k != missing}
             )

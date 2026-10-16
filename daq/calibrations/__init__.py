@@ -1,25 +1,12 @@
 # -*- coding: utf-8 -*-
-"""Power calibration utilities.
+"""Power conversions for the measured analyzer-input reference plane.
 
-``amp`` is the DAC voltage amplitude as a fraction of full scale, so at a fixed frequency the
-output power follows
-
-``power_dbm = power_dbm_at_amp_1 + 20 * log10(|amp|)``.
-
-The unfiltered October 2026 asset covers 0.1--9 GHz at 251 measured frequencies.
-Its power reference is the analyzer input through the unfiltered cable path, without cable-loss
-correction. It is a single-port calibration, not a calibration of every possible DAC setting.
-
-Frequency interpolation is allowed only across measured intervals marked safe by the builder.
-Intervals touching DAC-switch uncertainty windows or adjacent model-level jumps over 1 dB
-are rejected. Exact measured frequencies remain available. This conservative policy
-avoids inventing exact switch boundaries from a 5 MHz software scan.
-
-Most low-band nodes were measured only at amplitude 0.1. Other amplitudes there return a model
-estimate with CalibrationWarning. At swept nodes, conversions outside the empirical supported
-amplitude range also warn. This range is not an absolute accuracy specification.
-See docs/power_calibration_update.md for provenance, limitations and validation.
-
+0.1–2.1 GHz uses the full original amplitude curves corrected by a per-frequency
+filter offset. These are estimates of unfiltered power, not direct unfiltered sweeps.
+Above 2.1 GHz the direct unfiltered sweep model retains the 20 dB/decade law.
+Low-band interpolation is linear in dBm versus log amplitude, preserving supported
+measured curve shape. Frequency interpolation never crosses stored exclusions.
+See docs/power_calibration_update.md for correction assumptions and provenance.
 """
 
 import warnings
@@ -40,33 +27,35 @@ _Calibration = Tuple[
     npt.NDArray[np.float64],
     npt.NDArray[np.bool_],
     npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
+    npt.NDArray[np.float64],
 ]
 
 
 class CalibrationWarning(UserWarning):
-    """A conversion fell outside the region the calibration measurements verify."""
+    """A conversion has a calibration-provenance or amplitude-support limitation."""
+
+
+class FilterOffsetWarning(CalibrationWarning):
+    """Power uses a filter-offset-corrected estimate of the unfiltered low band."""
 
 
 @lru_cache(maxsize=1)
 def _load_calibration() -> _Calibration:
-    """Load and validate the packaged calibration.
-
-    :returns: ``(frequency_ghz, power_dbm_at_amp_1, amp_floor, interpolation_allowed, amp_ceiling)``; the
-        first three arrays are
-        indexed by calibrated frequency.  ``amp_floor`` is the smallest amplitude at which the
-        measurements at that frequency still follow the ``20 log10(amp)`` law within the
-        builder's tolerance.
-    :raises RuntimeError: If the asset is missing, corrupt or internally inconsistent.
-    """
+    """Load frequencies, full-scale powers, bounds, exclusions and tabulated curves."""
     try:
         with np.load(_DATA_PATH, allow_pickle=False) as data:
-            if data["schema_version"].shape != () or data["schema_version"].item() != 3:
-                raise ValueError("Expected unfiltered schema version 3; rebuild the asset.")
+            if data["schema_version"].shape != () or data["schema_version"].item() != 4:
+                raise ValueError(
+                    "Expected filter-offset curve schema version 4; rebuild the asset."
+                )
             frequency_ghz = np.asarray(data["frequency_ghz"], dtype=np.float64)
             power_dbm_at_amp_1 = np.asarray(data["power_dbm_at_amp_1"], dtype=np.float64)
             amp_floor = np.asarray(data["amp_floor"], dtype=np.float64)
             interpolation_allowed = np.asarray(data["interpolation_allowed"])
             amp_ceiling = np.asarray(data["amp_ceiling"], dtype=np.float64)
+            grid = np.asarray(data["curve_log_amplitude"], dtype=np.float64)
+            curves = np.asarray(data["curve_power_dbm"], dtype=np.float64)
     except (OSError, EOFError, KeyError, ValueError, zipfile.BadZipFile) as exc:
         raise RuntimeError(
             f"Could not load a valid power calibration from '{_DATA_PATH}'."
@@ -76,7 +65,11 @@ def _load_calibration() -> _Calibration:
         raise RuntimeError(
             "Calibration frequencies must form a one-dimensional array of at least two points."
         )
-    if power_dbm_at_amp_1.shape != frequency_ghz.shape or amp_floor.shape != frequency_ghz.shape or amp_ceiling.shape != frequency_ghz.shape:
+    if (
+        power_dbm_at_amp_1.shape != frequency_ghz.shape
+        or amp_floor.shape != frequency_ghz.shape
+        or amp_ceiling.shape != frequency_ghz.shape
+    ):
         raise RuntimeError("Calibration arrays must hold one value per calibrated frequency.")
     if not (
         np.all(np.isfinite(frequency_ghz))
@@ -97,7 +90,34 @@ def _load_calibration() -> _Calibration:
     ):
         raise RuntimeError("Calibration must contain one boolean interpolation flag per interval.")
 
-    return frequency_ghz, power_dbm_at_amp_1, amp_floor, interpolation_allowed, amp_ceiling
+    if (
+        grid.ndim != 1
+        or len(grid) < 2
+        or not np.isfinite(grid).all()
+        or not np.all(np.diff(grid) > 0)
+        or grid[-1] != 0
+        or curves.shape != (len(frequency_ghz), len(grid))
+        or not np.isfinite(curves).all()
+        or np.any(np.log10(amp_floor) < grid[0])
+        or np.any(amp_ceiling != 1)
+        or not np.array_equal(curves[:, -1], power_dbm_at_amp_1)
+    ):
+        raise RuntimeError("Invalid calibration curve grid, power matrix or endpoint metadata.")
+    for row, floor in zip(curves, amp_floor):
+        x = np.unique(np.r_[np.log10(floor), grid[grid >= np.log10(floor)]])
+        if len(x) < 2 or not np.all(np.diff(np.interp(x, grid, row)) > 0):
+            raise RuntimeError(
+                "Supported calibration curves must be strictly monotonic for inversion."
+            )
+    return (
+        frequency_ghz,
+        power_dbm_at_amp_1,
+        amp_floor,
+        interpolation_allowed,
+        amp_ceiling,
+        grid,
+        curves,
+    )
 
 
 def _bracket(freq_ghz: float) -> Tuple[int, int]:
@@ -107,7 +127,7 @@ def _bracket(freq_ghz: float) -> Tuple[int, int]:
 
     :raises ValueError: If *freq_ghz* is non-finite or outside a supported calibration interval.
     """
-    frequency_ghz, _, _, allowed, _ = _load_calibration()
+    frequency_ghz, _, _, allowed, _, _, _ = _load_calibration()
     if not np.isfinite(freq_ghz):
         raise ValueError("Frequency must be finite.")
     # Absorb only floating-point roundoff from Hz/GHz conversion (a few ULPs), not
@@ -133,46 +153,50 @@ def _bracket(freq_ghz: float) -> Tuple[int, int]:
     return lo, hi
 
 
-def _full_scale_power_dbm(freq_ghz: float) -> float:
-    """Interpolate the model full-scale level (inferred at single-anchor nodes)."""
-    frequency_ghz, powers, _, _, _ = _load_calibration()
+def _frequency_curve(freq_ghz: float) -> Tuple[npt.NDArray[np.float64], npt.NDArray[np.float64]]:
+    """Return a monotonic supported curve; use the common amplitude range off-grid."""
+    f, _, floors, _, _, grid, curves = _load_calibration()
     lo, hi = _bracket(freq_ghz)
+    floor = float(max(floors[lo], floors[hi]))
+    x = np.unique(np.r_[np.log10(floor), grid[grid >= np.log10(floor)]])
+    lower = np.interp(x, grid, curves[lo])
     if lo == hi:
-        return float(powers[lo])
-    weight = (freq_ghz - frequency_ghz[lo]) / (frequency_ghz[hi] - frequency_ghz[lo])
-    return float(powers[lo] + weight * (powers[hi] - powers[lo]))
+        return x, lower
+    weight = (freq_ghz - f[lo]) / (f[hi] - f[lo])
+    return x, lower + weight * (np.interp(x, grid, curves[hi]) - lower)
+
+
+def _full_scale_power_dbm(freq_ghz: float) -> float:
+    """Return the corrected or directly calibrated full-scale power."""
+    return float(_frequency_curve(freq_ghz)[1][-1])
 
 
 def min_verified_amp(freq_ghz: float) -> float:
-    """Lower bound of the empirical amplitude range; also check ``verified_amp_range``.
+    """Return the lower empirical support bound; low-band support is conditional on correction.
 
-    A lower bound alone does not imply support at all higher amplitudes: most low-band
-    nodes have an upper bound of 0.1 as well.
-    Between two calibrated frequencies the larger of their floors is used, so the answer is
-    conservative.  Below this empirical amplitude floor, fit residuals or acquisition review flags
-    prevent verification. The conversions extrapolate the law and warn with
-    :class:`CalibrationWarning`. Between measured frequencies the floor is itself an estimate,
-    not verification at the requested frequency.
+    This compatibility name does not mean direct unfiltered validation. See
+    :func:`verified_amp_range` and :class:`FilterOffsetWarning`.
 
-    :param freq_ghz: Carrier frequency in GHz, within the calibrated band.
-    :returns: Amplitude as a fraction of full scale.
-    :raises ValueError: If *freq_ghz* is non-finite or outside a supported calibration interval.
+    :param freq_ghz: Carrier frequency in GHz.
+    :returns: Dimensionless amplitude floor.
     """
     return verified_amp_range(freq_ghz)[0]
 
 
 def verified_amp_range(freq_ghz: float) -> Tuple[float, float]:
-    """Return empirical amplitude bounds, not an absolute accuracy guarantee.
+    """Return source-quality amplitude bounds, not an absolute accuracy guarantee.
 
-    Most low-band nodes return (0.1, 0.1): only this amplitude was measured.
-    Sparse checks at 0.1 and 1 GHz support the model over 0.01--1;
-    gap/high-band nodes use the reviewed sweep floor through amplitude 1.
-    Between nodes, return the intersection of their bounds. This is a conservative
-    estimate, not validation at an unmeasured frequency.
+    At 0.1–2.1 GHz these bounds apply to the corrected filtered curve and assume an
+    amplitude-independent offset. They do not claim a direct unfiltered amplitude sweep.
+    Elsewhere they apply to the direct sweep model. Off-grid bounds are the intersection
+    of endpoint bounds. Below the floor, conversions warn and extrapolate at 20 dB/decade.
+
+    :param freq_ghz: Carrier frequency in GHz.
+    :returns: Lower and upper dimensionless amplitude bounds.
     """
-    _, _, floor, _, ceiling = _load_calibration()
+    _, _, floors, _, ceilings, _, _ = _load_calibration()
     lo, hi = _bracket(freq_ghz)
-    return float(max(floor[lo], floor[hi])), float(min(ceiling[lo], ceiling[hi]))
+    return float(max(floors[lo], floors[hi])), float(min(ceilings[lo], ceilings[hi]))
 
 
 def _check_amp(amp: FloatArray) -> npt.NDArray[np.float64]:
@@ -188,13 +212,21 @@ def _check_amp(amp: FloatArray) -> npt.NDArray[np.float64]:
 def _warn_below_floor(freq_ghz: float, amps: npt.NDArray[np.float64]) -> None:
     """Warn outside either empirical amplitude bound (legacy internal name)."""
     floor, ceiling = verified_amp_range(freq_ghz)
+    lo, _ = _bracket(freq_ghz)
+    if _load_calibration()[0][lo] <= 2.1:
+        warnings.warn(
+            "0.1–2.1 GHz power is calculated by filter offset from the original filtered "
+            "amplitude curves. It is an unfiltered estimate assuming amplitude-independent "
+            "loss; offsets may also include path/session drift.",
+            FilterOffsetWarning,
+            stacklevel=3,
+        )
     tolerance = 8 * np.finfo(float).eps
-    outside = (amps < floor * (1-tolerance)) | (amps > ceiling * (1+tolerance))
+    outside = (amps < floor * (1 - tolerance)) | (amps > ceiling * (1 + tolerance))
     if np.any(outside):
         warnings.warn(
             f"Amplitude at {freq_ghz:.4f} GHz is outside the empirically supported "
             f"range [{floor:.6g}, {ceiling:.6g}]. "
-            + ("Only amplitude 0.1 was directly measured at a supporting frequency. " if floor == ceiling else "")
             + "The returned 20 dB/decade model estimate is unverified at this amplitude.",
             CalibrationWarning,
             stacklevel=3,
@@ -212,12 +244,14 @@ def amp_to_power_dbm(freq_ghz: float, amp: FloatArray) -> FloatArray:
     :raises ValueError: If the frequency is non-finite or outside a supported calibration interval, or any
         amplitude is non-finite, zero or above full scale.
     :warns CalibrationWarning: If any amplitude is outside :func:`verified_amp_range` at that
-        frequency; the value is still returned.
+        frequency; the value is still returned. Low-band calls also emit FilterOffsetWarning.
     """
     amps = _check_amp(amp)
-    full_scale_power = _full_scale_power_dbm(freq_ghz)
+    x, powers = _frequency_curve(freq_ghz)
     _warn_below_floor(freq_ghz, amps)
-    result = full_scale_power + 20.0 * np.log10(amps)
+    log_amp = np.log10(amps)
+    result = np.asarray(np.interp(log_amp, x, powers))
+    result = np.where(log_amp < x[0], powers[0] + 20 * (log_amp - x[0]), result)
     return float(result) if result.ndim == 0 else result
 
 
@@ -243,7 +277,7 @@ def power_dbm_to_amp(freq_ghz: float, power_dbm: float) -> float:
     :raises ValueError: If the frequency is non-finite or outside a supported calibration interval, or the
         power is non-finite or above what full-scale drive delivers.
     :warns CalibrationWarning: If the resulting amplitude is outside :func:`verified_amp_range` at
-        that frequency; the value is still returned.
+        that frequency; the value is still returned. Low-band calls also emit FilterOffsetWarning.
     """
     if not np.isfinite(power_dbm):
         raise ValueError("Power must be finite.")
@@ -253,7 +287,13 @@ def power_dbm_to_amp(freq_ghz: float, power_dbm: float) -> float:
             f"Requested power {power_dbm:.1f} dBm exceeds the full-scale output "
             f"{full_scale_power:.1f} dBm at {freq_ghz:.4f} GHz."
         )
-    amp = min(10.0 ** ((power_dbm - full_scale_power) / 20.0), 1.0)
+    x, powers = _frequency_curve(freq_ghz)
+    log_amp = (
+        x[0] + (power_dbm - powers[0]) / 20
+        if power_dbm < powers[0]
+        else float(np.interp(power_dbm, powers, x))
+    )
+    amp = min(10.0**log_amp, 1.0)
     if amp == 0.0:
         raise ValueError("Requested power underflows the representable positive amplitude range.")
     _warn_below_floor(freq_ghz, np.asarray(amp, dtype=np.float64))

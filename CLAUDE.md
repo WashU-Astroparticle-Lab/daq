@@ -274,29 +274,34 @@ Files are saved as `{number}-{device}-{type}.h5` (e.g., `00000042-Resonator_A-sw
 
 ### Calibrations (`daq/calibrations/`)
 
-Schema 3 is the unfiltered October 12 v2 model: 251 nodes, 0.1–9 GHz, 14,200 selected
-observations. Inputs are source_data/2026-10-12/. Historical Oct 2 low-band data used two
-low-pass filters and are excluded; Oct 2 high-band data were unfiltered and are retained.
-Power means SM200C analyzer-input power through the measured cable path, not de-embedded
-Presto output. Both conversions retain their GHz signatures and the 20 dB/decade law.
+Schema 4 / release v3 uses 251 nodes. **0.1–2.1 GHz is calculated by filter offset**, using
+all 5,050 original TWO-filter low-band readings and one unfiltered A=0.1 anchor per frequency.
+At each frequency the constant dB offset is the unfiltered anchor minus the filtered curve
+interpolated in log amplitude at A=0.1. Preserve the supported measured curve shape in the
+runtime; do not collapse it back to a fitted 20 dB/decade line. Invert the same monotonic
+piecewise curve. Original weak/flagged data remain preserved; below quality support use a
+warned 20 dB/decade extension from the floor. The quality-screen reference is not the low-band
+runtime model. Support is conditional on amplitude-independent filter/path correction.
 
-98 low nodes have only A=0.1 anchors; 0.1 and 1 GHz have sparse checks supporting A=0.01–1.
-151 gap/high nodes have dense sweeps, fitted from unflagged A>=0.1 points. Absolute residuals
->0.5 dB or acquisition flags limit empirical amplitude support. verified_amp_range returns
-both bounds; min_verified_amp alone does not imply all larger amplitudes were measured.
-Conversions warn outside either bound, but return model estimates. No absolute accuracy
-guarantee follows from this support rule or the 24 independent hardware spot checks.
+Direct gap/high behavior above 2.1 GHz remains analytic. 2.1 GHz is corrected and its direct
+gap sweep is an independent overlap check; 2.5 GHz uses the original direct high model.
+FilterOffsetWarning identifies low-band estimated provenance; CalibrationWarning also covers
+outside-amplitude-support estimates. Public GHz signatures and Hz convenience wrapper remain.
+Power is analyzer-input power, without cable-loss correction. No claimed universal spot-check
+accuracy or support for arbitrary ports, IF, currents or multiport DAC settings.
 
-All exact nodes remain usable. Stored interpolation flags block intervals touching the
-coarse 5 MHz DAC-switch scan windows or adjacent model-level jumps >1 dB. This is conservative
-review, not proof of exact hardware boundaries. Actual per-point DAC configurations were
-not logged. Changed ports, cables, currents, IF or shared-tile operation need separate validation.
+Current sources and deterministic derived tables: source_data/2026-10-16/. Negative offsets
+at 140/880/960 MHz are retained, not interpreted as physical passive gain. They can include
+session/path drift. The five same-day filter comparisons are contextual, not fitting inputs.
+20 frequency interpolation exclusions still protect uncertain DAC switches or >1 dB jumps.
+All exact nodes remain usable. Actual per-point DAC configurations were not logged.
 
-build_power_calibration.py rebuilds the asset, tests/test_calibrations.py tests it, and
-validate_power_calibration_update.py writes numerical diagnostics (all NumPy only).
-plot_power_calibration_update.py regenerates the current figure with matplotlib.
-docs/power_calibration_update.md explains provenance and limits. March artifacts and the
-2026-10-02 source policy are historical. Never use the filtered low table for unfiltered v2.
+build_power_calibration.py rebuilds asset and derived CSVs; tests/test_calibrations.py tests
+offset arithmetic, curve shape/inversion, warnings, direct-model compatibility and corrupt
+assets. validate_power_calibration_update.py produces independent-check diagnostics;
+plot_power_calibration_update.py produces current figures. NumPy is sufficient except for
+the matplotlib figures. Earlier source directories document historical versions. See
+docs/power_calibration_update.md for assumptions and validation.
 
 ### Analysis (`daq/analysis/`)
 

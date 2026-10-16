@@ -1,70 +1,199 @@
-"""Plot current model and independent hardware checks (NumPy and matplotlib)."""
-from pathlib import Path
+"""Plot corrected low-band curves and offset provenance (NumPy and matplotlib)."""
+
 import csv
+import importlib.util
+from pathlib import Path
+import warnings
 import numpy as np
 import matplotlib
-matplotlib.use('Agg')
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / 'daq/calibrations/source_data/2026-10-12'
+SOURCE = ROOT / "daq/calibrations/source_data/2026-10-16"
+
+
+def read(name):
+    with (SOURCE / name).open(newline="", encoding="utf-8") as stream:
+        return list(csv.DictReader(stream))
 
 
 def main():
-    with np.load(ROOT / 'daq/calibrations/power_calibration.npz') as data:
-        frequency = data['frequency_ghz']
-        power = data['power_dbm_at_amp_1']
-        allowed = data['interpolation_allowed']
-    plt.rcParams.update({'font.size': 12, 'axes.spines.top': False,
-                         'axes.spines.right': False, 'savefig.facecolor': 'white'})
-    fig, axes = plt.subplots(1, 2, figsize=(15, 6.5), gridspec_kw={'width_ratios': [1.4, 1]})
-    ax = axes[0]
-    for i in np.flatnonzero(allowed):
-        ax.plot(frequency[i:i+2], power[i:i+2] - 20, color='#b3bac2', lw=1, zorder=1)
-    for lo, hi, color, label in [(.1, 2.1, '#2477ad', 'Low band: direct A=0.1 anchors'),
-                                (2.1, 2.5, '#dc803b', 'Gap: amplitude-sweep model'),
-                                (2.5, 9.01, '#31846b', 'High band: amplitude-sweep model')]:
-        selected = (frequency >= lo) & (frequency < hi)
-        ax.scatter(frequency[selected], power[selected] - 20, s=14, color=color, label=label, zorder=2)
-    ax.set(xlabel='Source frequency (GHz)', ylabel='Power at amplitude 0.1 (dBm)',
-           title='Unfiltered calibration: 251 frequency nodes', xlim=(0, 9.2))
-    ax.legend(loc='lower left', fontsize=10, frameon=False)
-    ax.grid(alpha=.18)
-    ax = axes[1]
-    markers = ['o', 's', '^', 'D', 'v', 'P']
-    colors = ['#2477ad', '#765ba8', '#dc803b', '#31846b', '#ab4277', '#686868']
-    series = 0
-    for filename, fcol, divisor, pcol in [
-        ('low_amplitude_checks.csv', 'frequency_mhz', 1000, 'median_peak_power_dbm'),
-        ('high_validation.csv', 'frequency_ghz', 1, 'measured_power_dbm')]:
-        with (SOURCE / filename).open(newline='') as stream:
-            rows = list(csv.DictReader(stream))
-        for f in sorted(set(float(row[fcol]) / divisor for row in rows)):
-            group = [row for row in rows if float(row[fcol]) / divisor == f]
-            amps = np.array([float(row['amplitude']) for row in group])
-            index = np.flatnonzero(np.isclose(frequency, f, rtol=0, atol=1e-12))[0]
-            errors = np.array([float(row[pcol]) for row in group]) - (power[index] + 20 * np.log10(amps))
-            ax.scatter(amps, errors, marker=markers[series], color=colors[series], s=50,
-                       label=f'{f:g} GHz', edgecolors='white', linewidths=.5, zorder=3)
-            series += 1
-    ax.axhline(0, color='#777777', lw=1)
-    ax.set(xscale='log', xlabel='Presto amplitude setting (log scale)',
-           ylabel='Measured minus predicted power (dB)',
-           title='24 independent hardware spot observations', ylim=(-.21, .21))
-    ax.set_xticks([.01, .03, .1, .3, 1], labels=['0.01', '0.03', '0.1', '0.3', '1'])
-    ax.grid(alpha=.18)
-    ax.legend(ncol=3, loc='upper left', fontsize=10, frameon=False)
-    fig.suptitle('Power calibration updated with unfiltered measurements', x=.065, ha='left', fontsize=20, weight='bold')
-    fig.text(.065, .035,
-        'Analyzer-input power through the measurement cable; no cable-loss correction. Largest spot discrepancy: 0.166 dB.\n'
-        '98 low-band nodes have only amplitude 0.1 measured. Spot checks do not establish full-band accuracy. Lines omit excluded intervals.',
-        fontsize=10, color='#4a4a4a')
-    fig.subplots_adjust(left=.065, right=.985, top=.84, bottom=.22, wspace=.28)
-    output = ROOT / 'docs/power_calibration_october_diagnostic.png'
-    fig.savefig(output, dpi=180)
+    spec = importlib.util.spec_from_file_location("cal", ROOT / "daq/calibrations/__init__.py")
+    cal = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cal)
+    warnings.simplefilter("ignore", cal.CalibrationWarning)
+    corrected, anchors, checks, offsets = [
+        read(n)
+        for n in [
+            "low_corrected_power.csv",
+            "low_anchor.csv",
+            "low_amplitude_checks.csv",
+            "low_filter_offsets.csv",
+        ]
+    ]
+    plt.rcParams.update(
+        {
+            "font.size": 11,
+            "axes.spines.top": False,
+            "axes.spines.right": False,
+            "savefig.facecolor": "white",
+        }
+    )
+    fig, axes = plt.subplots(2, 3, figsize=(15, 9), sharex=True, sharey=True)
+    for f, ax in zip([0.1, 0.12, 0.5, 1.0, 2.1, 5.2], axes.flat):
+        if f <= 2.1:
+            rows = [r for r in corrected if float(r["frequency_mhz"]) == f * 1000]
+            aa = np.array([float(r["amplitude"]) for r in rows])
+            pp = np.array([float(r["median_peak_power_dbm"]) for r in rows])
+            raw = np.array([float(r["original_filtered_power_dbm"]) for r in rows])
+            ax.plot(aa, raw, color="#aaaaaa", linewidth=1.5)
+            ax.scatter(aa, pp, color="#287eb0", s=13, zorder=3)
+            bad = np.array([r["review_signal_or_timing"] == "True" for r in rows])
+            ax.scatter(aa[bad], pp[bad], marker="x", color="#be5630", s=25, zorder=4)
+            anchor = next(r for r in anchors if float(r["frequency_mhz"]) == f * 1000)
+            ax.scatter(
+                [0.1],
+                [float(anchor["median_peak_power_dbm"])],
+                marker="*",
+                s=110,
+                color="#22834a",
+                zorder=6,
+            )
+            for row in checks:
+                if float(row["frequency_mhz"]) == f * 1000:
+                    ax.scatter(
+                        float(row["amplitude"]),
+                        float(row["median_peak_power_dbm"]),
+                        marker="D",
+                        s=45,
+                        facecolors="none",
+                        edgecolors="#b13d8d",
+                        zorder=5,
+                    )
+            ax.set_title(f"{f:g} GHz — filter-offset corrected", fontsize=12)
+        else:
+            rows = [r for r in read("high_power.csv") if float(r["frequency_mhz"]) == f * 1000]
+            ax.scatter(
+                [float(r["amplitude"]) for r in rows],
+                [float(r["median_peak_power_dbm"]) for r in rows],
+                s=13,
+                color="#287eb0",
+            )
+            for row in read("high_validation.csv"):
+                if float(row["frequency_ghz"]) == f:
+                    ax.scatter(
+                        float(row["amplitude"]),
+                        float(row["measured_power_dbm"]),
+                        marker="D",
+                        s=45,
+                        facecolors="none",
+                        edgecolors="#b13d8d",
+                        zorder=5,
+                    )
+            ax.set_title(f"{f:g} GHz — direct unfiltered", fontsize=12)
+        floor = cal.min_verified_amp(f)
+        supported = np.geomspace(floor, 1, 250)
+        ax.plot(supported, cal.amp_to_power_dbm(f, supported), color="#13577f", linewidth=1.1)
+        tail = np.geomspace(0.001, floor, 30)
+        ax.plot(tail, cal.amp_to_power_dbm(f, tail), "--", color="#7d8790", linewidth=1)
+        ax.axvspan(0.001, floor, color="#eeeeee", zorder=0)
+        ax.set(xscale="log", xlim=(0.00085, 1.15), ylim=(-72, 8))
+        ax.set_xticks([0.001, 0.01, 0.1, 1], labels=["0.001", "0.01", "0.1", "1"])
+        ax.grid(alpha=0.18)
+    for ax in axes[-1]:
+        ax.set_xlabel("Amplitude setting (log scale)")
+    for ax in axes[:, 0]:
+        ax.set_ylabel("Analyzer-input power (dBm)")
+    handles = [
+        Line2D([], [], color="#aaaaaa", label="Original filtered curve"),
+        Line2D(
+            [],
+            [],
+            marker="o",
+            linestyle="",
+            color="#287eb0",
+            label="Corrected points / direct high points",
+        ),
+        Line2D([], [], marker="*", linestyle="", color="#22834a", label="Direct unfiltered anchor"),
+        Line2D(
+            [],
+            [],
+            marker="D",
+            linestyle="",
+            markerfacecolor="none",
+            color="#b13d8d",
+            label="Independent checks",
+        ),
+        Line2D(
+            [], [], marker="x", linestyle="", color="#be5630", label="Original acquisition flag"
+        ),
+    ]
+    fig.legend(
+        handles=handles,
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.94),
+        ncol=3,
+        frameon=False,
+        fontsize=10,
+    )
+    fig.suptitle(
+        "0.1–2.1 GHz: calculated by filter offset", x=0.07, ha="left", fontsize=20, weight="bold"
+    )
+    fig.text(
+        0.07,
+        0.035,
+        "Corrected curves estimate unfiltered power; they assume amplitude-independent loss and can include session/path drift.\nGray shading: outside source-quality support; dashed lines: warned extrapolation. No cable-loss correction.",
+        fontsize=10,
+        color="#444444",
+    )
+    fig.subplots_adjust(left=0.07, right=0.985, top=0.81, bottom=0.14, hspace=0.27, wspace=0.13)
+    fig.savefig(ROOT / "docs/power_calibration_october_diagnostic.png", dpi=160)
     plt.close(fig)
-    print(output)
+
+    fig, ax = plt.subplots(figsize=(11, 5.8))
+    f = np.array([float(r["frequency_mhz"]) / 1000 for r in offsets])
+    d = np.array([float(r["filter_offset_db"]) for r in offsets])
+    ax.plot(
+        f,
+        d,
+        "o-",
+        ms=3,
+        color="#287eb0",
+        label="Per-frequency correction applied to all 50 amplitudes",
+    )
+    ax.scatter(
+        f[d < 0],
+        d[d < 0],
+        marker="x",
+        s=60,
+        color="#be5630",
+        label="Negative offset retained",
+        zorder=4,
+    )
+    ax.axhline(0, color="#777777", lw=1)
+    ax.set(
+        xlabel="Source frequency (GHz)",
+        ylabel="Added power offset (dB)",
+        xlim=(0.05, 2.15),
+        title="Correction offsets: unfiltered anchor minus original filtered curve at A=0.1",
+    )
+    ax.grid(alpha=0.2)
+    ax.legend(frameon=False, fontsize=10)
+    fig.text(
+        0.1,
+        0.035,
+        "Offsets include possible filter loss, path changes and session drift. They are not isolated insertion-loss measurements.\nNegative offsets at 140, 880 and 960 MHz are flagged; the correction is not forced positive.",
+        fontsize=10,
+        color="#444444",
+    )
+    fig.subplots_adjust(left=0.1, right=0.97, bottom=0.22, top=0.9)
+    fig.savefig(ROOT / "docs/low_band_filter_offsets.png", dpi=170)
+    plt.close(fig)
+    print("Updated corrected-curve and offset figures.")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

@@ -1,75 +1,94 @@
-# Unfiltered power calibration v2 — 12 October 2026
+# Filter-offset-corrected power calibration — v3, 16 October 2026
 
-This proposed update replaces the filtered low-band portion of v1 with direct unfiltered
-measurements, fills the 2.1–2.5 GHz gap and keeps the unfiltered 2.5–9 GHz measurements.
-Both conversion function names and their GHz inputs are unchanged. It has not been installed
-on the acquisition computer. Hardware spot measurements have been
-compared offline with this model; they are distinct from software integration tests.
+**0.1–2.1 GHz is calculated by filter offset.** Both conversion functions now use the
+original low-band amplitude curves after correction, preserving their supported measured
+shape. These are estimates of unfiltered analyzer-input power, not direct unfiltered sweeps.
+This replaces the prior v2 single-amplitude-anchor implementation in PR #79. No new hardware
+measurements were taken for this revision, and it has not been installed on the acquisition PC.
 
-## Data and model
+## Correction calculation
 
-251 nodes cover 0.1–9 GHz: 100 low nodes below 2.1 GHz (20 MHz spacing), 20 gap nodes from
-2.1 to 2.48 GHz (20 MHz), and 131 high nodes from 2.5 to 9 GHz (50 MHz). 14,200 observations
-are selected. Overlap observations remain in the source files; 2.1 GHz uses the dense gap
-sweep and 2.5 GHz retains the original high sweep. Endpoints from different days are not averaged.
+The Oct 2 low-band sweep measured 101 frequencies (100–2100 MHz, 20 MHz spacing), with 50
+logarithmic amplitude settings from 0.001 to 1 at each frequency, through TWO cascaded
+Mini-Circuits VLFX-2500+ low-pass filters. On Oct 12, all 101 frequencies were measured without
+filters at amplitude 0.1. These datasets now define:
 
-The law is `P(A) = P1(f) + 20*log10(abs(A))`, with inverse
-`A = 10**((P - P1(f))/20)`. Negative amplitude has the same predicted power.
-At dense gap/high nodes, P1 is the median high-amplitude (A>=0.1), unflagged offset from this
-law. At low nodes P1 is the direct A=0.1 reading plus 20 dB. There, P1 is inferred, not a
-full-scale measurement. **98 low nodes only have A=0.1 measured.** Sparse independent checks
-at 0.1 and 1 GHz support A=0.01–1 without refitting those anchors. The 2.1 GHz check validates
-the gap model. There are 151 dense-sweep nodes in total.
-
-The old Oct 2 low-band campaign used two cascaded VLFX-2500+ low-pass filters. Those powers
-remain historical and are not used in v2. Direct unfiltered measurements avoid applying an
-assumed filter correction. Sparse same-day with/without tests establish loss only at their
-five measured frequencies; differences between campaigns can also include drift or setup changes.
-Suppressed spurs cannot be reconstructed reliably by adding a main-tone correction.
-
-## What the checks establish
-
-15 independent low-band amplitude observations (five each at 0.1, 1 and 2.1 GHz) have maximum
-absolute model discrepancy 0.1261 dB. Nine independent high-band checks (2.5, 5.2 and 9 GHz,
-targeting −40, −30 and −20 dBm) have maximum discrepancy 0.1660 dB. The earlier v1 commands
-generated the high check amplitudes; their high-band model is unchanged in v2. These points
-were not used to fit P1. Low checks at two frequencies do inform supported amplitude ranges.
-
-Dense-sweep amplitude support starts above every acquisition flag or absolute model residual
->0.5 dB. This fit-consistency rule is not an uncertainty bound, and repeated readings measure
-repeatability rather than absolute accuracy. Sparse five-point validation does not directly
-measure every intermediate amplitude. Full-band accuracy is not established by 24 spot points.
-
-The reproducible JSON diagnostic also reports withheld-frequency errors. Their maxima are
-0.669, 0.296 and 0.885 dB for low, gap and high bands, respectively, after interpolation
-exclusions. Withholding a node tests a wider bracket than normal interpolation; these values
-are diagnostics, not guaranteed errors. Do not claim a universal ±0.17 dB calibration accuracy.
-
-## Calling the functions
-
-```python
-from daq import amp_to_power_dbm, power_dbm_to_amp, verified_amp_range
-
-power_dbm = amp_to_power_dbm(5.2, 0.1)
-amplitude = power_dbm_to_amp(5.2, -20.0)
-lower, upper = verified_amp_range(5.2)
+```
+offset_dB(f) = P_unfiltered(f, 0.1) - P_filtered_interpolated(f, 0.1)
+P_corrected(f, A) = P_filtered(f, A) + offset_dB(f)
 ```
 
-Use GHz unless calling the explicitly named amp_to_power_dbm_hz convenience function.
-Amplitude is a dimensionless voltage fraction, not amperes. The supported amplitude range
-at a single-anchor node is (0.1, 0.1). Both functions warn but return model estimates outside
-the empirical range. min_verified_amp remains compatible but returns only its lower bound.
-Off-grid ranges use the intersection of the two endpoint ranges, still an estimate.
-The inverse rejects power above inferred full-scale power; it does not silently clip.
-Zero/nonfinite amplitude and amplitudes above magnitude 1 are rejected.
+The original 50-point amplitude grid does not include 0.1 exactly. Interpolate filtered dBm
+linearly in log amplitude between its two adjacent samples; both bracket samples must be
+unflagged. There is no fit to the separate amplitude-check observations and no averaging
+across different frequencies. Every original point receives the same frequency-specific
+offset, preserving all point-to-point amplitude differences.
 
-## Frequency interpolation and issue #69
+The correction assumes amplitude-independent loss and sufficiently comparable source/cable
+configurations between sessions. It includes possible path changes and drift, not only the
+filter's insertion loss. Offsets range from −0.2950 to +2.6642 dB. Negative values at 140,
+880 and 960 MHz are retained and flagged rather than forced positive; they cannot be read
+as evidence of passive-filter gain. The controlled same-day filter-pair comparisons at five
+frequencies are preserved separately for context. They were not substituted for the 101
+per-frequency anchors. No main-tone correction is used to reconstruct suppressed spurs/noise.
 
-The functions reject interpolation across intervals touching the previously reported coarse
-DAC-switch uncertainty windows, as well as adjacent fitted levels differing by >1 dB.
-The latter is a conservative review threshold, not a physical boundary identification.
-All 251 exact nodes work. Allowed intervals use linear interpolation of P1 in GHz; calibration
-does not extend to 10 GHz. The 20 excluded open intervals are below (GHz; endpoints usable):
+## Source selection and runtime behavior
+
+- Corrected low: 101 nodes, 5,050 original filtered observations, including 2.1 GHz.
+- Direct gap: 19 nodes at 2.12–2.48 GHz, 950 observations.
+- Direct high: 131 nodes at 2.5–9 GHz, 13,100 observations.
+
+The total is 251 nodes and 19,100 selected source rows. The full direct 2.1 GHz gap sweep
+remains an independent overlap check. The direct gap 2.5 GHz endpoint remains in the source
+table, but the original high-band 2.5 GHz model is retained.
+
+In the low band, the forward function interpolates corrected dBm against log amplitude and
+the inverse solves this same piecewise curve. Above 2.1 GHz the previous direct-sweep
+P1+20*log10(abs(A)) model is preserved. At permitted off-grid frequencies the two neighboring
+curves are blended at the requested amplitude; the inverse solves that blended curve.
+
+Quality screening retains the earlier acquisition flags and 0.5 dB absolute residual rule
+against a high-amplitude 20 dB/decade reference. That reference is used to choose a reliable
+lower amplitude bound; it does NOT replace the corrected low curve. All supported corrected
+curves must be strictly monotonic for a unique inverse. All 5,050 corrected samples remain
+in the CSV and NPZ, including weak/flagged samples. Below the supported bound, both functions
+warn and use a 20 dB/decade extension from that bound, instead of inverting noisy/nonmonotonic
+samples. Corrected-data support is conditional on the correction assumptions, not direct
+unfiltered verification at all amplitudes.
+
+Both functions emit FilterOffsetWarning (a CalibrationWarning subtype) when the query uses
+the corrected low band, including interpolation involving its endpoint. Outside amplitude
+support there is additionally a CalibrationWarning. verified_amp_range returns conditional
+source-quality bounds; min_verified_amp retains its older name for compatibility. Public
+conversion names and GHz inputs are unchanged; amp_to_power_dbm_hz takes Hz. Amplitude is
+dimensionless voltage fraction, not current in amperes. Above-full-scale requests fail.
+
+## Validation
+
+The software suite covers the exact original-plus-offset calculation for every point,
+all offsets' interpolation brackets, retained flags/negative offsets, preservation of
+supported curve samples and midpoint shape, inverse behavior between samples and frequencies,
+weak-tail handling, corrupt/obsolete assets, unchanged direct gap/high calculations and
+rebuilding every asset array. Agreement with corrected source knots is by construction and
+is not independent accuracy evidence.
+
+Independent Oct 12 observations, excluded from curve/offset construction:
+
+| Check | Points | Maximum absolute discrepancy |
+| --- | ---: | ---: |
+| Five amplitudes at 0.1, 1 and 2.1 GHz | 15 | 0.0392 dB |
+| High-band checks at 2.5, 5.2 and 9 GHz | 9 | 0.1660 dB |
+| Direct 2.1 GHz gap overlap, unflagged points above corrected support floor | 42 | 0.1639 dB |
+
+These checks support the correction at the tested locations but do not establish full-band
+accuracy, amplitude-independent loss everywhere, or universal ±0.04 dB performance. The
+101 anchors match by construction and are not counted as independent validation. Withheld
+frequency diagnostics are also in power_calibration_validation.json; they test wider spacing
+than ordinary interpolation and are not accuracy bounds.
+
+## Frequency exclusions and configuration
+
+Twenty open intervals remain excluded (GHz; exact measured endpoints work):
 
 ```
 (0.94, 0.96)
@@ -94,35 +113,32 @@ does not extend to 10 GHz. The 20 excluded open intervals are below (GHz; endpoi
 (8, 8.05)
 ```
 
-This prevents silent cross-step averaging but does not solve arbitrary DAC-configuration,
-shared-tile or multiport dependence. The source notebook assumes port 1, automatic Mixed
-mode, 40.5 mA DAC current and inverse-sinc disabled. Executed API version and per-point DAC
-configuration were not frozen in the logs. Treat these as setup assumptions.
+They overlap coarse DAC-switch scan uncertainty windows or adjacent full-scale levels differing
+by >1 dB. The latter is a conservative review rule, not proof of a hardware switch. No coverage
+above 9 GHz is claimed. Automatic Mixed mode, port 1, 40.5 mA DAC current and inverse-sinc
+disabled are source-notebook assumptions; actual per-point DAC configurations/API version were
+not frozen. Arbitrary manual settings, different ports or shared-tile use need separate validation.
 
-## Reference plane and acquisition limits
+## Reference plane and reproducibility
 
-Power is at the Signal Hound SM200C input through the actual unfiltered cable path, without
-cable-loss correction. It is not de-embedded power at the Presto connector, sample or cryostat.
-Changing that path can change the answer. Powers are flat-top trace maxima within ±100 kHz
-of the programmed tone, with 100 kHz RBW/VBW and average detection, summarized within a hold.
-They are not integrated channel power. Source logs and analyzer acquisitions were aligned
-after the run with guards; there was no hardware handshake. The new low anchors and sparse
-checks used 2 s holds; the gap and original high sweep used 0.5 s holds. Acquisition flags
-and original observations remain available rather than deleting inconvenient values.
+Power is at the SM200C analyzer input through the measurement cable, without cable-loss
+correction. Measurements use flat-top trace maxima near the programmed tone (±100 kHz,
+100 kHz RBW/VBW, average detector), not integrated channel power. Source/receiver logs were
+aligned after collection without a hardware handshake. Raw original powers and flags remain.
 
-## Reproduction and adoption
+Current inputs and derived tables are in daq/calibrations/source_data/2026-10-16/:
+low_filtered_power.csv is the original; low_filter_offsets.csv records every offset and
+bracket; low_corrected_power.csv records all corrected values next to their originals.
+Input SHA-256 hashes are embedded in the schema-4 NPZ; newline conversion is disabled.
 
-Run from the repository root with NumPy installed:
-
-```text
+```
 python scripts/build_power_calibration.py
 python tests/test_calibrations.py
 python scripts/validate_power_calibration_update.py
+python scripts/plot_power_calibration_update.py
 ```
 
-The optional matplotlib script plot_power_calibration_update.py regenerates the diagnostic.
-Source tables and policy are byte-hashed in the schema-3 NPZ; newline conversion is disabled
-for those files. The runtime rejects older assets. Install the runtime and NPZ together.
-The supplied standalone calibration.py plus adjacent NPZ exposes the same functions without
-importing the complete DAQ package. It changes no hardware settings. The patch is prepared
-against commit 9deebeb57803887097aef8146a93d6328d58b86b and should be reviewed before deployment.
+NumPy is sufficient except for matplotlib plotting. Install runtime and NPZ together;
+schema-3 anchor-only assets are rejected by this runtime. The portable package exposes
+the same functions from standalone/calibration.py. Historical v1/v2 files are preserved
+separately; the 2026-10-16 source directory is authoritative for the current revision.

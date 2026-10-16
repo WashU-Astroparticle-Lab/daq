@@ -1,5 +1,6 @@
 from .calibrations import (
     CalibrationWarning,
+    FilterOffsetWarning,
     amp_to_power_dbm,
     amp_to_power_dbm_hz,
     min_verified_amp,
@@ -22,6 +23,7 @@ from .triggers import resolve_trigger_states, trigger_for
 
 __all__ = [
     "CalibrationWarning",
+    "FilterOffsetWarning",
     "amp_to_power_dbm",
     "amp_to_power_dbm_hz",
     "min_verified_amp",

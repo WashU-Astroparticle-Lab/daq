@@ -1,3 +1,7 @@
+> Historical version documentation. Superseded on 16 October 2026 by ../2026-10-16/.
+> The CURRENT model uses the original filtered low-band curves after per-frequency filter
+> offset correction. Statements below about excluding them describe the prior v2 version.
+
 # Unfiltered calibration sources, 12 October 2026
 
 All current model inputs refer to the analyzer input with no external VLFX-2500+ filters.

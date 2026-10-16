@@ -1,3 +1,7 @@
+> Historical version documentation. Superseded on 16 October 2026 by ../2026-10-16/.
+> The CURRENT model uses the original filtered low-band curves after per-frequency filter
+> offset correction. Statements below about excluding them describe the prior v2 version.
+
 # Historical October 2 source tables
 
 These preserved tables contain 5,050 low-band and 13,100 high-band settings from the
