@@ -302,6 +302,7 @@ class Base:
                 "lsb", "usb", "freqs_usb", "freqs_lsb",
                 "signal", "signal_freqs",
                 "time_ms", "avg_iq",
+                "t_arr", "store_arr",  # pulsed acquisitions belong in HDF5, not BSON
             ]:
                 continue
             

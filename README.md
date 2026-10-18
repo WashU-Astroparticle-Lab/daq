@@ -86,7 +86,8 @@ cached on first use, `reload_settings()` picks up changes.
 
 ```
 daq/
-├── measurements/   Sweep, TimeStream, SweepPower, SweepFreqAndDC, TwoTonePower, QCTrace, BiasHunt, StdDevSweep
+├── measurements/   Sweep, TimeStream, SweepPower, SweepFreqAndDC, TwoTonePower,
+│                   RabiAmp, RabiTime, T1, QCTrace, BiasHunt, StdDevSweep
 ├── analysis/       resonator fits, noise PSDs, folding, plotting, Mattis-Bardeen
 ├── instruments/    VISA drivers: Agilent33220A (gate bias), DC2200 (LED)
 ├── db/             MongoDB logging and querying
@@ -171,6 +172,10 @@ python tests/test_calibrations.py && python tests/test_instruments.py && python 
 They are standalone scripts, not pytest suites — run them as scripts. Extend them when
 touching the instruments layer, `TimeStream.run()` or `analyze()`'s bias dispatch, `QCTrace`'s
 trigger routing, `BiasHunt`'s ranking, the resonator fitting adapter, or the plotting helpers.
+
+For the pulsed qubit measurements (`RabiAmp`, `RabiTime`, `T1`), run
+`python tests/test_pulsed_qubit.py` in the `presto` environment. It checks sequences,
+synthetic fits, plots, HDF5/metadata round trips and Presto's own offline sequence compiler.
 
 ## Conventions
 

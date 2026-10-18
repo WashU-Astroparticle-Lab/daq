@@ -42,12 +42,20 @@ Calibrated power is added automatically:
 | `power_dbm` | `Sweep`, `SweepFreqAndDC`, `QCTrace`, `BiasHunt` (scalar); `TimeStream` (per-tone list) |
 | `power_dbm_arr` | `SweepPower` (drive power array); `StdDevSweep` (one power per readout frequency, following the shape of `readout_freqs`: a flat list for a 1-D sweep, a nested `[step][tone]` list for a multitone grid) |
 | `readout_power_dbm`, `control_power_dbm_arr` | `TwoTonePower` |
+| `readout_power_dbm` | `RabiAmp`, `RabiTime`, `T1` |
 
 Fit results are added when auto-fitting succeeds (`Sweep`; `QCTrace` and `BiasHunt` carry none
 of their own, since neither fits a resonance — they read out where you tell them to):
 `fit_fr`, `fit_Qi`, `fit_Qc`, `fit_Ql` with their `_err` counterparts, plus `fit_kappa = fr/Qc`.
 These keys are simply absent when `auto_fit=False` or the fit fails — filter on them with
 `df['fit_fr'].notna()` rather than assuming they exist.
+
+Pulsed qubit records use types `rabi_amp`, `rabi_time` and `t1`. Their nested
+`fit_results` field contains `pi_amp`/`pi_amp_err`, per-amplitude `rabi_rate`/
+`rabi_rate_err`, or `t1`/`t1_err`, respectively, plus integration bounds. Times are
+in seconds, rates in Hz and amplitudes in full-scale fractions. The large raw
+`t_arr`/`store_arr` arrays and fitted curves stay in HDF5. Failed fits leave the
+database field absent; partially fitted RabiTime sweeps use `None` for failed rows.
 
 Auxiliary instrument state lands in the document too, if you call
 [`Base.attach()`](../instruments/README.md) before `run()`: each instrument's `settings()` is
