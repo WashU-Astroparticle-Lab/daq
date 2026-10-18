@@ -6,6 +6,9 @@ from .sweep_freq_and_dc import SweepFreqAndDC
 from .sweep_power import SweepPower
 from .timestream import TimeStream
 from .two_tone_power import TwoTonePower
+from .rabi_amp import RabiAmp
+from .rabi_time import RabiTime
+from .t1 import T1
 
 # Imported after TimeStream: all three compose TimeStream, QCTrace pulls in daq.analysis for
 # the folding step, and StdDevSweep composes QCTrace.
@@ -20,6 +23,9 @@ __all__ = [
     "BiasHunt",
     "LEDPulsedRamp",
     "QCTrace",
+    "RabiAmp",
+    "RabiTime",
+    "T1",
     "StdDevSweep",
     "Sweep",
     "SweepFreqAndDC",
