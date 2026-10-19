@@ -348,6 +348,8 @@ sp.analyze(norm=True, portrait=True)
 
 **Analysis**: 2D response heatmap (with the fitted `fr` overlaid as a scatter),
 plus best-fit `fr` and `Qi` (diag. corrected) vs. drive power with error bars.
+Pass `sp.analyze(show_errorbars=False)` to hide the error bars on both fitted
+parameter plots when the uncertainties are unreliable. Error bars are shown by default.
 Drive powers whose fit fails are omitted automatically.
 
 ---
@@ -1046,3 +1048,123 @@ loaded.analyze()
 - Measurement type is automatically determined from class name
 - Large data arrays are excluded from database (stored only in HDF5 files)
 - All measurements inherit error handling and robustness from `Base` class
+
+## Pulsed qubit calibration: RabiAmp, RabiTime and T1
+
+These measurements follow the Presto tutorials for
+[Rabi amplitude](https://www.intermod.pro/manuals/presto/tutorial_qubits/rabi_amp.html),
+[Rabi time](https://www.intermod.pro/manuals/presto/tutorial_qubits/rabi_time.html) and
+[energy relaxation T1](https://www.intermod.pro/manuals/presto/tutorial_qubits/t1.html).
+They use `presto.pulsed` in Mixed mode and the normal DAQ configuration, HDF5 saving,
+MongoDB metadata logging and `attach()` mechanism. They require Presto API 2.14 or
+newer (`setup_flat_pulse` and `setup_store`; verified offline with the installed API).
+
+| Class | Sweep | Control pulse | Fit results |
+|---|---|---|---|
+| `RabiAmp` | `control_amp_arr` | Fixed-duration sin²; `num_pulses=1` by default | `pi_amp`, `pi_amp_err` in FS, for **one** pi pulse |
+| `RabiTime` | `control_duration_arr` for each `control_amp_arr` | Square | `rabi_rate`, `rabi_rate_err` in Hz; `pi_duration` in seconds; `rate_slope` in Hz/FS and `rate_intercept` in Hz when at least two rows fit |
+| `T1` | `delay_arr` after the control pulse | Calibrated sin² pi pulse | `t1`, `t1_err` in seconds |
+
+Rabi amplitude uses a sinusoid with a fitted offset and phase; Rabi time uses a
+sinusoid with an exponential envelope for each amplitude; T1 uses an exponential
+with a fitted offset. RabiTime also fits the linear dependence of Rabi rate on drive
+amplitude. Its `pi_duration` calibrates a **square** pulse; use RabiAmp to calibrate
+the **sin²** pulse used by T1. All reported errors are one-sigma fit uncertainties.
+
+### Example calibration workflow
+
+Replace these illustrative frequencies, ports and timing values with your setup's
+parameters. Readout is at the resonator frequency and control is at the qubit frequency.
+The input port is called `sample_port`, matching the tutorials.
+
+```python
+import numpy as np
+from daq import RabiAmp, RabiTime, T1
+
+common = dict(
+    readout_freq=6.2e9,           # Hz
+    control_freq=4.2e9,           # Hz
+    readout_amp=0.1,              # full-scale voltage fraction
+    readout_duration=2.1e-6,      # seconds
+    sample_duration=2.5e-6,
+    readout_port=1,               # RF output: resonator
+    control_port=4,               # RF output: qubit (distinct from readout)
+    sample_port=1,                # RF input
+    wait_delay=100e-6,            # idle time after readout AND sampling finish
+    readout_sample_delay=0.0,     # sampling start relative to readout start
+    num_averages=100,
+    device="Qubit_A",            # required for run/save
+    notes="Qubit calibration",
+)
+
+rabi_amp = RabiAmp(
+    **common,
+    control_amp_arr=np.linspace(0, 0.2, 101),
+    control_duration=100e-9,
+)
+amp_file = rabi_amp.run()         # uses DAQ_PRESTO_ADDRESS/DAQ_PRESTO_PORT
+amp_fig = rabi_amp.analyze()
+pi_amp = rabi_amp.fit_results["pi_amp"]
+
+rabi_time = RabiTime(
+    **common,
+    control_amp_arr=np.linspace(0.001, 0.01, 21),
+    control_duration_arr=np.linspace(100e-9, 10e-6, 100),
+)
+time_file = rabi_time.run()
+time_fig = rabi_time.analyze()
+
+relaxation = T1(
+    **common,
+    control_amp=pi_amp,           # use the verified RabiAmp fit
+    control_duration=rabi_amp.control_duration,
+    delay_arr=np.linspace(0, 50e-6, 101),
+)
+t1_file = relaxation.run()
+t1_fig = relaxation.analyze()
+print(relaxation.fit_results["t1"] * 1e6, "µs")
+
+restored = T1.load(t1_file)
+restored.analyze()
+```
+
+`run(presto_address=..., presto_port=..., ext_ref_clk=True, save_filename=...)`
+accepts explicit connection and save-path overrides. `analyze()` returns a Matplotlib
+figure; call `figure.show()` or `plt.show()` in a script. It does not open a window itself.
+Inspect the fitted curves before using a calibration: an undersampled oscillation or
+an insufficient delay range does not establish a reliable pi pulse or T1.
+
+### Integration, storage and validation
+
+- All durations/delays are in **seconds**, frequencies in **Hz**, and amplitudes in
+  **full-scale fractions**. Sweeps must be finite, nonempty and strictly increasing.
+  A single amplitude (scalar or length-one array) is supported for RabiTime.
+  Control amplitudes allow zero for a reference measurement; readout amplitude and
+  T1 control amplitude must be positive. No amplitude may exceed 1. Amplitude LUTs
+  allow at most 512 points. Ports are one-based RF ports 1–8.
+- `run()` rounds timing to the connected Presto's event-clock grid and retains those
+  actual values in the object and file. It rejects durations that round to zero or
+  sweep points that collapse onto the same clock tick. Hardware memory and sequence
+  limits are checked by the Presto API.
+- `t_arr` is time relative to each sampling window. `store_arr` is complex raw I/Q
+  with shape `(points, 1, samples)`. For RabiTime, points are ordered by amplitude,
+  then duration. Integrated `resp_arr` has shape `(amplitudes, durations)` for
+  RabiTime and `(points,)` for the other two classes.
+- Integration averages the whole sampling window by default. To exclude a startup
+  transient, use `fit(sample_start=0.5e-6, sample_end=2e-6)` or the same arguments to
+  `analyze()`. Bounds are relative to **sampling start**, with an exclusive end.
+  The complex response is rotated onto its principal axis before fitting. Readout
+  quadrature is not a calibrated excited-state probability.
+- `auto_fit=True` fits before saving. Failed fits emit a warning and still save raw
+  data. `auto_fit=False` disables fitting during acquisition; `analyze(fit=False)`
+  plots integrated data only. Insufficient/flat RabiTime rows get `None` entries
+  and messages in `fit_errors`; other rows can still fit. Explicit `fit()` raises
+  if no usable fit can be obtained. RabiAmp needs at least six sweep points,
+  RabiTime needs at least six durations, and T1 needs at least four delays to fit.
+- HDF5 retains raw data, metadata, integration bounds and fit results. MongoDB gets
+  parameters and fit summaries without the large raw traces or fitted curves.
+  `load()` restores stored fits without rerunning them. A later `fit()`/`analyze()`
+  updates the in-memory result; call `save()` to persist it in a new record.
+
+Offline verification: `python tests/test_pulsed_qubit.py` in the `presto` environment.
+The tests do not connect to hardware or MongoDB.

@@ -292,7 +292,9 @@ class SweepPower(Base):
 
         return fr, fr_err, qi, qi_err
 
-    def analyze(self, norm: bool = True, portrait: bool = True):
+    def analyze(
+        self, norm: bool = True, portrait: bool = True, show_errorbars: bool = True
+    ):
         """Plot the 2D response map and the fitted resonator parameters.
 
         The left/top panel shows the response-amplitude map over frequency and
@@ -300,7 +302,7 @@ class SweepPower(Base):
         at each drive power. The remaining two panels show the best-fit
         resonant frequency ``fr`` and internal quality factor ``Qi``
         (diagonally corrected) as a function of drive power, each with
-        fit-error bars.
+        optional fit-error bars.
 
         Fits frequently fail at some -- or all -- drive powers; those points
         are simply omitted from every panel (and drawn without an error bar
@@ -314,6 +316,9 @@ class SweepPower(Base):
         :type norm: bool
         :param portrait: Stack the panels vertically instead of side-by-side.
         :type portrait: bool
+        :param show_errorbars: Show fit uncertainties on the ``fr`` and ``Qi``
+            plots (default True). Set False to hide unreliable error bars.
+        :type show_errorbars: bool
         :return: The created figure.
         :rtype: matplotlib.figure.Figure
         """
@@ -415,7 +420,7 @@ class SweepPower(Base):
             ax2.errorbar(
                 power_dbm[finite_fr],
                 1e-9 * fr[finite_fr],
-                yerr=1e-9 * fr_err_safe[finite_fr],
+                yerr=1e-9 * fr_err_safe[finite_fr] if show_errorbars else None,
                 fmt=".-",
                 capsize=3,
             )
@@ -427,7 +432,7 @@ class SweepPower(Base):
             ax3.errorbar(
                 power_dbm[finite_qi],
                 qi[finite_qi],
-                yerr=qi_err_safe[finite_qi],
+                yerr=qi_err_safe[finite_qi] if show_errorbars else None,
                 fmt=".-",
                 capsize=3,
             )

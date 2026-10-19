@@ -16,6 +16,10 @@ classifiers = [
   "Topic :: Scientific/Engineering :: Physics",
 ]
 repository = "https://github.com/WashU-Astroparticle-Lab/daq"
+include = [
+  {path = "daq/calibrations/source_data/*.s2p", format = ["sdist", "wheel"]},
+  {path = "daq/calibrations/source_data/fridge_loss_to_mc.csv", format = ["sdist", "wheel"]}
+]
 
 [tool.poetry.dependencies]
 python = ">=3.11"
