@@ -1,0 +1,3 @@
+# Preserve exact acquisition table/policy bytes for the SHA-256 provenance checks.
+*.csv -text whitespace=cr-at-eol
+interpolation_policy.json -text whitespace=cr-at-eol

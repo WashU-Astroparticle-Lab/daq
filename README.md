@@ -100,31 +100,50 @@ daq/
 `daq/utils.py` is a backward-compatible facade; new code should use `daq.config` and
 `daq.time_utils`.
 
-Power calibration is exported at top level — `amp_to_power_dbm(freq_ghz, amp)` and
-`power_dbm_to_amp(freq_ghz, power_dbm)` — so a measurement can be set up in dBm
-(`amp=power_dbm_to_amp(5.0, -20.0)`). Here `amp` is a full-scale voltage
-fraction, so its power dependence is `20 log10(amp)`; `SweepPower` and
-`TwoTonePower` label their axes with the calibration. Any `0 < |amp| <= 1` converts, but
-below `min_verified_amp(freq_ghz)` — the amplitude where the spectrum analyzer's own floor
-started hiding the tone during calibration — the conversion is an extrapolation of that law
-and raises a `CalibrationWarning` to say so.
+Power calibration is exported at top level: `amp_to_power_dbm(freq_ghz, amp)`,
+`amp_to_power_dbm_hz(freq_hz, amp)`, `power_dbm_to_amp(freq_ghz, power_dbm)`,
+`min_verified_amp(freq_ghz)` and `verified_amp_range(freq_ghz)`.
 
-The spectrum-analyzer sweeps the asset was built from are committed under
-`daq/calibrations/source_data/`. Regenerate the packaged asset—and optionally its diagnostic
-figure—with:
+**0.1–2.1 GHz is calculated by filter offset:** 101 original filtered amplitude curves
+(50 points each) are shifted using the per-frequency unfiltered amplitude-0.1 scan.
+The runtime preserves supported measured curve shape by interpolating dBm versus log
+amplitude, and the inverse solves that same curve. These are estimates of unfiltered
+power, not direct unfiltered amplitude sweeps. Calls emit `FilterOffsetWarning`, a subtype
+of `CalibrationWarning`. The offset can include session/path changes and assumes a
+constant dB shift across amplitude. Negative offsets are retained and flagged.
 
-```bash
-python scripts/build_power_calibration.py --diagnostic-plot docs/power_calibration_diagnostic.png
+Above 2.1 GHz, the existing direct unfiltered gap/high sweep models retain the
+`P(A)=P1(f)+20*log10(abs(A))` law. Altogether there are 251 frequency nodes from 0.1 to 9 GHz.
+All exact nodes are usable; 20 open frequency intervals reject interpolation around uncertain
+switches or large level jumps. Outside amplitude support, conversions warn and extrapolate
+20 dB/decade from the supported floor. Low-band support is conditional on the filter correction.
+
+```python
+from daq import amp_to_power_dbm, power_dbm_to_amp, verified_amp_range
+
+power = amp_to_power_dbm(0.5, 0.1)  # GHz; emits FilterOffsetWarning
+amplitude = power_dbm_to_amp(0.5, power)
+bounds = verified_amp_range(0.5)
 ```
 
-Two more figures document the calibration and can be regenerated the same way:
-`docs/power_calibration_interpolation.png` (`scripts/plot_power_calibration_interpolation.py`)
-shows how the conversions behave at frequencies with no calibration data — the interpolated
-full-scale power and verified floor across the band, every DAC-configuration switch, and nine
-off-grid frequencies drawn between their calibrated neighbours — and is the plot to check after
-any rebuild. `docs/power_calibration_before_after.png`
-(`scripts/plot_power_calibration_before_after.py`) compares it with the four-corner grid it
-replaced.
+Power refers to analyzer input through the measurement cable, without cable-loss correction;
+amplitude is a dimensionless voltage fraction. Independent low-band checks (15 points) differ
+by at most 0.0392 dB and high-band checks (9 points) by 0.1660 dB. This is limited spot-check
+agreement, not a full-band accuracy guarantee. Corrected-point agreement is by construction.
+
+See [correction method and limits](docs/power_calibration_update.md) and the current inputs,
+offsets and full corrected table in `daq/calibrations/source_data/2026-10-16/`.
+Rebuild and validate offline with NumPy:
+
+```bash
+python scripts/build_power_calibration.py
+python tests/test_calibrations.py
+python scripts/validate_power_calibration_update.py
+```
+
+`python scripts/plot_power_calibration_update.py` regenerates the current figures (matplotlib).
+The schema-4 asset and runtime must be deployed together. Earlier source directories and March
+figures are historical. This update has not been installed on the acquisition computer.
 
 `nominal_fridge_loss(freq_hz)` returns the nominal fridge loss in **dB**, with frequency
 in **Hz** (scalar or array). The default is the **input-line loss down to the mixing

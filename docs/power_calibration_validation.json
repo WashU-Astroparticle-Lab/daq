@@ -1,0 +1,191 @@
+{
+  "calibration_id": "presto-port1-filter-offset-lowband-2026-10-16-v3",
+  "reference_plane": "Estimated unfiltered SM200C analyzer-input power through the measurement cable path; 0.1\u20132.1 GHz calculated by filter offset; no cable-loss correction",
+  "measured_frequency_nodes": 251,
+  "selected_observations": 19100,
+  "amplitude_support": {
+    "direct_unfiltered_sweep": 150,
+    "filter_offset_corrected_curve": 101
+  },
+  "excluded_open_intervals_ghz": [
+    [
+      0.94,
+      0.96
+    ],
+    [
+      1.02,
+      1.04
+    ],
+    [
+      2.0,
+      2.02
+    ],
+    [
+      2.38,
+      2.4
+    ],
+    [
+      2.4,
+      2.42
+    ],
+    [
+      2.95,
+      3.0
+    ],
+    [
+      3.0,
+      3.05
+    ],
+    [
+      4.25,
+      4.3
+    ],
+    [
+      4.85,
+      4.9
+    ],
+    [
+      4.9,
+      4.95
+    ],
+    [
+      5.55,
+      5.6
+    ],
+    [
+      5.6,
+      5.65
+    ],
+    [
+      6.0,
+      6.05
+    ],
+    [
+      6.55,
+      6.6
+    ],
+    [
+      6.95,
+      7.0
+    ],
+    [
+      7.0,
+      7.05
+    ],
+    [
+      7.05,
+      7.1
+    ],
+    [
+      7.1,
+      7.15
+    ],
+    [
+      7.95,
+      8.0
+    ],
+    [
+      8.0,
+      8.05
+    ]
+  ],
+  "hardware_validation": {
+    "low_amplitude_checks.csv": {
+      "points": 15,
+      "max_abs_error_db": 0.03914197285966736,
+      "mean_signed_error_db": 0.013848643832727199,
+      "residual_db": [
+        -0.005232493082722556,
+        0.026297887166322198,
+        0.019456863403318536,
+        0.019438107808434246,
+        0.01818974812826113,
+        -0.010289510091190834,
+        0.01883665720620087,
+        0.0069293975830078125,
+        0.019357363382979997,
+        0.010694662729907378,
+        0.03914197285966736,
+        0.028981526692692938,
+        0.00214385986328125,
+        0.010101159413657967,
+        0.0036824544270896986
+      ]
+    },
+    "high_validation.csv": {
+      "points": 9,
+      "max_abs_error_db": 0.165924072265625,
+      "mean_signed_error_db": -0.10611195034450877,
+      "residual_db": [
+        -0.165924072265625,
+        -0.03560829162597656,
+        -0.05012702941894531,
+        -0.15121078491210227,
+        -0.12697982788085582,
+        -0.12075996398926137,
+        -0.10239219665527344,
+        -0.0862503051757777,
+        -0.11575508117676137
+      ]
+    }
+  },
+  "leave_one_frequency_out": {
+    "low": {
+      "points": 93,
+      "absolute_error_db_median_p95_max": [
+        0.16917196909586352,
+        0.5060264269510915,
+        0.6627670923868823
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    },
+    "gap": {
+      "points": 16,
+      "absolute_error_db_median_p95_max": [
+        0.075416141626787,
+        0.2558338447492952,
+        0.29575149380430976
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    },
+    "high": {
+      "points": 106,
+      "absolute_error_db_median_p95_max": [
+        0.22205271142901584,
+        0.6886707002466408,
+        0.8845364108230127
+      ],
+      "note": "Withholding measured nodes tests a wider frequency interval than normal interpolation; not an accuracy bound."
+    }
+  },
+  "meaning": "Low-band powers are calculated by filter offset from 5050 filtered observations, not direct unfiltered sweeps. Corrected-knot agreement is by construction, not independent validation. Above 2.1 GHz uses direct sweeps. Spot checks do not certify full-band accuracy.",
+  "filter_offset_correction": {
+    "points": 5050,
+    "frequencies": 101,
+    "formula": "P_corrected(f,A)=P_filtered(f,A)+[P_unfiltered(f,0.1)-interpolate_log_A(P_filtered(f,A),0.1)]",
+    "offset_range_db": [
+      -0.29499244689942117,
+      2.6641305287678954
+    ],
+    "negative_offsets": [
+      {
+        "frequency_mhz": 140.0,
+        "offset_db": -0.027807235717780543
+      },
+      {
+        "frequency_mhz": 880.0,
+        "offset_db": -0.030337015787768706
+      },
+      {
+        "frequency_mhz": 960.0,
+        "offset_db": -0.29499244689942117
+      }
+    ],
+    "assumptions": "Constant dB shift across amplitude at each frequency. Offset includes possible session/path drift. Separate five-frequency filter comparison is not used to fit these offsets."
+  },
+  "direct_2p1GHz_overlap_check": {
+    "points": 42,
+    "max_abs_error_db": 0.1638456980388341,
+    "note": "Unflagged direct gap observations above the corrected-curve quality floor; not used to fit the corrected 2.1-GHz endpoint."
+  }
+}

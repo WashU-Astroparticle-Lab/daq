@@ -1,0 +1,12 @@
+{
+  "schema_version": 2,
+  "calibration_id": "presto-port1-2026-10-02-v1",
+  "bands_ghz": [[0.1, 2.1], [2.5, 9.0]],
+  "switch_scan_upper_ghz": [2.4, 3.0, 4.27, 4.9, 5.605, 7.005, 7.105, 8.0],
+  "switch_scan_step_ghz": 0.005,
+  "switch_source": "https://github.com/WashU-Astroparticle-Lab/daq/issues/69; Presto 2.17.1 recommended_dac_config scan at 5 MHz spacing, as reported in issue and repository plotting script",
+  "policy": "Reject off-grid interpolation if the closed interval between its measured neighbors touches a scan uncertainty interval [upper - step, upper]. Exact measured nodes remain available. Also reject intervals spanning the unmeasured band gap. These are conservative exclusion intervals, not exact DAC switch boundaries.",
+  "configuration_limit": "Actual DAC configurations and API version were not logged per October point. Single-port automatic Mixed configuration is assumed from the source notebook. Different configurations, output ports, DAC currents, nonzero IF, or shared-tile multiport operation require separate validation.",
+  "reference_plane": "Signal Hound SM200C analyzer input, original measurement cable path; no cable-loss correction",
+  "measurement": "2026-10-02; median trace-peak power within +/-100 kHz of programmed frequency; RBW/VBW 100 kHz, flat-top, average detector; 0.5 s programmed dwell. Source amplitudes and spectra matched after acquisition using fitted clock alignment; this is not hardware-synchronized calibration."
+}

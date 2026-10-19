@@ -1,0 +1,27 @@
+{
+  "schema_version": 3,
+  "calibration_id": "presto-port1-unfiltered-2026-10-12-v2",
+  "bands_ghz": [
+    [
+      0.1,
+      9.0
+    ]
+  ],
+  "switch_scan_upper_ghz": [
+    2.4,
+    3.0,
+    4.27,
+    4.9,
+    5.605,
+    7.005,
+    7.105,
+    8.0
+  ],
+  "switch_scan_step_ghz": 0.005,
+  "switch_source": "https://github.com/WashU-Astroparticle-Lab/daq/issues/69; Presto 2.17.1 recommended_dac_config scan at 5 MHz spacing, as reported in issue and repository plotting script",
+  "policy": "Reject interpolation across coarse DAC-switch uncertainty intervals and any adjacent measured model-level jump >1 dB. The 1 dB threshold is a conservative data-review rule, not an identified hardware boundary. Exact measured nodes remain available; allowed interpolation is still an estimate.",
+  "configuration_limit": "Actual DAC configurations and API version were not logged per October point. Single-port automatic Mixed configuration is assumed from the source notebook. Different configurations, output ports, DAC currents, nonzero IF, or shared-tile multiport operation require separate validation.",
+  "reference_plane": "Signal Hound SM200C analyzer input through the unfiltered measurement cable path; no external VLFX-2500+ filters, no cable-loss correction",
+  "measurement": "Oct 12: direct low-band amplitude-0.1 anchors and gap sweeps, plus held-out low-band amplitude checks. Oct 2: unfiltered high-band sweeps. Trace peaks within +/-100 kHz, 100 kHz RBW/VBW, post-run source-log alignment. No filtered low-band powers used in this asset.",
+  "maximum_adjacent_jump_db": 1.0
+}
