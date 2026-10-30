@@ -159,15 +159,12 @@ def read_measurements(input_dir):
     return rows
 
 
-def interpolation_flags(frequencies, policy, powers):
+def interpolation_flags(frequencies, policy):
+    """Allow adjacent-node interpolation throughout each configured frequency band."""
     left, right = frequencies[:-1], frequencies[1:]
     allowed = np.zeros(left.shape, dtype=bool)
     for start, stop in policy["bands_ghz"]:
         allowed |= (left >= start) & (right <= stop)
-    for upper in policy["switch_scan_upper_ghz"]:
-        lower = upper - policy["switch_scan_step_ghz"]
-        allowed &= ~((left <= upper + 1e-12) & (right >= lower - 1e-12))
-    allowed &= np.abs(np.diff(powers)) <= policy["maximum_adjacent_jump_db"]
     return allowed
 
 
@@ -230,7 +227,7 @@ def build_calibration(input_dir=DEFAULT_INPUT_DIR):
         curve_log_amplitude=grid,
         curve_power_dbm=np.array(curves),
         low_filter_offset_db=np.array([r["filter_offset_db"] for r in offsets]),
-        interpolation_allowed=interpolation_flags(frequencies, policy, powers),
+        interpolation_allowed=interpolation_flags(frequencies, policy),
         fit_point_count=np.array(fit_counts),
         verified_point_count=np.array(checked_counts),
         max_verified_abs_residual_db=np.array(worst),

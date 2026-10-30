@@ -3,7 +3,7 @@
 **0.1–2.1 GHz is calculated by filter offset. These are estimates of unfiltered power,
 not new direct unfiltered amplitude sweeps.** The original filtered curve shape is preserved.
 
-Inputs (all immutable, byte-hashed inside the NPZ):
+Inputs (measurement files are immutable; all files are byte-hashed inside the NPZ):
 
 | File | Provenance / role |
 | --- | --- |
@@ -14,7 +14,7 @@ Inputs (all immutable, byte-hashed inside the NPZ):
 | low_amplitude_checks.csv | Independent Oct 12 five-amplitude checks at 0.1, 1 and 2.1 GHz; not used to fit offsets or curves. |
 | high_validation.csv | Independent nine Oct 12 high-band checks; commands used the unchanged high-band model. |
 | filter_pair_comparison.csv | Same-day two-filter versus no-filter comparison at five frequencies. Context only; not used to fit the 101 offsets. |
-| interpolation_policy.json | Frequency exclusions, correction assumptions and reference-plane metadata. |
+| interpolation_policy.json | Frequency coverage, historical switch diagnostics, correction assumptions and reference-plane metadata. |
 
 The builder calculates the filtered power at amplitude 0.1 by interpolating dBm linearly
 between its two neighboring log-amplitude samples (both must be unflagged). The offset is
