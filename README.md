@@ -114,8 +114,10 @@ constant dB shift across amplitude. Negative offsets are retained and flagged.
 
 Above 2.1 GHz, the existing direct unfiltered gap/high sweep models retain the
 `P(A)=P1(f)+20*log10(abs(A))` law. Altogether there are 251 frequency nodes from 0.1 to 9 GHz.
-All exact nodes are usable; 20 open frequency intervals reject interpolation around uncertain
-switches or large level jumps. Outside amplitude support, conversions warn and extrapolate
+All frequencies in that band are usable, with linear interpolation in dBm between adjacent
+calibration curves, including uncertain DAC switches and large level jumps. Interpolation
+estimates the transition between nodes and does not resolve hardware steps. Outside amplitude
+support, conversions warn and extrapolate
 20 dB/decade from the supported floor. Low-band support is conditional on the filter correction.
 
 ```python
@@ -142,6 +144,8 @@ python scripts/validate_power_calibration_update.py
 ```
 
 `python scripts/plot_power_calibration_update.py` regenerates the current figures (matplotlib).
+The [frequency coverage diagnostics](docs/power_calibration_update.md#frequency-interpolation-and-configuration)
+show all 20 reopened intervals and the conversion at 6.9968 GHz, with reproduction commands.
 The schema-4 asset and runtime must be deployed together. Earlier source directories and March
 figures are historical. This update has not been installed on the acquisition computer.
 

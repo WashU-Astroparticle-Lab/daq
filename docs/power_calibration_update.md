@@ -1,10 +1,11 @@
-# Filter-offset-corrected power calibration — v3, 16 October 2026
+# Filter-offset-corrected power calibration — v4, 30 October 2026
 
 **0.1–2.1 GHz is calculated by filter offset.** Both conversion functions now use the
 original low-band amplitude curves after correction, preserving their supported measured
 shape. These are estimates of unfiltered analyzer-input power, not direct unfiltered sweeps.
-This replaces the prior v2 single-amplitude-anchor implementation in PR #79. No new hardware
-measurements were taken for this revision, and it has not been installed on the acquisition PC.
+Release v3 replaced the prior v2 single-amplitude-anchor implementation in PR #79. Release v4
+keeps those calibration curves and enables interpolation throughout 0.1–9 GHz, including all
+20 previously rejected intervals. No new hardware measurements were taken for this revision.
 
 ## Correction calculation
 
@@ -86,9 +87,11 @@ accuracy, amplitude-independent loss everywhere, or universal ±0.04 dB performa
 frequency diagnostics are also in power_calibration_validation.json; they test wider spacing
 than ordinary interpolation and are not accuracy bounds.
 
-## Frequency exclusions and configuration
+## Frequency interpolation and configuration
 
-Twenty open intervals remain excluded (GHz; exact measured endpoints work):
+All 250 adjacent intervals across 0.1–9 GHz now interpolate linearly in dBm between
+calibration curves. This includes the following 20 intervals that release v3 rejected
+(GHz; exact measured-node values are unchanged):
 
 ```
 (0.94, 0.96)
@@ -113,11 +116,41 @@ Twenty open intervals remain excluded (GHz; exact measured endpoints work):
 (8, 8.05)
 ```
 
-They overlap coarse DAC-switch scan uncertainty windows or adjacent full-scale levels differing
-by >1 dB. The latter is a conservative review rule, not proof of a hardware switch. No coverage
-above 9 GHz is claimed. Automatic Mixed mode, port 1, 40.5 mA DAC current and inverse-sinc
+The old exclusions touched coarse DAC-switch scan uncertainty windows or had adjacent
+full-scale levels differing by >1 dB. Those criteria are now diagnostic context, not rejection
+rules: 15 intervals touched a switch window and 5 were rejected only for a level jump.
+For example, `power_dbm_to_amp(6.9968, -32.0)` now returns `0.056801045968`, interpolating
+between the 6.95 and 7.00 GHz curves (full-scale power at 6.9968 GHz is −7.087126663 dBm). No new
+measurements are introduced: interpolating across a switch smooths a possible hardware step
+and does not establish its location or accuracy. Out-of-band frequencies and requests above
+the interpolated full-scale power still raise errors. Existing low-band provenance and
+below-amplitude-support warnings remain. No coverage above 9 GHz is claimed.
+
+Automatic Mixed mode, port 1, 40.5 mA DAC current and inverse-sinc
 disabled are source-notebook assumptions; actual per-point DAC configurations/API version were
 not frozen. Arbitrary manual settings, different ports or shared-tile use need separate validation.
+
+The overview compares the previous coverage with the current conversion functions; the
+close-ups show all 20 reopened intervals and their endpoint level differences. Calibration
+nodes are identical to release v3. Each close-up has its own y scale.
+
+![Frequency coverage and conversion at 6.9968 GHz](power_calibration_coverage.png)
+
+![All 20 reopened interpolation intervals](power_calibration_reopened_intervals.png)
+
+Reproduce these comparisons against the release-v3 asset:
+
+```bash
+git show 19998f7e963231e53ed50680e88fa9e66e3f618e:daq/calibrations/power_calibration.npz > /tmp/daq-calibration-v3.npz
+python scripts/plot_power_calibration_coverage.py --baseline /tmp/daq-calibration-v3.npz
+```
+
+The plotting script also checks that all numerical calibration data are unchanged. The
+regression suite checks all 250 intervals at three frequency weights and multiple amplitudes,
+the 6.9968 GHz case, and every previously rejected region. The regenerated validation report
+includes previously excluded neighborhoods in its leave-one-frequency-out diagnostic; the
+high-band maximum is now about 3.00 dB near the large transition. This wider-spacing test is
+not an accuracy bound for ordinary interpolation.
 
 ## Reference plane and reproducibility
 

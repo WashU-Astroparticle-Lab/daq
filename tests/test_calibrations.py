@@ -141,39 +141,74 @@ check(
     ),
 )
 allowed = asset["interpolation_allowed"]
-allowed_ok = blocked_ok = floors_ok = True
-for i, ok in enumerate(allowed):
-    f = float((cal_freqs[i] + cal_freqs[i + 1]) / 2)
-    if ok:
-        expected = (asset["power_dbm_at_amp_1"][i] + asset["power_dbm_at_amp_1"][i + 1]) / 2
-        allowed_ok &= np.isclose(amp_to_power_dbm(f, 1), expected)
-        floors_ok &= min_verified_amp(f) == max(cal_floors[i : i + 2])
-    else:
-        blocked_ok &= all(
-            raises(fn)
-            for fn in (
-                lambda: amp_to_power_dbm(f, 0.1),
-                lambda: power_dbm_to_amp(f, -20),
-                lambda: amp_to_power_dbm_hz(f * 1e9, 0.1),
-                lambda: min_verified_amp(f),
+check("all 250 adjacent intervals permit interpolation", len(allowed) == 250 and np.all(allowed))
+interpolation_ok = floors_ok = inverse_ok = True
+for i in range(len(allowed)):
+    # Asymmetric weights exercise interpolation beyond just interval midpoints.
+    for weight in (0.1, 0.5, 0.9):
+        f = float((1 - weight) * cal_freqs[i] + weight * cal_freqs[i + 1])
+        floor = max(cal_floors[i : i + 2])
+        floors_ok &= calibrations.verified_amp_range(f) == (floor, 1.0)
+        for amplitude in (float(floor), 0.1, 1.0):
+            expected = (1 - weight) * amp_to_power_dbm(
+                float(cal_freqs[i]), amplitude
+            ) + weight * amp_to_power_dbm(float(cal_freqs[i + 1]), amplitude)
+            actual = amp_to_power_dbm(f, amplitude)
+            interpolation_ok &= np.isclose(actual, expected, atol=1e-12)
+            interpolation_ok &= np.isclose(
+                amp_to_power_dbm_hz(f * 1e9, amplitude), expected, atol=1e-12
             )
-        )
-check("all allowed intervals interpolate between adjacent measured nodes", allowed_ok)
-check("all rejected intervals fail in BOTH conversions and floor query", blocked_ok)
-check("off-grid floors use the more conservative neighbor", floors_ok)
-check("issue69: 8 GHz jump is not blended", raises(lambda: amp_to_power_dbm(7.975, 1)))
+            # Use the API's exact full-scale value to avoid a rounding-only excess.
+            inverse_ok &= np.isclose(power_dbm_to_amp(f, actual), amplitude, atol=1e-12)
+check("all intervals interpolate neighboring curves at three frequency weights", interpolation_ok)
+check("all intervals invert the interpolated curve", inverse_ok)
+check("off-grid support uses the more conservative neighbor", floors_ok)
+
+# The reported failure and representative former switch/jump exclusions.
+for f in (
+    0.95,
+    1.03,
+    2.01,
+    2.39,
+    2.41,
+    2.975,
+    3.025,
+    4.275,
+    4.875,
+    4.925,
+    5.575,
+    5.625,
+    6.025,
+    6.575,
+    6.9968,
+    7.025,
+    7.075,
+    7.125,
+    7.975,
+    8.025,
+):
+    check(
+        f"formerly excluded frequency {f:g} GHz converts and round-trips",
+        np.isclose(amp_to_power_dbm(f, power_dbm_to_amp(f, -32.0)), -32.0),
+    )
 check(
-    "issue69: narrow 7 GHz mode interval is not skipped",
-    raises(lambda: amp_to_power_dbm(7.025, 1))
-    and np.isfinite(amp_to_power_dbm(7.05, 1))
-    and np.isfinite(amp_to_power_dbm(7.1, 1)),
+    "6.9968 GHz uses the measured 6.95 and 7.00 GHz levels",
+    np.isclose(
+        power_dbm_to_amp(6.9968, -32.0),
+        10 ** ((-32 - (0.064 * -6.949591174270165 + 0.936 * -7.096530798709757)) / 20),
+        rtol=1e-12,
+    ),
 )
 check(
-    "switch endpoint uncertainty also rejects the other side",
-    raises(lambda: amp_to_power_dbm(8.025, 1)),
+    "disjoint configured bands do not bridge an uncovered gap",
+    np.array_equal(
+        builder.interpolation_flags(
+            np.array([1.0, 2.0, 3.0, 4.0]),
+            {"bands_ghz": [[1.0, 2.0], [3.0, 4.0]]},
+        ),
+        [True, False, True],
+    ),
 )
-check("new gap is usable away from the 2.4 GHz switch", np.isfinite(amp_to_power_dbm(2.35, 0.1)))
-check("gap switch remains excluded", raises(lambda: amp_to_power_dbm(2.39, 0.1)))
 check(
     "corrected low curves expose an amplitude range",
     calibrations.verified_amp_range(0.12)[0] < 0.01

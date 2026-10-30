@@ -275,7 +275,7 @@ Files are saved as `{number}-{device}-{type}.h5` (e.g., `00000042-Resonator_A-sw
 
 ### Calibrations (`daq/calibrations/`)
 
-Schema 4 / release v3 uses 251 nodes. **0.1–2.1 GHz is calculated by filter offset**, using
+Schema 4 / release v4 uses 251 nodes. **0.1–2.1 GHz is calculated by filter offset**, using
 all 5,050 original TWO-filter low-band readings and one unfiltered A=0.1 anchor per frequency.
 At each frequency the constant dB offset is the unfiltered anchor minus the filtered curve
 interpolated in log amplitude at A=0.1. Preserve the supported measured curve shape in the
@@ -296,8 +296,10 @@ accuracy or support for arbitrary ports, IF, currents or multiport DAC settings.
 Current sources and deterministic derived tables: source_data/2026-10-16/. Negative offsets
 at 140/880/960 MHz are retained, not interpreted as physical passive gain. They can include
 session/path drift. The five same-day filter comparisons are contextual, not fitting inputs.
-20 frequency interpolation exclusions still protect uncertain DAC switches or >1 dB jumps.
-All exact nodes remain usable. Actual per-point DAC configurations were not logged.
+All 250 adjacent frequency intervals allow linear interpolation in dBm, including the 20
+previously excluded for uncertain DAC switches or >1 dB jumps. Measured nodes are unchanged;
+interpolating a transition is an estimate and does not resolve a hardware step. Actual
+per-point DAC configurations were not logged.
 
 build_power_calibration.py rebuilds asset and derived CSVs; tests/test_calibrations.py tests
 offset arithmetic, curve shape/inversion, warnings, direct-model compatibility and corrupt

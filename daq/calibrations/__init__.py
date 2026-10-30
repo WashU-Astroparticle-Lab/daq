@@ -5,7 +5,9 @@
 filter offset. These are estimates of unfiltered power, not direct unfiltered sweeps.
 Above 2.1 GHz the direct unfiltered sweep model retains the 20 dB/decade law.
 Low-band interpolation is linear in dBm versus log amplitude, preserving supported
-measured curve shape. Frequency interpolation never crosses stored exclusions.
+measured curve shape. Frequency interpolation is linear in dBm between adjacent
+nodes throughout 0.1–9 GHz, including DAC-switch regions and measured level jumps.
+It estimates the transition between nodes; it does not resolve a hardware step.
 See docs/power_calibration_update.md for correction assumptions and provenance.
 """
 
@@ -225,7 +227,7 @@ def _bracket(freq_ghz: float) -> Tuple[int, int]:
     if not np.isfinite(freq_ghz):
         raise ValueError("Frequency must be finite.")
     # Absorb only floating-point roundoff from Hz/GHz conversion (a few ULPs), not
-    # a physical frequency offset. This preserves exact nodes beside excluded intervals.
+    # a physical frequency offset. This preserves exact measured-node values.
     nearest = int(np.argmin(np.abs(frequency_ghz - freq_ghz)))
     tolerance = 4 * np.finfo(float).eps * max(1.0, abs(freq_ghz))
     if abs(freq_ghz - frequency_ghz[nearest]) <= tolerance:
@@ -239,10 +241,8 @@ def _bracket(freq_ghz: float) -> Tuple[int, int]:
     lo = hi - 1
     if not allowed[lo]:
         raise ValueError(
-            f"Frequency {freq_ghz:.6g} GHz lies in an unverified interpolation interval "
-            f"({frequency_ghz[lo]:.6g}, {frequency_ghz[hi]:.6g}) GHz: a DAC-switch "
-            "uncertainty window or a measured level jump. Use a measured frequency or "
-            "acquire calibration for the actual DAC configuration; do not blend across it."
+            f"Frequency {freq_ghz:.6g} GHz lies outside the configured interpolation bands "
+            f"in interval ({frequency_ghz[lo]:.6g}, {frequency_ghz[hi]:.6g}) GHz."
         )
     return lo, hi
 

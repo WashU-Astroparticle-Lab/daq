@@ -1,6 +1,6 @@
 {
   "schema_version": 4,
-  "calibration_id": "presto-port1-filter-offset-lowband-2026-10-16-v3",
+  "calibration_id": "presto-port1-filter-offset-lowband-2026-10-16-v4",
   "bands_ghz": [
     [
       0.1,
@@ -19,7 +19,7 @@
   ],
   "switch_scan_step_ghz": 0.005,
   "switch_source": "https://github.com/WashU-Astroparticle-Lab/daq/issues/69; Presto 2.17.1 recommended_dac_config scan at 5 MHz spacing, as reported in issue and repository plotting script",
-  "policy": "Reject interpolation across coarse DAC-switch uncertainty intervals and any adjacent measured model-level jump >1 dB. The 1 dB threshold is a conservative data-review rule, not an identified hardware boundary. Exact measured nodes remain available; allowed interpolation is still an estimate.",
+  "policy": "Interpolate dBm linearly between adjacent calibration curves throughout each configured band, including DAC-switch uncertainty windows and measured level jumps. Switch-scan metadata and maximum_adjacent_jump_db are retained only as historical diagnostic context; they do not exclude intervals. Interpolated transitions are estimates, not resolved hardware steps.",
   "configuration_limit": "Actual DAC configurations and API version were not logged per October point. Single-port automatic Mixed configuration is assumed from the source notebook. Different configurations, output ports, DAC currents, nonzero IF, or shared-tile multiport operation require separate validation.",
   "reference_plane": "Estimated unfiltered SM200C analyzer-input power through the measurement cable path; 0.1\u20132.1 GHz calculated by filter offset; no cable-loss correction",
   "measurement": "0.1\u20132.1 GHz: all 5050 original two-filter readings shifted by per-frequency offsets from direct unfiltered A=0.1 anchors. Offset uses log-amplitude interpolation of the original filtered curve at A=0.1. Above 2.1 GHz: direct unfiltered sweeps. Corrected low powers are estimates, not direct unfiltered observations.",
