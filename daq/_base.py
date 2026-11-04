@@ -183,7 +183,7 @@ class Base:
                         continue
                     if attribute in skip:
                         continue
-                    if attribute in ["jpa_params", "clear"]:
+                    if attribute == "clear":
                         h5f.attrs[attribute] = str(self.__dict__[attribute])
                     elif np.isscalar(self.__dict__[attribute]):
                         h5f.attrs[attribute] = self.__dict__[attribute]

@@ -356,52 +356,90 @@ Drive powers whose fit fails are omitted automatically.
 
 ### 4. SweepFreqAndDC (`sweep_freq_and_dc.py`)
 
-**Purpose**: 2D sweep of DC bias and frequency for JPA modulation curve 
-characterization.
+**Purpose**: Map the mean response and fluctuations versus RF frequency and constant **chip
+bias**, using the Agilent 33220A and Presto's on-hardware mean/std reduction.
 
-**Key Features**:
-- 2D parameter sweep (frequency × DC bias)
-- Automatic DC bias ramping
-- JPA characterization
+`bias_arr` is in **volts at the chip**. `voltage_divider` is required: explicitly pass `455`
+for the usual 455:1 wiring. The Agilent is programmed to `bias_arr * voltage_divider`;
+1 mV requested at the chip means 0.455 V on the generator. Both arrays, the divider and
+generator offset readbacks are saved. A readback mismatch aborts rather than labeling a
+clipped generator setting as the requested chip voltage. The conversion assumes the stated
+divider applies to the configured generator load; readback verifies the setting, not the
+physical voltage at the chip.
 
-**Key Parameters**:
-- `freq_center`: Center frequency (Hz)
-- `freq_span`: Frequency span (Hz)
-- `df`: Frequency resolution (Hz)
-- `num_averages`: Number of averages per point
-- `amp`: Drive amplitude
-- `bias_arr`: Array of DC bias values (V)
-- `output_port`: DAC output port
-- `input_port`: ADC input port
-- `bias_port`: DC bias port
-- `bias_ramp_rate`: Ramp rate for bias (V/s)
-- `device`: Device name (required for DB)
-- `filter`: Filter name (optional)
-- `notes`: Measurement notes (optional)
+`freq_step` controls RF spacing independently of `sampling_frequency` (default **10 kHz**).
+The grid starts at `freq_center - freq_span/2`, advances by `freq_step`, and stops at or below
+the upper bound; `freq_span=0` measures just the center. The default retained
+`acquisition_duration_s` is **0.5 s per point**. `discard_start_ms=25` excludes startup data;
+both durations round up to whole summary blocks using the **tuned** rate. A warning is issued
+if the actual retained duration is **below 0.2 s**, independent of sampling rate.
 
-**Usage Example**:
+At exactly 10 kHz, the default plan is 250 samples/block, one discarded block (25 ms), and
+20 retained blocks (0.5 s). At higher rates the block size is capped at 1023 and enough
+whole leading blocks are discarded to cover at least 25 ms. The SDK already removes one
+initial block (verified in Presto 2.16.0 and 2.17.1 without FIR); it counts toward the exclusion,
+so even `discard_start_ms=0` cannot remove that mandatory overhead. Saved timing fields are
+`actual_sampling_frequency`, `samples_per_block`, `discard_blocks`, `retained_blocks`,
+`retained_samples`, `actual_discard_s`, `actual_acquisition_s`, and `total_acquisition_s`
+(discard plus retained time, excluding setup/settling/communication).
+
+Only hardware summary packets cross the connection, via `get_pixels(summed=True)`.
+The host combines block means and variances, including **changes between block means** so
+slow fluctuations are retained. Neither raw pixels nor per-block summaries are saved.
+`resp_arr`, `std_i_arr`, `std_q_arr`, and `std_iq_arr` have shape `(n_bias, n_frequency)`:
+one complex mean and three standard deviations per setting. The statistic is
+`sigma_IQ = sqrt(var(I) + var(Q))`, not `std(abs(signal))`; readout is at zero IF.
+
+**Normalization/bench check:** `summary_ddof=0` assumes population-normalized hardware
+variances. Presto's public manual does not document the divisor, so this is an explicit,
+saved assumption pending hardware verification. `summary_ddof=1` supports sample-normalized
+hardware variances; the pooled output is always population-normalized. Offline tests verify
+both cases against explicit samples, but cannot establish the firmware's normalization or
+actual startup behavior. Before quantitative use, compare summary-mode I/Q means/stds with
+ordinary pixel acquisitions of a stationary signal under matching bandwidth, duration and
+startup exclusion, including a small block size where an N versus N−1 divisor is resolvable.
+
+`bias_settle_s=0.5` preserves the Agilent driver's settling delay once per bias row, separately
+from acquisition startup at every frequency. No digital triggers are asserted. RF and Agilent
+outputs are turned off on success or failure; a caller-supplied generator stays connected.
+
 ```python
 from daq import SweepFreqAndDC
+from daq.instruments import Agilent33220A
 
 sf = SweepFreqAndDC(
     freq_center=6e9,
-    freq_span=200e6,
-    df=1e3,
-    num_averages=100,
+    freq_span=2e6,
+    freq_step=20e3,             # RF spacing; independent of the sample rate
     amp=0.1,
-    bias_arr=[0.0, 0.5, 1.0, 1.5, 2.0],
+    bias_arr=[0.0, 0.001, 0.002],  # CHIP volts: 0, 1, 2 mV
+    voltage_divider=455,        # required, no implicit wiring assumption
     output_port=1,
     input_port=1,
-    bias_port=1,
-    device="JPA_A",
-    notes="Modulation curve"
+    sampling_frequency=10_000,
+    acquisition_duration_s=0.5,
+    device="device_name",
+    notes="Mean response and fluctuation maps",
 )
-filepath = sf.run()
+with Agilent33220A() as bias:
+    filepath = sf.run(bias)     # or sf.run() to discover/open the generator
 sf.analyze(quantity="amplitude")
+sf.analyze(quantity="std_iq")
 ```
 
-**Analysis**: 2D heatmap with various quantity options (amplitude, phase, 
-dB, group delay, dpdb).
+**Analysis:** `amplitude`, `phase`, `dB`, `group delay`, `dpdb`, `std_i`, `std_q`, `std_iq`
+(alias `sigma_iq`). Bias axes use chip volts and `dpdb` uses radians per chip volt. Nonuniform
+biases and single-frequency/single-bias scans are supported; gradient quantities need at
+least two distinct points on the differentiated axis.
+
+**Migration:** This replaces the old Presto-DC sweep. New construction requires explicit
+chip voltages and divider; do not copy old generator/output voltages into `bias_arr` without
+converting them. `df` remains a deprecated alias for `freq_step` only. Replace
+`num_averages` with `acquisition_duration_s` and `num_skip` with `discard_start_ms`; remove
+`bias_port`/`bias_ramp_rate` and pass the Agilent to `run(bias, ...)`. Connection arguments to
+`run` are keyword-only. Historical files still load and plot their original mean response
+with **Presto output volts** on the bias axis; their divider is unknown and they cannot be
+rerun through the new Agilent path. They have no standard-deviation maps.
 
 ---
 
