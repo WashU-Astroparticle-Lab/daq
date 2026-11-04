@@ -196,6 +196,11 @@ They are standalone scripts, not pytest suites — run them as scripts. Extend t
 touching the instruments layer, `TimeStream.run()` or `analyze()`'s bias dispatch, `QCTrace`'s
 trigger routing, `BiasHunt`'s ranking, the resonator fitting adapter, or the plotting helpers.
 
+For `SweepFreqAndDC`, run `python tests/test_sweep_freq_and_dc.py` in the `presto`
+environment. It checks hardware-summary pooling against explicit samples, acquisition and
+discard timing, Agilent divider/readback handling, output cleanup, and new/legacy HDF5 files.
+It does not replace bench verification of Presto's variance normalization or startup timing.
+
 For the pulsed qubit measurements (`RabiAmp`, `RabiTime`, `T1`), run
 `python tests/test_pulsed_qubit.py` in the `presto` environment. It checks sequences,
 synthetic fits, plots, HDF5/metadata round trips and Presto's own offline sequence compiler.
