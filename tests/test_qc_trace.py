@@ -16,7 +16,8 @@ Plus the fold: ``run()`` folds on the ramp's own period at the *tuned* sample ra
 ``fold()`` is re-callable on a stream loaded back from ``qc_file``.
 
 Note the ``TimeStream`` swap targets ``daq.measurements._gate_bias``, not this measurement's own
-module: the readout builder both ``QCTrace`` and ``BiasHunt`` acquire through lives there.
+module: the TimeStream builder used by ``QCTrace`` lives there. The fast ``BiasHunt``
+instead shares hardware-summary acquisition with ``SweepFreqAndDC``.
 
 Requires ``presto`` to be importable (``QCTrace`` imports it transitively); no hardware and no
 network. The database calls are stubbed rather than left to fail, so the round-trip check does

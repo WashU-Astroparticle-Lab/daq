@@ -1,14 +1,13 @@
 # -*- coding: utf-8 -*-
 """Shared machinery for the gate-biased readout measurements.
 
-:class:`~daq.measurements.qc_trace.QCTrace`, :class:`~daq.measurements.bias_hunt.BiasHunt`
-and :class:`~daq.measurements.sweep_std_dev.StdDevSweep` are separate measurements -- one
-sweeps the gate with a ramp and folds the response, one parks the gate at a series of constant
-voltages and ranks them, one repeats the ramp at a series of readout frequencies and ranks
-those -- but they read the device out the same way: through the same Presto ports, at the
+:class:`~daq.measurements.qc_trace.QCTrace` and
+:class:`~daq.measurements.sweep_std_dev.StdDevSweep` sweep the gate with a ramp, fold the
+response, and optionally rank readout frequencies. They read through the same Presto ports, at the
 same sample rate, driven by an :class:`~daq.instruments.function_generator.Agilent33220A` on
 the gate. Normally that is one tone at zero IF on a caller-supplied frequency; a multitone
 ``StdDevSweep`` reads several devices at once through the same builder with a fixed LO.
+The fast BiasHunt shares hardware-summary acquisition with SweepFreqAndDC instead.
 
 This module holds only that shared readout, the shared ramp, the trigger routing and the
 gated-ramp acquisition sequence, so the measurements differ in their own files by exactly what

@@ -312,7 +312,7 @@ Three things it does that a hand-rolled `loglog` does not:
 - **It frames the y-axis on the log-binned points**, not the raw periodogram. A bare periodogram scatters over ten decades, and framing on it flattens everything of interest into a line so that a good fit reads as a bad one.
 - **A failed fit costs the fit, not the spectrum.** The panel is drawn and labelled, and that channel's entry in `fits` is `None`.
 
-Pass `labels` / `units` for a projection that is neither basis (`BiasHunt`'s magnitude spectrum, say), a 2-D array for one PSD per row (one row per tone), `psd_b=None` for a single panel, `f_bw` to hold the sampling bandwidth at the tuned rate, and `ax` to draw into axes you already have. `fits` follows `fit_parity_psd`'s own convention: a dict for 1-D input, a list of dicts for 2-D.
+Pass `labels` / `units` for a projection that is neither basis (a magnitude spectrum, say), a 2-D array for one PSD per row (one row per tone), `psd_b=None` for a single panel, `f_bw` to hold the sampling bandwidth at the tuned rate, and `ax` to draw into axes you already have. `fits` follows `fit_parity_psd`'s own convention: a dict for 1-D input, a list of dicts for 2-D.
 
 Note `f_bw` defaults to `2 * f[-1]`, which is exact to within one frequency bin — it only sets the height of the white floor, so the inference is harmless, but pass the stream's `df` when you have it.
 
@@ -599,7 +599,7 @@ ramp's — `qc.fold(period_s=...)` also takes an override.
 
 `QCTrace` packages exactly the block above — gated ramp, whole-period acquisition, fold — and
 saves the folded trace as its own record. `BiasHunt` is its companion: constant biases, ranked
-by parity contrast. Neither locates the resonance, so run a fitted `Sweep` first and hand both
+by hardware-summary sigma_IQ. Neither locates the resonance, so run a fitted `Sweep` first and hand both
 its `fr`:
 
 ```python
@@ -624,21 +624,20 @@ qct.time_ms, qct.avg_iq                         # the QC trace
 
 hunt = BiasHunt(
     readout_freq=fr, amp=amp, output_port=1, input_port=1,
-    v_min=0.0, v_max=2.0, n_bias_try=20, ts_duration_s=5.0,
+    v_min=0.0, v_max=0.002, voltage_divider=455, n_bias_try=20,
+    acquisition_duration_s=0.5,  # range in CHIP volts
     device="my_device",
 )
 hunt.run()
 hunt.analyze()                                  # contrast vs gate bias
-hunt.best_bias, hunt.best_bias_stream           # winning gate bias and its stream
+hunt.best_bias, hunt.best_generator_bias        # chip volts and Agilent volts
 ```
 
-For the parity spectrum at the best operating point, `hunt.best_bias_stream.analyze()` draws it
-with the fit (that stream's `bias_mode` is `'constant'`), and `.parity_psd()` / `.fit_parity()`
-give the arrays; `hunt.average_psd()` averages every try instead, which is what beats the
-single-record scatter down. `QCTrace.fold()` re-folds on demand — on a different period, or on a
-stream reloaded from `qct.qc_file` — so `fold_timestream` need not be called by hand for a
-packaged run. See the `QCTrace` and `BiasHunt` entries in `CLAUDE.md` for the full parameter
-sets and what lands in HDF5 and MongoDB.
+For a parity spectrum, acquire a separate `TimeStream` at `hunt.best_generator_bias`
+on the Agilent, attach the generator as `bias`, then use `analyze()`, `parity_psd()` or
+`fit_parity()`. The fast hunt stores moments only: no winning stream or averaged PSD exists.
+`QCTrace.fold()` still re-folds its full acquisition on demand. See the measurement README
+for acquisition examples and migration from historical magnitude-ranked hunts.
 
 ---
 

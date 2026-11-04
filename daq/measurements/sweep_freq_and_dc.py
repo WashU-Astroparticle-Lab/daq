@@ -198,6 +198,24 @@ class SweepFreqAndDC(Base):
         save_filename: Optional[str] = None,
     ) -> str:
         """Acquire summaries only; a supplied Agilent stays connected but is switched off."""
+        self._acquire(
+            bias, presto_address=presto_address, presto_port=presto_port, ext_ref_clk=ext_ref_clk
+        )
+        return self.save(save_filename)
+
+    def _acquire(
+        self,
+        bias: Optional[Agilent33220A] = None,
+        *,
+        presto_address: Optional[str] = None,
+        presto_port: Optional[int] = None,
+        ext_ref_clk: bool = False,
+    ) -> None:
+        """Shared summary acquisition for the 2-D sweep and single-frequency BiasHunt.
+
+        Produces arrays indexed by bias and frequency without writing a file. Callers finalize
+        their results before saving once, after both outputs have been switched off.
+        """
         if self.bias_source != "Agilent33220A" or self.voltage_divider is None:
             raise ValueError(
                 "Legacy Presto-DC files are analysis-only. Construct a new SweepFreqAndDC "
@@ -249,6 +267,7 @@ class SweepFreqAndDC(Base):
                 ig = lck.add_input_group(self.input_port, 1)
                 ig.set_frequencies(0.0)
                 extra = self.discard_blocks - self.SDK_DISCARD_BLOCKS
+                last_freq = None
                 for jj, voltage in enumerate(self.generator_bias_arr):
                     bias.constant(float(voltage), settle_s=self.bias_settle_s)
                     state = bias.settings()
@@ -263,10 +282,16 @@ class SweepFreqAndDC(Base):
                     self.generator_bias_readback_arr[jj] = readback
                     self.attach(bias=state)
                     for ii, freq in enumerate(self.freq_arr):
-                        lck.hardware.configure_mixer(
-                            freq=float(freq), in_ports=self.input_port, out_ports=self.output_port
-                        )
-                        lck.apply_settings()
+                        # A fixed-frequency bias hunt changes only the external generator;
+                        # keep the mixer configured instead of retuning it at every candidate.
+                        if last_freq != freq:
+                            lck.hardware.configure_mixer(
+                                freq=float(freq),
+                                in_ports=self.input_port,
+                                out_ports=self.output_port,
+                            )
+                            lck.apply_settings()
+                            last_freq = freq
                         data = lck.get_pixels(
                             self.retained_blocks + extra,
                             summed=True,
@@ -299,7 +324,6 @@ class SweepFreqAndDC(Base):
                     lck.apply_settings()
                 except Exception as err:
                     warnings.warn(f"Failed to mute Presto outputs: {err}", RuntimeWarning)
-        return self.save(save_filename)
 
     def save(self, save_filename: Optional[str] = None) -> str:
         return super()._save(__file__, save_filename=save_filename)

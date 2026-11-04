@@ -257,8 +257,7 @@ discrimination axis `qpd` fits to the IQ cloud. Parity moves the resonator betwe
 points of that plane, and `"abs"`, `"real"` or `"imag"` each see only the `cos(angle)` of
 the line joining them: a separation that is mostly a phase shift barely moves the
 magnitude at all. (The *reconstruction* always fits its own axis, whatever this is set
-to. `BiasHunt` keeps `"abs"` as its own default, because that is what its contrast
-ranking uses; pass `quantity="proj"` to `hunt.average_psd()`.)
+to.) The fast `BiasHunt` ranks total I/Q variance and retains no spectra.
 
 **What the constant-bias panels show.** The reconstruction is
 [`qpd`](https://github.com/WashU-Astroparticle-Lab/qpd)'s — a two-blob emission model
@@ -299,9 +298,9 @@ resets that the fixed-gate routine would fit as noise.
 > trace is flat, which reads as a dead device rather than as a wiring fault. This is the
 > failure `QCTrace` refuses up front; here it is caught after the fact.
 
-`QCTrace` and `BiasHunt` are unaffected — they own the acquisition *and* the bias, so
-they run these reconstructions themselves. This is the same analysis reached from the
-stream, for a hand-rolled acquisition or a reloaded file.
+`QCTrace` owns both the ramp and acquisition and runs the folded reconstruction itself.
+The fast `BiasHunt` retains only hardware moments; a subsequent `TimeStream` is needed
+for parity reconstruction or spectral analysis at the selected operating point.
 
 ---
 
@@ -628,125 +627,82 @@ overlaid (`analyze(raw=True)`) to show what the averaging bought.
 
 ### 7. BiasHunt (`bias_hunt.py`)
 
-**Purpose**: find the gate bias with the largest charge-parity contrast — the operating point
-to take parity spectra at. The companion to `QCTrace`, and its exact inverse: where `QCTrace`
-sweeps the gate under a gated ramp, `BiasHunt` parks it at a series of constant voltages with
-**nothing gated**.
+**Purpose:** find the candidate constant chip bias with the largest
+`sigma_IQ = sqrt(var(I) + var(Q))` at a caller-supplied readout frequency. The new hunt
+uses the same hardware-summary acquisition as `SweepFreqAndDC`, keeping one Presto session
+open throughout the search. It never constructs a `TimeStream` or downloads raw pixels.
 
-`run()` writes each entry of `bias_voltages` to the generator with `Agilent33220A.constant` and
-records one `ts_duration_s` `TimeStream` per voltage at `readout_freq`. Parity switching moves
-the resonator between two frequencies, so a two-level-telegraph response shows up as a spread
-in the readout magnitude: `std(|signal|)` ranks the candidates. Like `QCTrace`, it does **not**
-locate the resonance — pass `readout_freq` from a fitted `Sweep`.
+**Inputs and defaults:**
 
-Every acquisition is ungated. The bias is a DC level already written over SCPI, so there is
-nothing for a trigger to start, and asserting one would gate whatever else is wired to that
-port for the whole hunt.
+- `readout_freq`, `amp`, `output_port`, `input_port`: fixed readout configuration.
+- `bias_voltages`: explicit **chip voltages**, in the order to acquire; alternatively provide
+  `v_min`, `v_max`, and `n_bias_try=20` for a uniform random draw. Bounds are required when
+  no explicit list is given. `seed` reproduces the draw, which happens at construction.
+- `voltage_divider`: required. Pass `455` explicitly for the usual wiring. Agilent settings
+  are `bias_voltages * voltage_divider`; 1 mV at the chip requests 0.455 V on the generator.
+- `sampling_frequency=10_000`, `acquisition_duration_s=0.5`, `discard_start_ms=25`:
+  at exactly 10 kHz, discard one 250-sample block and retain 20 blocks. Durations round up
+  to whole blocks at the tuned rate. The SDK's already-discarded block counts toward the
+  startup exclusion. Retained duration below 0.2 s warns; higher sample rates alone do not.
+- `bias_settle_s=0.5`: Agilent settling delay per candidate, separate from startup exclusion.
+- `summary_ddof=0`: explicit population-variance assumption for hardware summaries;
+  normalization still needs bench verification. `1` supports sample-normalized block
+  variances. Pooled results always use population normalization.
+- `device` (required for saving), `filter`, `notes`: normal measurement metadata.
 
-**Key Parameters**:
-- `readout_freq`, `amp`, `output_port` / `input_port`: as `QCTrace`
-- `v_min` / `v_max`, `n_bias_try`, `seed`: bounds, count and seed for the random bias draw
-- `bias_voltages`: explicit voltages to try (e.g. a `numpy.linspace`) instead of a draw
-- `ts_duration_s`, `sampling_frequency`: length (s) and sample rate (Hz) of each try
-- `device` (required for DB), `filter`, `notes`
+The score includes both within-block variance and changes between block means, preserving
+slow fluctuations. It measures total I/Q spread, not SNR or proof of charge-parity switching.
+It is different from `std(abs(signal))`, which can miss phase fluctuations.
 
-There is **no default gate range**: omitting `v_min`/`v_max` without `bias_voltages` raises
-rather than putting an invented voltage on a device. Pass `bias_voltages` and they are ignored
-— the attributes then report that list's span. The draw happens in `__init__`, so the object
-pins down exactly what will be measured before any hardware is touched.
-
-Every result is cleared at the top of `run()`. A re-run that fails part-way therefore leaves
-nothing stale: `best_bias_stream` reads `parity_contrast` and `bias_streams` together, and a
-contrast curve left over from a previous run would index the new (shorter) stream list by the
-old argmax — reporting a new acquisition under an old bias voltage.
-
-**Usage Example**:
 ```python
+import numpy as np
 from daq import BiasHunt
+from daq.instruments import Agilent33220A
 
 hunt = BiasHunt(
-    readout_freq=fr,                        # from a fitted Sweep
+    readout_freq=fr,           # chosen previously, e.g. from a fitted Sweep
     amp=amp, output_port=1, input_port=1,
-    v_min=0.0, v_max=2.0, n_bias_try=20,    # or bias_voltages=np.linspace(0, 2, 20)
-    ts_duration_s=5.0, sampling_frequency=5e4,
-    device="B260416-NG-D1_dev3",
+    bias_voltages=np.linspace(0, 0.002, 21),  # CHIP volts: 0–2 mV
+    voltage_divider=455,
+    sampling_frequency=10_000,
+    acquisition_duration_s=0.5,
+    device="device_name",
 )
-hunt.run()                                  # opens the 33220A itself
-hunt.analyze()                              # contrast vs bias, above the fitted noise spectrum
+with Agilent33220A() as bias:
+    filepath = hunt.run(bias)
+hunt.analyze()                # sigma_IQ versus chip bias, winner marked
 
-hunt.best_bias, hunt.best_contrast          # the operating point
-hunt.best_bias_stream                       # the winning acquisition
-hunt.fit_results["gamma_p"]                 # parity-switching rate from the fitted spectrum
+hunt.best_bias                # chip volts
+hunt.best_generator_bias      # Agilent volts
+hunt.best_contrast            # winning sigma_IQ, ADC full-scale units
+loaded = BiasHunt.load(filepath)
+loaded.analyze()
 ```
 
-As with `QCTrace`, `run()` takes the bias generator as its only positional argument.
+For random sampling instead, replace `bias_voltages=...` with
+`v_min=0, v_max=0.002, n_bias_try=20, seed=42`.
 
-**The averaged spectrum.** `analyze()`'s lower panel is the noise PSD averaged over every try,
-fitted to the random-telegraph parity model. Each try is short, so its own periodogram is
-noisy; the mean over `n_bias_try` of them beats that scatter down by `sqrt(n_bias_try)` and
-leaves something worth fitting. Both steps are lazy and cached, and can be driven directly:
+**Results and records:** one `bias_hunt` HDF5/MongoDB record per hunt, with no per-try files.
+`resp_arr`, `std_i_arr`, `std_q_arr`, `std_iq_arr` are one-dimensional arrays in candidate
+order. `parity_contrast` is a compatibility name for `std_iq_arr`, and the record explicitly
+identifies `contrast_metric="sigma_iq"`. The winner is the first maximum if candidates tie.
+Candidate chip voltages (`bias_arr` on disk, `bias_voltages` also available on the object),
+programmed/readback generator voltages, divider and actual timing are saved. All results are
+reset before acquisition, so a failed rerun cannot report an old winner. Both RF and Agilent
+outputs are turned off on exit, including failure; the winning bias is **not left applied**.
 
-```python
-f, psd = hunt.average_psd()                 # -> hunt.psd_freqs, hunt.psd_avg
-res    = hunt.fit_psd(fit_onef=True)        # kwargs go to fit_parity_psd
-res["gamma_p"], res["f_corner"], res["fidelity"], res["resid_dex_rms"]
+**Spectra require another acquisition.** Mean/std summaries cannot reconstruct time traces,
+switching rates or PSDs. Take a separate `TimeStream` at `hunt.best_generator_bias`, attach
+its generator settings, and use `TimeStream.parity_psd()` / `fit_parity()` / `analyze()`.
+There is no automatic extra acquisition at the winner.
 
-hunt.analyze()                              # reuses that fit rather than refitting
-```
-
-The spectrum is taken of the **mean-subtracted** `|signal|` — the parity signal is the
-fluctuation, not the operating point it sits on — at the streams' *tuned* `df`, which is also
-the `f_bw` the fit holds fixed. Pass `quantity="real"`/`"imag"` to project differently, or
-`welch=True` for Welch's method.
-
-**Averaging across operating points is the intended use.** The expectation is that the
-switching rate is common across the gate range — it is set by quasiparticle dynamics — while
-what varies with bias is the telegraph *amplitude*, through the quantum-capacitance slope. The
-model is linear in that amplitude, so averaging the per-try spectra gives back the same
-Lorentzian with `sigma^2` replaced by its mean: the corner survives and only the precision
-improves. Over 20 simulated realisations of six tries spanning a factor of 100 in amplitude,
-averaging all six and averaging only the top three by contrast agree (130.2 ± 7.6 Hz vs
-130.8 ± 7.7 Hz), and both beat a single stream by 2.3× (146.9 ± 17.2 Hz, against `sqrt(6)`
-expected). Low-contrast tries cost nothing.
-
-Two caveats that do survive:
-
-- **`fidelity` is diluted by averaging.** It is set by the Lorentzian-to-floor ratio, and a
-  dead try contributes floor without signal, so `F` falls as such tries are added. Read it as
-  an ensemble property, not the readout fidelity at the best point.
-- **`gamma_p` reads high on short records** — about 10 % over 20 realisations of 6 × 2 s,
-  falling to ~5 % at 4 M samples and 0.4 % when the fitter is handed an exact analytic
-  spectrum. It is a log-periodogram small-sample effect, not a defect in the fitter. Take
-  longer records before quoting a rate.
-
-If the rate genuinely varies with bias, the average is a mixture of Lorentzians and the fit
-returns an intermediate corner; fit the tries individually to check. Re-averaging clears any
-existing fit, so a fit never describes a spectrum it did not see.
-
-Check `resid_dex_rms` before believing the numbers: `~0.1` is a good fit, `~1` means the model
-is a decade off across the band. The panel plots the raw periodogram faintly behind the
-log-binned points the fit actually used, since a bare periodogram scatters over ten decades and
-reads as a bad fit even when it is a good one.
-
-The fit lives on the object only — like `SweepPower`'s per-amplitude fits it is **not** written
-to HDF5 or MongoDB, since it derives from streams the saved record does not contain. After a
-`load()` the spectrum panel is skipped (with a note) rather than raising; reload the
-acquisitions to get it back:
-
-```python
-hunt.average_psd([TimeStream.load(p) for p in hunt.bias_files])
-hunt.analyze()
-```
-
-**Records**: every try saves its own HDF5 + MongoDB record with `attach(bias=...)` applied.
-`BiasHunt` saves one further `bias_hunt` record with `parity_contrast`, `best_bias`,
-`best_contrast`, `best_bias_file` and every try's path in `bias_files`. `bias_streams` and
-`best_bias_stream` are read-only properties; `load()` restores the derived record but not the
-streams — reload them from `bias_files`.
-
-**Analysis**: parity contrast versus gate bias (sorted by voltage, winner marked), above the
-averaged noise spectrum with its parity fit. `analyze(psd=False)` gives the contrast curve
-alone; `analyze(fit=False)` the spectrum without the model.
+**Migration:** replace `ts_duration_s` with `acquisition_duration_s`, explicitly supply the
+divider, and convert old generator-voltage ranges to chip volts. `bias_streams`,
+`best_bias_stream`, `average_psd`, and `fit_psd` are no longer part of the fast hunt.
+Historical files still load and plot their original magnitude-based score with **Agilent
+volts** on the horizontal axis and `contrast_metric="abs"`. Their saved `bias_files` and
+`best_bias_file` remain available for manually loading old `TimeStream` records. No divider
+is inferred; create a new object with explicit chip voltages to rerun the measurement.
 
 ---
 
@@ -758,7 +714,7 @@ time -- each folded trace is reduced to its standard deviation over the ramp per
 `best_freq` is the frequency with the largest spread. That is the operating point for a
 subsequent `QCTrace` or `BiasHunt`.
 
-Like its two siblings it inherits `GateBiasMeasurement`, which owns the readout and ramp
+Like `QCTrace`, it inherits `GateBiasMeasurement`, which owns the readout and ramp
 validation, the stream builder, the trigger routing and the gated-ramp acquisition sequence.
 One-dimensional inputs run one `QCTrace` per frequency; a frequency matrix builds one shared
 multitone `TimeStream` per row through the same builder and runs it under the same gated ramp,
@@ -1058,8 +1014,7 @@ Each measurement class provides an `analyze()` method for visualization:
 - **QCTrace**: the block-averaged I/Q QC trace over one ramp period
 - **StdDevSweep**: I, Q and principal-axis standard deviation versus readout frequency,
   with the maximum of the selected statistic marked
-- **BiasHunt**: parity contrast vs. gate bias with the winner marked, above the averaged noise
-  PSD and its random-telegraph fit
+- **BiasHunt**: sigma_IQ vs. chip bias with the winner marked
 
 ---
 

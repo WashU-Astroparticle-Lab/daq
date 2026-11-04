@@ -43,7 +43,7 @@ class QCTrace(GateBiasMeasurement):
         qct = QCTrace(readout_freq=sw.fit_results["fr"], ...)
 
     and see :class:`~daq.measurements.bias_hunt.BiasHunt` for the companion measurement that
-    parks the gate at constant voltages and ranks them by parity contrast.
+    parks the gate at constant voltages and ranks hardware-summary sigma_IQ.
 
     Requires the Presto **and** the 33220A over VISA; it cannot run without hardware.
 
