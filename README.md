@@ -201,6 +201,10 @@ environment. It checks hardware-summary pooling against explicit samples, acquis
 discard timing, Agilent divider/readback handling, output cleanup, and new/legacy HDF5 files.
 It does not replace bench verification of Presto's variance normalization or startup timing.
 
+`python tests/test_bias_hunt.py` checks the fast hardware-summary bias optimization:
+sigma_IQ ranking, explicit chip-to-generator voltage conversion, single-session acquisition,
+output cleanup, and new/legacy records. It shares the sweep's timing and pooling code.
+
 For the pulsed qubit measurements (`RabiAmp`, `RabiTime`, `T1`), run
 `python tests/test_pulsed_qubit.py` in the `presto` environment. It checks sequences,
 synthetic fits, plots, HDF5/metadata round trips and Presto's own offline sequence compiler.

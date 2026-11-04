@@ -858,15 +858,14 @@ class TimeStream(Base):
         The spectrum of the **mean-subtracted** projection of the readout, at the **tuned**
         :attr:`df` -- the parity signal is the fluctuation about the operating point, not the
         point itself, and the frequency axis follows the rate the hardware settled on rather
-        than the one that was asked for. ``"abs"`` matches the metric
-        :class:`~daq.measurements.bias_hunt.BiasHunt` ranks its tries by.
+        than the one that was asked for. ``"abs"`` takes the magnitude projection;
+        the fast BiasHunt instead ranks total I/Q variance and retains no time series.
 
         Every tone is spectrated by default, one row per tone -- a multi-tone parity
         acquisition is normally a signal tone beside a reference, and taking only the first
         would quietly answer a question nobody asked.
 
-        One stream's periodogram is noisy; ``BiasHunt.average_psd`` averages over the tries to
-        beat that down before fitting.
+        One stream's periodogram is noisy; Welch averaging can reduce that scatter.
 
         :param tone: Which tone to take the spectrum of. ``None`` (default) takes every tone.
         :param quantity: Projection of the complex readout -- ``"abs"``, ``"real"`` or
@@ -1078,11 +1077,9 @@ class TimeStream(Base):
         gate was ramping, and the fallback is the raw plot. Pass *mode* to override the
         detection either way.
 
-        This is the same reconstruction the composed measurements do --
-        :class:`~daq.measurements.qc_trace.QCTrace` folds, and
-        :class:`~daq.measurements.bias_hunt.BiasHunt` takes and fits the spectrum -- reached
-        from the stream itself, so a single hand-rolled acquisition or a reloaded file gets it
-        without wrapping it in a measurement class.
+        The folded reconstruction is also used by QCTrace. A constant-bias TimeStream
+        acquired after a fast BiasHunt provides the samples needed for spectral analysis;
+        the hunt itself retains only moments and cannot reconstruct a spectrum.
 
         :param num_samples: Limit the time-axis panels to this many samples. Applies to the
             ``raw`` and ``constant`` plots; the folded trace is one period long by

@@ -1,486 +1,232 @@
-"""Offline verification of ``BiasHunt``.
+"""Offline hardware-summary BiasHunt checks. Run in the presto environment.
 
-The bias hunt parks the gate at a series of constant voltages and ranks them by parity
-contrast. Its failure modes are the mirror image of ``QCTrace``'s:
-
-- every acquisition must be **ungated**. The bias is a DC level already written over SCPI, so
-  a trigger asserted here would gate whatever else is wired to that port for the whole hunt.
-- the winner must be the argmax of ``std(|signal|)``, and ``best_bias`` / ``best_bias_file`` /
-  ``best_bias_stream`` must all name the *same* try -- three ways of saying it is three ways
-  to disagree.
-- the voltages are drawn in ``__init__``, so the object pins down what was measured before any
-  hardware is touched, and a seed reproduces the draw.
-- there is no default gate range: a missing ``v_min``/``v_max`` must raise rather than put an
-  invented voltage on somebody's device.
-- the contrast curve, the winner and the constituent file paths survive the HDF5 round trip.
-
-The averaged spectrum and its parity fit are checked against a *known* answer rather than
-against themselves: the stand-in stream is a genuine random-telegraph process switching at
-``GAMMA_P``, built from exponential dwell times rather than hand-shaped to match the model, so
-``fit_psd`` has to recover a number it was never told. The averaging, the mean subtraction, the
-use of the tuned rate and the invalidation of a stale fit are each pinned separately.
-
-Requires ``presto`` to be importable (``BiasHunt`` imports it transitively); no hardware and no
-network. The database calls are stubbed so the round-trip check does not sit through MongoDB's
-server-selection timeout. Run from the repository root::
-
-    python tests/test_bias_hunt.py
+The mock reduces explicit I/Q samples, never offers a raw acquisition path, and chooses a
+known optimum whose magnitude is constant: ranking std(abs(signal)) would fail this test.
+Shared timing, pooling, SDK and cleanup cases also live in test_sweep_freq_and_dc.py.
 """
 
 import os
 import sys
 import tempfile
+import unittest
+import warnings
+from unittest.mock import patch
 
-try:
-    import presto  # noqa: F401
-except ImportError:
-    print("SKIP: presto is not installed; BiasHunt cannot be imported without it")
-    sys.exit(0)
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import matplotlib
+import h5py
+import numpy as np
+from test_sweep_freq_and_dc import FakeBias, FakeLockin, plt
 
-matplotlib.use("Agg")  # the analyze() checks below must not need a display
-import matplotlib.pyplot  # noqa: E402
-import numpy as np  # noqa: E402
-
-import daq._base as base_mod  # noqa: E402
-import daq.measurements._gate_bias as gate_bias_mod  # noqa: E402
-from daq.analysis.noise import compute_psd  # noqa: E402
-from daq.measurements.bias_hunt import BiasHunt  # noqa: E402
-
-base_mod.get_next_number = lambda: "00000001"
-base_mod.insert_measurement = lambda document: "offline"
-
-results = []
-
-
-def check(label, condition, detail=""):
-    results.append((label, bool(condition)))
-    print(f"{'PASS' if condition else 'FAIL'}  {label}" + (f"  [{detail}]" if detail else ""))
-
-
-# ---------------------------------------------------------------- stand-ins
-
-FS = 5e4
-#: Parity-switching rate of the synthetic response, in hertz. The spectrum checks below fit
-#: for this number, so the fit is pinned against a known answer rather than against itself.
-GAMMA_P = 120.0
-
-
-class FakeTimeStream:
-    """A genuine random-telegraph response whose contrast depends on the bias it sits at.
-
-    The signal switches between two magnitudes at :data:`GAMMA_P`, so its PSD really is the
-    Lorentzian the parity model describes, and ``std(|signal|)`` really does measure the
-    switching amplitude. The amplitude peaks at ``PEAK_V``, giving the hunt an unambiguous
-    winner. Both the ranking and the spectral fit are therefore checked against known answers.
-    """
-
-    instances = []
-    PEAK_V = 1.25
-
-    def __init__(self, **kwargs):
-        self.kwargs = kwargs
-        self.df = kwargs["df"]
-        n = int(kwargs["pixel_counts"])
-        # The note carries the bias; parse it rather than threading extra state through.
-        voltage = float(kwargs["notes"].split("Constant bias ")[1].split(" V")[0])
-        spread = np.exp(-(((voltage - self.PEAK_V) / 0.3) ** 2))
-        # Seed from the voltage, NOT from hash(notes): Python randomises string hashing per
-        # process, so a hash-derived seed silently regenerates different data on every run.
-        # The spectral checks below then fluctuate by tens of hertz between runs and pass only
-        # on the width of their tolerance -- which is a coin flip dressed as a test.
-        rng = np.random.default_rng(int(round(abs(voltage) * 1e6)) % 2**32)
-        # Switch with probability Gamma/fs per sample -> exponential dwell times, i.e. a real
-        # telegraph process rather than a spectrum hand-built to match the model.
-        telegraph = np.where(np.cumsum(rng.random(n) < GAMMA_P / self.df) % 2 == 0, 1.0, -1.0)
-        level = 1.0 + 0.02 * spread * telegraph
-        noise = 0.002 * rng.standard_normal(n)  # readout noise -> the white floor
-        self.signal = ((level + noise) + 0j).reshape(n, 1)
-        FakeTimeStream.instances.append(self)
-
-    def attach(self, **instruments):
-        pass
-
-    def run(self, **kwargs):
-        return f"/tmp/ts{len(FakeTimeStream.instances)}.h5"
-
-
-class FakeBias:
-    """A 33220A stand-in that records the voltages it was told to hold."""
-
-    def __init__(self, trigger_port=1):
-        self.trigger_port = trigger_port
-        self.output = False
-        self.calls = []
-
-    def constant(self, voltage):
-        self.calls.append(("constant", voltage))
-
-    def sawtooth(self, **kwargs):
-        self.calls.append(("sawtooth", kwargs.get("gated")))
-
-
-gate_bias_mod.TimeStream = FakeTimeStream
-
-# Stub the save at *class* level, not per instance: an instance attribute would itself land in
-# the saved record, since Base._save walks __dict__. The real one is kept for the round trip.
-save_for_real = BiasHunt.save
-BiasHunt.save = lambda self, save_filename=None: "/dev/null"  # type: ignore[assignment]
+import daq._base as base_mod
+import daq.measurements._gate_bias as gate_mod
+import daq.measurements.sweep_freq_and_dc as sweep_mod
+from daq import BiasHunt
 
 
 def make(**kwargs):
-    params = dict(
-        readout_freq=2.8e9,
-        amp=0.01,
+    args = dict(
+        readout_freq=6e9,
+        amp=0.1,
         output_port=1,
         input_port=1,
-        v_min=0.0,
-        v_max=2.0,
-        n_bias_try=8,
-        # Long enough that the telegraph switches ~GAMMA_P * ts_duration_s = 120 times, so
-        # std(|signal|) measures the switching amplitude rather than the luck of a record that
-        # happened to contain one transition.
-        ts_duration_s=1.0,
-        sampling_frequency=FS,
-        discard_start_ms=0.0,
-        seed=7,
-        device="offline-test",
+        bias_voltages=[0.003, 0.001, 0.002],
+        voltage_divider=455,
+        device="test",
+        notes="offline",
+        filter="none",
     )
-    params.update(kwargs)
-    return BiasHunt(**params)
+    args.update(kwargs)
+    return BiasHunt(**args)
 
 
-def run_hunt(hunt, bias=None):
-    FakeTimeStream.instances = []
-    hunt.run(bias=bias or FakeBias())
-    return FakeTimeStream.instances
+class HuntLockin(FakeLockin):
+    def __init__(self, hunt, fail_at=None, factors=(0.1, 0.4, 0.2)):
+        super().__init__(hunt)
+        self.fail_at = fail_at
+        self.factors = factors
+
+    def get_pixels(self, n, *, summed, nsum, fir_coeffs):
+        index = len(self.calls)
+        if index == self.fail_at:
+            raise RuntimeError("failed mid-hunt")
+        self.calls.append((n, nsum))
+        assert summed is True and fir_coeffs is None
+        extra = self.sweep.discard_blocks - 1
+        # Each point switches between +a and -a; abs(signal) has no contrast at all.
+        samples = np.tile(np.where(np.arange(nsum) % 2, 1.0, -1.0), (n - extra, 1))
+        samples *= self.factors[index % len(self.factors)]
+        means = np.r_[np.full(extra, 1000.0), samples.mean(1)][:, None].astype(complex)
+        stds = np.r_[np.full(extra, 500.0), samples.std(1, ddof=self.sweep.summary_ddof)][:, None]
+        zeros = np.zeros_like(means)
+        self.oracles.append((samples.mean(), samples.std()))
+        return {1: (np.array([0.0]), means, stds.astype(complex), zeros, zeros)}
 
 
-# ---------------------------------------------------------------- the draw
+class HuntTests(unittest.TestCase):
+    def run_mock(self, hunt, **kwargs):
+        bias, lck = FakeBias(), HuntLockin(hunt, **kwargs)
+        with patch.object(sweep_mod.lockin, "Lockin", return_value=lck) as opened, patch.object(
+            gate_mod, "TimeStream", side_effect=AssertionError("raw acquisition")
+        ), patch.object(BiasHunt, "save", return_value="hunt.h5") as saved:
+            hunt.run(bias, presto_address="offline")
+        opened.assert_called_once()
+        saved.assert_called_once()
+        return bias, lck
 
-hunt = make()
-check("the draw happens in __init__", hunt.bias_voltages is not None and hunt.n_bias_try == 8)
-check(
-    "the draw stays inside the bounds",
-    np.all(hunt.bias_voltages >= 0.0) and np.all(hunt.bias_voltages <= 2.0),
-    f"[{hunt.bias_voltages.min():.3f}, {hunt.bias_voltages.max():.3f}]",
-)
-check("a seed reproduces the draw", np.allclose(make().bias_voltages, hunt.bias_voltages))
-check(
-    "a different seed draws differently",
-    not np.allclose(make(seed=8).bias_voltages, hunt.bias_voltages),
-)
+    def test_rank_sigma_iq_and_convert_winner(self):
+        h = make()
+        b, lck = self.run_mock(h)
+        np.testing.assert_allclose(h.parity_contrast, [0.1, 0.4, 0.2])
+        np.testing.assert_allclose(h.std_iq_arr, h.parity_contrast)
+        np.testing.assert_allclose(h.std_q_arr, 0)
+        self.assertEqual(h.resp_arr.shape, (3,))
+        self.assertEqual(h.best_bias, 0.001)
+        self.assertAlmostEqual(h.best_generator_bias, 0.455)
+        self.assertAlmostEqual(h.best_contrast, 0.4)
+        np.testing.assert_allclose([v for v, _ in b.calls], [1.365, 0.455, 0.91])
+        self.assertEqual(lck.mixers, [6e9])
+        self.assertEqual(lck.calls, [(20, 250)] * 3)
+        self.assertTrue(all(t == [0] for t in lck.triggers))
+        self.assertFalse(b.output)
+        self.assertEqual(lck.og.amps[-1], 0)
+        self.assertFalse(hasattr(h, "bias_files"))
 
-explicit = make(bias_voltages=np.linspace(0.0, 2.0, 5), v_min=None, v_max=None)
-check(
-    "explicit voltages are used verbatim", np.allclose(explicit.bias_voltages, np.linspace(0, 2, 5))
-)
-check("n_bias_try follows the explicit list", explicit.n_bias_try == 5)
-check("v_min/v_max report the explicit span", (explicit.v_min, explicit.v_max) == (0.0, 2.0))
+    def test_random_draw_is_fixed_and_reproducible(self):
+        a = make(bias_voltages=None, v_min=-0.001, v_max=0.002, seed=19)
+        b = make(bias_voltages=None, v_min=-0.001, v_max=0.002, seed=19)
+        np.testing.assert_array_equal(a.bias_voltages, b.bias_voltages)
+        original = a.bias_voltages.copy()
+        self.run_mock(a)
+        self.run_mock(a)
+        np.testing.assert_array_equal(a.bias_voltages, original)
+        self.assertEqual(a.n_bias_try, 20)
 
-# No default gate range: guessing one would put an arbitrary voltage on the device.
-for missing in ({"v_min": None}, {"v_max": None}, {"v_min": None, "v_max": None}):
-    try:
-        make(**missing)
-        check(f"missing {sorted(missing)} rejected", False, "constructed")
-    except ValueError as exc:
-        check(f"missing {sorted(missing)} rejected", "no default gate range" in str(exc))
+    def test_explicit_candidates_override_bounds_and_count(self):
+        h = make(v_min=100, v_max=-100, n_bias_try=0)
+        self.assertEqual(h.v_min, 0.001)
+        self.assertEqual(h.v_max, 0.003)
+        self.assertEqual(h.n_bias_try, 3)
 
-for bad in ({"v_min": 2.0, "v_max": 1.0}, {"n_bias_try": 0}, {"amp": 1.5}, {"ts_duration_s": 0}):
-    try:
-        make(**bad)
-        check(f"invalid {bad} rejected", False, "constructed")
-    except ValueError:
-        check(f"invalid {bad} rejected", True)
+    def test_validation_and_required_divider(self):
+        for kwargs in (
+            dict(bias_voltages=None),
+            dict(bias_voltages=[]),
+            dict(bias_voltages=[[0, 1]]),
+            dict(bias_voltages=[np.nan]),
+            dict(voltage_divider=0),
+            dict(bias_voltages=None, v_min=0, v_max=np.inf),
+            dict(bias_voltages=None, v_min=0, v_max=1, n_bias_try=1.5),
+            dict(bias_voltages=None, v_min=0, v_max=1, n_bias_try=np.nan),
+        ):
+            with self.subTest(kwargs=kwargs), self.assertRaises(ValueError):
+                make(**kwargs)
+        with self.assertRaises(TypeError):
+            BiasHunt(readout_freq=6e9, amp=0.1, output_port=1, input_port=1, bias_voltages=[0])
 
-try:
-    make(bias_voltages=[], v_min=None, v_max=None)
-    check("an empty bias_voltages is rejected", False, "constructed")
-except ValueError:
-    check("an empty bias_voltages is rejected", True)
+    def test_short_warning_and_high_rate_discard(self):
+        with warnings.catch_warnings(record=True) as seen:
+            warnings.simplefilter("always")
+            h = make(sampling_frequency=1e6)
+            make(acquisition_duration_s=0.1)
+        self.assertEqual(len(seen), 1)
+        _, lck = self.run_mock(h)
+        self.assertEqual(h.discard_blocks, 25)
+        self.assertGreaterEqual(h.actual_discard_s, 0.025)
+        self.assertEqual(lck.calls[0][0], h.retained_blocks + 24)
+        np.testing.assert_allclose(h.std_iq_arr, [o[1] for o in lck.oracles])
 
-# ---------------------------------------------------------------- acquisition
+    def test_failure_clears_previous_winner_and_never_saves(self):
+        h = make()
+        self.run_mock(h)
+        b, lck = FakeBias(), HuntLockin(h, fail_at=1)
+        with patch.object(sweep_mod.lockin, "Lockin", return_value=lck), patch.object(
+            BiasHunt, "save"
+        ) as saved:
+            with self.assertRaisesRegex(RuntimeError, "mid-hunt"):
+                h.run(b, presto_address="offline")
+        saved.assert_not_called()
+        self.assertIsNone(h.best_bias)
+        self.assertIsNone(h.best_generator_bias)
+        self.assertIsNone(h.parity_contrast)
+        self.assertFalse(b.output)
+        self.assertEqual(lck.og.amps[-1], 0)
 
-hunt = make()
-bias = FakeBias()
-streams = run_hunt(hunt, bias)
+    def test_ties_and_single_candidate(self):
+        h = make()
+        self.run_mock(h, factors=(0.2, 0.2, 0.2))
+        self.assertEqual(h.best_bias, 0.003)
+        h = make(bias_voltages=[0.001])
+        self.run_mock(h)
+        self.assertEqual(h.std_iq_arr.shape, (1,))
+        self.assertEqual(h.best_bias, 0.001)
 
-check("one acquisition per bias", len(streams) == hunt.n_bias_try, str(len(streams)))
-check(
-    "every acquisition is ungated",
-    all(ts.kwargs["external_trigger"] is False for ts in streams),
-    str([ts.kwargs["external_trigger"] for ts in streams]),
-)
-check(
-    "the generator is only ever set to a constant",
-    all(call[0] == "constant" for call in bias.calls) and len(bias.calls) == hunt.n_bias_try,
-    str(bias.calls[:2]),
-)
-check(
-    "it holds the drawn voltages in order",
-    np.allclose([call[1] for call in bias.calls], hunt.bias_voltages),
-)
-check(
-    "the tone sits at readout_freq, at zero IF",
-    all(
-        ts.kwargs["lo_freq"] == 2.8e9 and np.allclose(ts.kwargs["if_freqs"], [0.0])
-        for ts in streams
-    ),
-)
+    def test_save_once_after_outputs_off_and_roundtrip(self):
+        h = make()
+        bias, lck = FakeBias(), HuntLockin(h)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "hunt.h5")
 
-# The winner is the argmax of std(|signal|) -- checked against the known peak of the stand-in
-# response, not just against the measurement's own bookkeeping.
-best = int(np.argmax(hunt.parity_contrast))
-check(
-    "the winner is the argmax of the contrast",
-    hunt.best_bias == hunt.bias_voltages[best] and hunt.best_contrast == hunt.parity_contrast[best],
-)
-check(
-    "the winner is the bias nearest the true peak",
-    best == int(np.argmin(np.abs(hunt.bias_voltages - FakeTimeStream.PEAK_V))),
-    f"won at {hunt.best_bias:.3f} V, peak at {FakeTimeStream.PEAK_V} V",
-)
-check("best_bias_file names the winning try", hunt.best_bias_file == hunt.bias_files[best])
-check("best_bias_stream is the winning stream", hunt.best_bias_stream is streams[best])
-check("every try's path is kept", len(hunt.bias_files) == hunt.n_bias_try)
-check(
-    "the contrast really is std(|signal|)",
-    np.allclose(hunt.parity_contrast, [np.std(np.abs(ts.signal[:, 0])) for ts in streams]),
-)
+            def insert(document):
+                self.assertFalse(bias.output)
+                self.assertEqual(lck.og.amps[-1], 0)
+                self.assertEqual(document["type"], "bias_hunt")
+                self.assertEqual(document["contrast_metric"], "sigma_iq")
+                return "offline"
 
-# ---------------------------------------------------------------- bias safety
+            with patch.object(sweep_mod.lockin, "Lockin", return_value=lck), patch.object(
+                base_mod, "get_next_number", return_value="1"
+            ), patch.object(base_mod, "insert_measurement", side_effect=insert) as saved:
+                h.run(bias, presto_address="offline", save_filename=path)
+            saved.assert_called_once()
+            self.assertEqual(os.listdir(tmp), ["hunt.h5"])
+            with h5py.File(path) as f:
+                self.assertEqual(f["std_iq_arr"].shape, (3,))
+                self.assertFalse(any(k in f for k in ("signal", "pixel_i", "bias_files")))
+            loaded = BiasHunt.load(path)
+            np.testing.assert_array_equal(loaded.bias_voltages, h.bias_voltages)
+            np.testing.assert_array_equal(loaded.parity_contrast, h.parity_contrast)
+            self.assertEqual(loaded.best_generator_bias, h.best_generator_bias)
+            self.assertEqual(loaded.actual_acquisition_s, 0.5)
+            with patch.object(plt, "show"):
+                fig = loaded.analyze()
+                self.assertIn("chip V", fig.axes[0].get_xlabel())
+                self.assertEqual(fig.axes[0].get_ylabel(), "σIQ [FS]")
+                np.testing.assert_array_equal(
+                    fig.axes[0].lines[0].get_xdata(), [0.001, 0.002, 0.003]
+                )
+                plt.close(fig)
+            self.run_mock(loaded)
 
-# The gate is never left energised. A bias left on an unattended device is the one failure here
-# that outlives the session.
-safe_bias = FakeBias()
-safe_bias.output = True
-run_hunt(make(), safe_bias)
-check("a caller-supplied generator is de-energised on success", safe_bias.output is False)
-
-failing_bias = FakeBias()
-failing_bias.output = True
-failing_bias.constant = lambda v: (_ for _ in ()).throw(RuntimeError("boom"))
-try:
-    run_hunt(make(), failing_bias)
-    check("an exception mid-hunt still de-energises the gate", False, "no exception raised")
-except RuntimeError:
-    check("an exception mid-hunt still de-energises the gate", failing_bias.output is False)
-
-# ---------------------------------------------------------------- stale results
-
-# A hunt that fails part-way through a RE-RUN must not leave the previous run's results beside
-# this run's shorter stream list: best_bias_stream indexes one by the argmax of the other, so a
-# stale parity_contrast either raises IndexError or reports a new stream under an old voltage.
-rerun = make()
-run_hunt(rerun, FakeBias())
-first_contrast = np.array(rerun.parity_contrast)
-
-
-def fail_after(bias, n):
-    """Let *n* tries through, then raise."""
-    seen = []
-
-    def constant(voltage):
-        seen.append(voltage)
-        if len(seen) > n:
-            raise RuntimeError("boom")
-        bias.calls.append(("constant", voltage))
-
-    bias.constant = constant
-    return bias
+    def test_legacy_record_retains_magnitude_and_generator_volts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "old.h5")
+            with h5py.File(path, "w") as f:
+                f.attrs.update(
+                    readout_freq=6e9,
+                    best_bias=1.0,
+                    best_contrast=0.5,
+                    best_bias_file="old_stream.h5",
+                )
+                f["bias_voltages"] = [0.5, 1.0]
+                f["parity_contrast"] = [0.2, 0.5]
+                f.create_dataset(
+                    "bias_files", data=["a.h5", "old_stream.h5"], dtype=h5py.string_dtype()
+                )
+            h = BiasHunt.load(path)
+            self.assertEqual(h.bias_files, ["a.h5", "old_stream.h5"])
+            self.assertEqual(h.best_bias_file, "old_stream.h5")
+            self.assertEqual(h.contrast_metric, "abs")
+            self.assertIsNone(h.voltage_divider)
+            self.assertIsNone(h.std_iq_arr)
+            with patch.object(plt, "show"):
+                fig = h.analyze()
+                self.assertIn("Agilent V", fig.axes[0].get_xlabel())
+                self.assertEqual(fig.axes[0].get_ylabel(), "std(|signal|) [FS]")
+                plt.close(fig)
+            with self.assertRaisesRegex(ValueError, "analysis-only"):
+                h.run(FakeBias())
 
 
-try:
-    run_hunt(rerun, fail_after(FakeBias(), 2))
-    check("a failed re-run raises", False, "no exception raised")
-except RuntimeError:
-    check("a failed re-run raises", True)
-
-check(
-    "a failed re-run leaves no stale contrast curve",
-    rerun.parity_contrast is None,
-    f"still holds {None if rerun.parity_contrast is None else len(rerun.parity_contrast)} entries",
-)
-check(
-    "and no stale winner",
-    rerun.best_bias is None and rerun.best_bias_file is None and rerun.bias_files is None,
-)
-check(
-    "so best_bias_stream is silent rather than wrong",
-    rerun.best_bias_stream is None,
-    f"streams={len(rerun.bias_streams)}, previous contrast had {len(first_contrast)}",
-)
-
-# ---------------------------------------------------------------- averaged spectrum
-
-# A record long enough to resolve the corner: 2 s at 50 kHz gives 0.5 Hz resolution against a
-# GAMMA_P/pi ~ 38 Hz corner, so there is real spectrum on both sides of it.
-spec = make(ts_duration_s=2.0, n_bias_try=6)
-spec_streams = run_hunt(spec)
-
-check("no spectrum before average_psd()", spec.psd_avg is None and spec.fit_results is None)
-
-f, psd = spec.average_psd()
-n_samples = spec_streams[0].signal.shape[0]
-check(
-    "the frequency axis is the rfft axis of one try", f.shape == (n_samples // 2 + 1,), str(f.shape)
-)
-check("one spectrum per try was averaged", spec.psd_n_averaged == 6, str(spec.psd_n_averaged))
-check("the tuned rate is used, not the requested one", spec.psd_fs == spec_streams[0].df)
-check("the quantity is recorded", spec.psd_quantity == "abs")
-check(
-    "the average really is the mean of the per-try spectra",
-    np.allclose(
-        psd,
-        np.mean(
-            [
-                compute_psd(np.abs(s.signal[:, 0]) - np.abs(s.signal[:, 0]).mean(), s.df)[1]
-                for s in spec_streams
-            ],
-            axis=0,
-        ),
-    ),
-)
-check(
-    "averaging is not just the first try",
-    not np.allclose(
-        psd,
-        compute_psd(
-            np.abs(spec_streams[0].signal[:, 0]) - np.abs(spec_streams[0].signal[:, 0]).mean(),
-            spec_streams[0].df,
-        )[1],
-    ),
-)
-
-# The point of the whole exercise: does the fit return the rate that was put in?
-#
-# Tolerance is 30 %, which is wider than it looks. Two known effects sit between the number
-# fed in and the number that comes back, both measured rather than guessed:
-#
-#   * the discrete-time generator's own rate is ~2 % below GAMMA_P (its autocorrelation decays
-#     as (1 - 2p)^k, not exp(-2pk));
-#   * fit_parity_psd reads high on short records -- ~10 % over 20 independent realisations of
-#     6 x 2 s, shrinking to ~5 % at 4 M samples and to 0.4 % when handed the exact analytic
-#     model. It is a log-periodogram small-sample effect, not a defect in the fitter, and it
-#     is why a real measurement should not over-trust Gamma_p from a couple of seconds.
-#
-# The check that actually has teeth is the shape one below: nothing about a wrong Lorentzian
-# reproduces the corner AND the residual.
-res = spec.fit_psd()
-check("the fit converges", res["success"], str(res.get("success")))
-check(
-    "the fit recovers the true parity rate",
-    abs(res["gamma_p"] - GAMMA_P) < 0.3 * GAMMA_P,
-    f"fitted {res['gamma_p']:.1f} +/- {res['gamma_p_err']:.1f} Hz vs true {GAMMA_P} Hz",
-)
-check(
-    "and the corner that follows from it",
-    np.isclose(res["f_corner"], res["gamma_p"] / np.pi, rtol=1e-6),
-    f"{res['f_corner']:.2f} vs {res['gamma_p'] / np.pi:.2f} Hz",
-)
-check(
-    "the model describes the data",
-    res["resid_dex_rms"] < 0.3,
-    f"resid_dex_rms = {res['resid_dex_rms']:.3f} dex",
-)
-check("f_bw is held at the tuned rate", res["f_bw"] == spec.psd_fs)
-
-# Averaging fewer streams must give a noisier answer, not a different one -- and the two must
-# agree, since they are the same process at different statistics.
-single = spec.average_psd([spec.best_bias_stream])[1]
-check("re-averaging invalidates the stale fit", spec.fit_results is None)
-res_one = spec.fit_psd()
-check(
-    "a single try recovers the same rate, less precisely",
-    abs(res_one["gamma_p"] - GAMMA_P) < 5 * res_one["gamma_p_err"]
-    and res_one["gamma_p_err"] > res["gamma_p_err"],
-    f"{res_one['gamma_p']:.1f} +/- {res_one['gamma_p_err']:.1f} vs "
-    f"{res['gamma_p']:.1f} +/- {res['gamma_p_err']:.1f} Hz",
-)
-
-# The spectrum is of the FLUCTUATION: the operating point it sits on is not parity signal,
-# and leaving it in would put the whole DC level into the lowest bins.
-series = BiasHunt._parity_series(spec_streams[0], "abs")
-check(
-    "the mean is removed before the spectrum",
-    abs(series.mean()) < 1e-12 * np.abs(spec_streams[0].signal).mean(),
-    f"residual mean {series.mean():.3e}",
-)
-for quantity in ("real", "imag"):
-    spec.average_psd(quantity=quantity)
-    check(f"quantity={quantity!r} is accepted", spec.psd_quantity == quantity)
-try:
-    spec.average_psd(quantity="magnitude")
-    check("an unknown quantity is rejected", False, "accepted")
-except ValueError:
-    check("an unknown quantity is rejected", True)
-
-# Failure modes that must not silently produce a wrong spectrum.
-try:
-    make().average_psd()
-    check("no streams raises", False, "returned a spectrum")
-except RuntimeError as exc:
-    check("no streams raises", "No time streams" in str(exc))
-
-short = make(ts_duration_s=0.02)
-run_hunt(short)
-try:
-    spec.average_psd(list(spec_streams) + list(short.bias_streams))
-    check("mismatched record lengths raise", False, "averaged anyway")
-except ValueError as exc:
-    check("mismatched record lengths raise", "different numbers of samples" in str(exc))
-
-# ---------------------------------------------------------------- analyze
-
-matplotlib.pyplot.close("all")
-fig = spec.analyze()
-check("analyze() draws contrast and spectrum", len(fig.axes) == 2, f"{len(fig.axes)} axes")
-fig = spec.analyze(psd=False)
-check("analyze(psd=False) draws the contrast alone", len(fig.axes) == 1, f"{len(fig.axes)} axes")
-
-# A loaded measurement has no streams. The contrast curve is still worth seeing, so the
-# spectrum panel is skipped rather than the whole plot raising.
-stripped = make()
-stripped.parity_contrast = np.array([1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0])
-stripped.best_bias = float(stripped.bias_voltages[-1])
-fig = stripped.analyze()
-check("analyze() on a stream-less measurement degrades to one panel", len(fig.axes) == 1)
-matplotlib.pyplot.close("all")
-
-# ---------------------------------------------------------------- persistence
-
-with tempfile.TemporaryDirectory() as tmp:
-    path = os.path.join(tmp, "00000001-offline-test-bias_hunt.h5")
-    save_for_real(hunt, save_filename=path)
-    reloaded = BiasHunt.load(path)
-
-    check("bias voltages round trip", np.allclose(reloaded.bias_voltages, hunt.bias_voltages))
-    check(
-        "the contrast curve round trips",
-        np.allclose(reloaded.parity_contrast, hunt.parity_contrast),
-    )
-    check(
-        "the winner round trips",
-        reloaded.best_bias == hunt.best_bias
-        and reloaded.best_contrast == hunt.best_contrast
-        and reloaded.best_bias_file == hunt.best_bias_file,
-    )
-    check("the constituent paths round trip", reloaded.bias_files == hunt.bias_files)
-    check("readout_freq round trips", reloaded.readout_freq == hunt.readout_freq)
-    check(
-        "the draw bounds round trip, not the extremes",
-        (reloaded.v_min, reloaded.v_max) == (hunt.v_min, hunt.v_max)
-        and (reloaded.v_min, reloaded.v_max)
-        != (hunt.bias_voltages.min(), hunt.bias_voltages.max()),
-        f"({reloaded.v_min}, {reloaded.v_max})",
-    )
-    check("the raw streams are not restored", reloaded.bias_streams == [])
-
-# ------------------------------------------------------------------------------ summary
-failed = [label for label, ok in results if not ok]
-print(f"\n{len(results) - len(failed)}/{len(results)} passed")
-if failed:
-    for label in failed:
-        print("  FAILED:", label)
-    sys.exit(1)
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

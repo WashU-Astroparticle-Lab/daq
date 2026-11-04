@@ -89,9 +89,8 @@ def project_readout(
 
     ``"proj"`` projects onto the discrimination axis ``qpd`` fits to the cloud
     (:func:`qpd.reconstruction.fit_two_blobs`, whose model carries the projection), which is
-    where the whole parity signal lives. The other three are the fixed axes, kept because they
-    are what :class:`~daq.measurements.bias_hunt.BiasHunt` ranks by and are sometimes what you
-    want to look at; they need no ``qpd``.
+    where the whole parity signal lives. The other three are fixed projections useful for
+    inspecting magnitude or individual quadratures; they need no ``qpd``.
 
     The operating point is kept for the fixed axes -- where the readout sits is worth plotting
     even when only its fluctuation is worth spectrating. The projected axis is centred on the

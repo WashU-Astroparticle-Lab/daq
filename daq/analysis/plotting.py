@@ -601,8 +601,7 @@ def plot_psd(
     ==============  ==================  ====================  ============
 
     Pass *labels* / *units* to override, for a projection that is neither -- e.g.
-    ``labels=("|S|", "")`` for :class:`~daq.measurements.bias_hunt.BiasHunt`'s magnitude
-    spectrum.
+    ``labels=("|S|", "")`` for a magnitude spectrum.
 
     **Each channel is fit from the array passed in**, independently, with
     :func:`~daq.analysis.noise.fit_parity_psd`. Nothing is read off a measurement object: a

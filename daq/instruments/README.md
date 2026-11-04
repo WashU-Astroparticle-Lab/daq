@@ -178,13 +178,16 @@ qct.run()                       # opens and closes the 33220A itself
 with Agilent33220A() as bias:
     qct.run(bias=bias)          # output de-energised on the way out, session left open
     BiasHunt(readout_freq=fr, amp=amp, output_port=1, input_port=1,
-             v_min=0.0, v_max=2.0, device="my_device").run(bias=bias)
+             v_min=0.0, v_max=0.002, voltage_divider=455,
+             device="my_device").run(bias=bias)  # bounds are CHIP volts
 ```
 
 `QCTrace` gates on the generator's own `trigger_port`, so a rewired rig needs no change here
 either; `QCTrace(trigger_states=…)` overrides the routing for one measurement, and a routing
 that gates nothing raises rather than recording a static bias. `BiasHunt` gates nothing at all
 — its bias is a DC level already written over SCPI.
+It ranks hardware-summary `sigma_IQ` at 10 kHz for 0.5 s per candidate by default;
+`best_bias` is in chip volts and `best_generator_bias` is the corresponding Agilent setting.
 
 ## LED driver (DC2200) modes
 
